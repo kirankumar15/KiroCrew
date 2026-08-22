@@ -189,43 +189,55 @@ class RunEventCoordinator(ManagerComponent):
         """Execute a subagent task in its own session."""
         session_key = info.conversation_key or f"subagent:{info.id}"
         try:
-            if not info._coordinator_admitted:
-                await self._manager._shadow_submit_accepted_run(info)
-            else:
+            authority_admitted = info._coordinator_admitted
+            if not authority_admitted:
+                await self._manager._await_retained_shadow_submit(info)
+            if info.user_stopped or info._reap_started:
+                return
+            if info._coordinator_claim_uncertain:
+                self._manager._retain_recovery_batch(info)
+                return
+            if info._coordinator_fence is None:
+                raise RuntimeError("coordinator execution fence is missing")
+            try:
+                await self._manager._coordinator_mark_starting(info)
+            except Exception:
+                if not authority_admitted:
+                    raise
+                # A lost lifecycle response is retried inside the transition.
+                # If both attempts fail, command settlement must not run: it
+                # would apply a command whose STARTING state is still unknown.
+                info._coordinator_claim_uncertain = True
+                self._manager._retain_recovery_batch(info)
+                logger.warning(
+                    "Subagent %s starting transition is uncertain",
+                    info.id,
+                    exc_info=True,
+                )
+                return
+            if authority_admitted:
                 try:
-                    await self._manager._coordinator_mark_starting(info)
-                except Exception:
-                    # A lost lifecycle response is retried inside the transition.
-                    # If both attempts fail, command settlement must not run: it
-                    # would apply a command whose STARTING state is still unknown.
-                    info._coordinator_claim_uncertain = True
-                    logger.warning(
-                        "Subagent %s starting transition is uncertain",
-                        info.id,
-                        exc_info=True,
-                    )
-                    return
-                try:
+                    # The command fence makes the same result idempotent.
+                    # Reconcile a commit whose response was lost before
+                    # deciding that recovery must own the accepted run.
                     await self._manager.command_authority.execution_started(info.id)
                 except Exception:
                     try:
-                        # The command fence makes the same result idempotent.
-                        # Reconcile a commit whose response was lost before
-                        # deciding that recovery must own the accepted run.
                         await self._manager.command_authority.execution_started(info.id)
                     except Exception:
                         # The claimed command remains the only safe retry path.
                         # Keep the live record cancellable and suppress terminal
                         # delivery until cancellation or recovery settles it.
                         info._coordinator_claim_uncertain = True
+                        self._manager._retain_recovery_batch(info)
                         logger.warning(
                             "Subagent %s start settlement is uncertain",
                             info.id,
                             exc_info=True,
                         )
                         return
-                info._coordinator_waiting = False
-                self._manager._start_coordinator_heartbeat(info)
+            info._coordinator_waiting = False
+            self._manager._start_coordinator_heartbeat(info)
             await asyncio.wait_for(
                 self._manager._run_inner(info, session_key), timeout=self._manager._default_timeout
             )
@@ -650,6 +662,8 @@ class RunEventCoordinator(ManagerComponent):
             # Detect CC provider to skip permission event loop
             is_cc = self._manager._is_cc_provider(client)
         await self._manager._coordinator_mark_running(info)
+        if info._session_sharing and info._pid:
+            await self._manager._coordinator_record_process(info, info._pid, "", False)
         # Intentionally check info.agent (not resolved `agent`) so only
         # explicitly requested agents skip _SYSTEM_PREFIX (defense-in-depth).
         named_agent = bool(info.agent and _AGENT_NAME_RE.fullmatch(info.agent))
@@ -766,15 +780,9 @@ class RunEventCoordinator(ManagerComponent):
         )
         # Stream results to disk for orchestrated chat.
 
-        # Record PID for orphan recovery
-        try:
-
-            pid = self._manager._sessions.get_pid(session_key)
-            if pid:
-                info._pid = pid  # make available for _write_tombstone
-                update_state(info.id, pid=pid, pid_recorded_at=time.time())
-        except Exception:
-            logger.debug("Failed to record PID for %s", info.id, exc_info=True)
+        # Protected identity is the only restart authority for terminating this
+        # process tree. Failure must abort before the child receives a prompt.
+        await self._manager._record_process_identity(info, session_key)
 
         # Record session_id and provider type for session file cleanup
         try:
@@ -1661,7 +1669,14 @@ class RunEventCoordinator(ManagerComponent):
         info._shared_provider = provider
         if runtime.pid:
             info._pid = runtime.pid
-            update_state(info.id, pid=runtime.pid, pid_recorded_at=time.time())
+            await asyncio.to_thread(
+                update_state,
+                info.id,
+                pid=runtime.pid,
+                pid_recorded_at=time.time(),
+                pid_start_id="",
+                process_owned=False,
+            )
         logger.info(
             "Subagent %s using session sharing on runtime PID %s (session %s, key %s)",
             info.id,
