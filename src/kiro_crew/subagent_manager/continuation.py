@@ -48,16 +48,13 @@ class ContinuationCoordinator(ManagerComponent):
         for a in self._manager._agents.values():
             if not a.done and (a.conversation_key or f"subagent:{a.id}") == conv_key:
                 return a
-        for p in self._manager._queue:
-            pkey = str(p.get("conversation_key") or "") or (
-                f"subagent:{p.get('_preassigned_id', '')}"
+        queued = self._manager._scheduler.find_conversation(conv_key)
+        if queued is not None:
+            return SubagentInfo(
+                id=str(queued.get("_preassigned_id") or "queued"),
+                task="",
+                queued=True,
             )
-            if pkey == conv_key:
-                return SubagentInfo(
-                    id=str(p.get("_preassigned_id") or "queued"),
-                    task="",
-                    queued=True,
-                )
         return None
 
     def _keep_recorded_on_disk_impl(self, key: str) -> bool:
