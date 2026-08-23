@@ -94,6 +94,7 @@ from kiro_crew.run_coordinator import (
     CommandOperation,
     CoordinatorDecision,
     RunCoordinator,
+    SQLiteRunCoordinator,
     SubmitRun,
 )
 from kiro_crew.security import (
@@ -107,6 +108,7 @@ from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.session_workspace import result_path as _ws_result_path
 from kiro_crew.slack.format import extract_options
 from kiro_crew.stats import Stats
+from kiro_crew.subagent_command_authority import SubagentCommandAuthority
 from kiro_crew.subagent_completion_meta import (
     OUTCOME_FAILED,
     OUTCOME_INTERRUPTED,
@@ -1219,6 +1221,14 @@ class SubagentInfo:
     # digest COMPOSITION would re-open the restart-loss window between
     # composing and routing.
     _digest_settle_ids: list[str] = field(default_factory=list)
+    # True when async command authority admitted this run before invoking the
+    # compatibility executor, so run start must settle that durable command.
+    _coordinator_admitted: bool = False
+    # True while a keyed run is queued or awaiting approval.
+    _coordinator_waiting: bool = False
+    # Durable start settlement is unknown, so terminal delivery must wait for
+    # cancellation retry or fenced recovery.
+    _coordinator_claim_uncertain: bool = False
     # True when the gateway QUEUED this completion's injection because the
     # parent's slot was busy. Delivery is not consumption: the announce sits in
     # the slot queue until a turn drains it, and that wait is bounded only by the
@@ -1519,10 +1529,11 @@ class SubagentManager:
         self._shutting_down = False
         self._completion_keep = completion_keep
         self._completion_keep_chars = completion_keep_chars
-        # This seam is deliberately pre-authority: spawn is synchronous while
-        # coordinator mutation is async. The accepted run is mirrored only at
-        # async _run entry, after the legacy admission/approval path has won.
-        self._coordinator = coordinator
+        # Keyed async callers durably admit commands before invoking the
+        # compatibility executor. Legacy synchronous callers remain mirrored
+        # at async run entry during migration.
+        self._coordinator = coordinator or SQLiteRunCoordinator()
+        self.command_authority = SubagentCommandAuthority(self._coordinator, self)
         self._lifecycle: SubagentLifecycle[SubagentInfo] = SubagentLifecycle()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
@@ -1533,6 +1544,9 @@ class SubagentManager:
         self._followup_watchers: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
         self._agents: dict[str, SubagentInfo] = {}
+        # Reserve keyed identities across coordinator awaits so a legacy spawn
+        # cannot claim the same local run id in the gap.
+        self._coordinator_run_id_reservations: set[str] = set()
         # Continuable conversations: session_key ("subagent:<conv-id>") →
         # last-used unix ts. Drives the reaper's idle-TTL sweep. Rebuilt from
         # state.json (keep=True runs) on the reaper's first pass after a
@@ -1540,6 +1554,8 @@ class SubagentManager:
         # the TTL sweep across restarts; a spawn_continue on an unknown key
         # also re-registers it on demand.
         self._conversations: dict[str, float] = {}
+        # Release drops loop-affine ownership before off-loop file cleanup.
+        self._releasing_conversations: set[str] = set()
         self._conv_registry_rebuilt = False
         # state.json is the source of truth for retention (#1115): give the
         # SessionManager's in-memory continuable cache a disk fallback so a
@@ -1643,6 +1659,22 @@ class SubagentManager:
     @_queue.setter
     def _queue(self, value: list[dict[str, Any]]) -> None:
         self._scheduler.queue = value
+
+    def reserve_coordinator_run_id(self, run_id: str) -> bool:
+        """Reserve an unused manager identity for one keyed admission."""
+        if (
+            not run_id
+            or run_id in self._coordinator_run_id_reservations
+            or run_id in self._agents
+            or any(str(entry.get("_preassigned_id") or "") == run_id for entry in self._queue)
+        ):
+            return False
+        self._coordinator_run_id_reservations.add(run_id)
+        return True
+
+    def release_coordinator_run_id(self, run_id: str) -> None:
+        """Release a keyed identity after manager ownership transfers."""
+        self._coordinator_run_id_reservations.discard(run_id)
 
     @property
     def _report_tasks(self) -> set[asyncio.Task[None]]:
@@ -1999,6 +2031,7 @@ class SubagentManager:
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _coordinator_admitted: bool = False,
     ) -> SubagentInfo | None:
         return self._admission.spawn_impl(
             task,
@@ -2023,13 +2056,23 @@ class SubagentManager:
             _agent_prevalidated,
             _from_queue,
             _preassigned_id,
+            _coordinator_admitted,
         )
 
     async def _safe_announce(self, info: SubagentInfo) -> None:
         return await self._admission._safe_announce_impl(info)
 
-    def _announce_rejection(self, info: SubagentInfo) -> SubagentInfo:
-        return self._admission._announce_rejection_impl(info)
+    def _announce_rejection(
+        self, info: SubagentInfo, *, coordinator_admitted: bool = False
+    ) -> SubagentInfo:
+        return self._admission._announce_rejection_impl(
+            info, coordinator_admitted=coordinator_admitted
+        )
+
+    async def announce_durable_rejection(self, info: SubagentInfo) -> None:
+        """Announce a keyed batch rejection after command settlement succeeds."""
+        if info.batch_id and self._on_done:
+            await self._safe_announce(info)
 
     def _should_stagger_queue(self, now: float) -> tuple[bool, bool]:
         return self._admission._should_stagger_queue_impl(now)
@@ -2063,9 +2106,18 @@ class SubagentManager:
         max_turns: int = 0,
         cwd: str = "",
         _preassigned_id: str = "",
+        _coordinator_admitted: bool = False,
     ) -> SubagentInfo | None:
         return self._continuation.continue_conversation_impl(
-            conv_id, task, parent_session_key, agent, model, max_turns, cwd, _preassigned_id
+            conv_id,
+            task,
+            parent_session_key,
+            agent,
+            model,
+            max_turns,
+            cwd,
+            _preassigned_id,
+            _coordinator_admitted,
         )
 
     def recorded_cwd(self, conv_id: str) -> str:
@@ -2109,6 +2161,17 @@ class SubagentManager:
 
     def release_conversation(self, conv_id: str) -> tuple[bool, str]:
         return self._continuation.release_conversation_impl(conv_id)
+
+    def _prepare_conversation_release(
+        self, conv_id: str
+    ) -> tuple[tuple[bool, str], tuple[str, str, str] | None]:
+        return self._continuation._prepare_conversation_release_impl(conv_id)
+
+    def _finish_conversation_release(self, conv_id: str, sid: str, provider_label: str) -> None:
+        return self._continuation._finish_conversation_release_impl(conv_id, sid, provider_label)
+
+    async def release_conversation_async(self, conv_id: str) -> tuple[bool, str]:
+        return await self._continuation.release_conversation_async_impl(conv_id)
 
     def _sweep_conversations(self, now: float) -> None:
         return self._continuation._sweep_conversations_impl(now)
@@ -2192,8 +2255,6 @@ class SubagentManager:
         This method runs only after admission and approval have succeeded, and
         any coordinator failure is diagnostic rather than an execution failure.
         """
-        if self._coordinator is None:
-            return
         try:
             await asyncio.wait_for(
                 self._shadow_submit_accepted_run_unchecked(info),
@@ -2435,8 +2496,11 @@ class SubagentManager:
                 info._cancel_retry_used = True
         task.cancel()
 
-    def _unqueue(self, agent_id: str) -> bool:
+    def _unqueue(self, agent_id: str) -> list[dict[str, Any]]:
         return self._cancellation._unqueue_impl(agent_id)
+
+    async def _finalize_queued_cancel(self, params: dict[str, Any]) -> None:
+        return await self._cancellation._finalize_queued_cancel_impl(params)
 
     async def cancel(self, agent_id: str) -> bool:
         return await self._cancellation.cancel_impl(agent_id)
@@ -2481,6 +2545,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     _AGENT_NAME_RE,
     _agent_dir,
     _cleanup_session_files_sync,
+    _redact,
     _subagents_dir,
     _ws_result_path,
     acp_error_is_transient,
