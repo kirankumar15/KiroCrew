@@ -7967,7 +7967,9 @@
       "updating": "अपडेट हो रहा है…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "WebSocket इवेंट"
+      "websocket_events": "WebSocket इवेंट",
+      "all_contributors": "All contributors",
+      "contributors": "Contributors:"
     },
     "appPage": {
       "loading_app": "ऐप लोड हो रहा है…"

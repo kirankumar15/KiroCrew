@@ -7859,7 +7859,9 @@
       "updating": "업데이트 중…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "WebSocket 이벤트"
+      "websocket_events": "WebSocket 이벤트",
+      "all_contributors": "All contributors",
+      "contributors": "Contributors:"
     },
     "appPage": {
       "loading_app": "앱을 불러오는 중…"

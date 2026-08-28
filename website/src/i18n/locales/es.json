@@ -8075,7 +8075,9 @@
       "updating": "Actualizando…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "Eventos de WebSocket"
+      "websocket_events": "Eventos de WebSocket",
+      "all_contributors": "All contributors",
+      "contributors": "Contributors:"
     },
     "appPage": {
       "loading_app": "Cargando la app…"
