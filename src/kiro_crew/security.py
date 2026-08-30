@@ -3489,19 +3489,79 @@ def _xargs_reconstructed_command(tokens: "list[str]") -> str:
 _PRINTF_ESCAPES = (("\\n", " "), ("\\t", " "), ("\\r", " "), ("\\v", " "), ("\\f", " "))
 
 
-# ``printf`` numeric escapes: octal (``\\NNN``, ``\\0NNN``) and hex (``\\xHH``).
-_NUMERIC_ESCAPE_RE = re.compile(r"\\(?:x([0-9a-f]{1,2})|0?([0-7]{1,3}))", re.IGNORECASE)
+# ``printf`` / ``$'…'`` numeric escapes: octal (``\\NNN``, ``\\0NNN``), hex
+# (``\\xHH``) and Unicode (``\\uHHHH``, ``\\UHHHHHHHH``).
+#
+# The Unicode widths are EXACT and CASE-SENSITIVE, as bash defines them: ``\\u``
+# consumes at most 4 hex digits and ``\\U`` at most 8, so ``$'\\u0072f'`` is ``r``
+# followed by a literal ``f`` -- NOT a 5-digit code point.  Reading more digits than
+# the spelling allows is a bypass, because the wrong character replaces the two the
+# shell actually passes.  The pattern therefore carries no ``re.IGNORECASE`` (which
+# would conflate the two widths) and spells its own classes; ``\\x`` keeps accepting
+# either case, as it always did.
+#
+# This requires the caller to have preserved case: see ``_deny_segment_views``,
+# which decodes BEFORE lowercasing for exactly this reason.
+_NUMERIC_ESCAPE_RE = re.compile(
+    r"\\(?:[xX]([0-9a-fA-F]{1,2})"
+    r"|u([0-9a-fA-F]{1,4})"
+    r"|U([0-9a-fA-F]{1,8})"
+    r"|0?([0-7]{1,3}))"
+)
+
+# ANSI-C quoting (``$'...'``) spells octal as ``\nnn`` -- one to three octal digits
+# TOTAL, where a leading zero is simply one of the three.  The ``\0nnn`` form above
+# (zero plus up to three more digits) belongs to ``echo -e``/``printf %b`` ONLY;
+# sharing that pattern here consumed a fourth digit, so ``$'\06777'`` -- which bash
+# reads as ``\067`` ('7') followed by the literal ``77``, i.e. ``777`` -- decoded to
+# a single non-ASCII byte and the deny view diverged from what the shell runs
+# (BLOCKING from the GPT 5.6 lane).  Group order matches _NUMERIC_ESCAPE_RE so
+# ``_numeric_escape_code`` reads either match.
+_ANSI_C_NUMERIC_ESCAPE_RE = re.compile(
+    r"\\(?:[xX]([0-9a-fA-F]{1,2})"
+    r"|u([0-9a-fA-F]{1,4})"
+    r"|U([0-9a-fA-F]{1,8})"
+    r"|([0-7]{1,3}))"
+)
+
+
+def _escape_code_is_inert(code: int) -> bool:
+    """True for a code point that must be left ENCODED rather than decoded.
+
+    A NUL cannot appear in an argv the shell builds.  A LONE SURROGATE is refused
+    for a second reason: it is not a character bash can pass either, and a decoded
+    one would travel into the SEL audit record, whose JSON encoder raises on it --
+    turning a denial into a crash.
+    """
+    return code == 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF
+
+
+def _numeric_escape_code(match: "re.Match[str]") -> "int | None":
+    """The code point an octal / hex / Unicode escape resolves to, or None.
+
+    Split out so :func:`_numeric_escape_char` and :func:`_decode_ansi_c_body` cannot
+    disagree about what a match means -- the body decoder has to recognise a NUL to
+    truncate at it, and re-deriving that separately is how two code paths drift.
+
+    Octal is masked to ONE BYTE, which is bash's semantics and was measured rather
+    than assumed: ``$'\\555'`` is ``m`` (0o555 & 0xFF == 0x6D), ``$'\\777'`` is
+    0xFF, and ``$'\\400'`` masks to a NUL.  Converting the full value instead gave
+    ``$'r\\555'`` the character ``u``-breve where bash passes ``rm``, so
+    ``$'r\\555' -rf /`` ran while the view matched nothing (BLOCKING from the GPT
+    5.6 lane).
+    """
+    hex_digits, u4_digits, u8_digits, octal_digits = match.groups()
+    digits = hex_digits or u4_digits or u8_digits
+    try:
+        return int(digits, 16) if digits else (int(octal_digits, 8) & 0xFF)
+    except (TypeError, ValueError):  # pragma: no cover - the pattern admits only digits
+        return None
 
 
 def _numeric_escape_char(match: "re.Match[str]") -> str:
-    """One decoded character for an octal or hex ``printf`` escape."""
-    hex_digits, octal_digits = match.group(1), match.group(2)
-    try:
-        code = int(hex_digits, 16) if hex_digits else int(octal_digits, 8)
-    except (TypeError, ValueError):  # pragma: no cover - the pattern admits only digits
-        return match.group(0)
-    if code == 0 or code > 0x10FFFF:
-        # A NUL cannot appear in an argv the shell builds, so leave it inert.
+    """One decoded character for an octal, hex or Unicode escape."""
+    code = _numeric_escape_code(match)
+    if code is None or _escape_code_is_inert(code):
         return match.group(0)
     return chr(code)
 
@@ -3519,6 +3579,12 @@ def _decode_printf_escapes(text: str) -> str:
     escapes closed, and ``\\x6b`` can spell a character of the program name itself.  What
     the shell will actually run is the decoded text, so the comparison is made against
     that.
+
+    The Unicode forms (``\\uHHHH``, ``\\UHHHHHHHH``) are decoded for the same reason and
+    were missing: ``$'\\u0074\\u006f\\u006b\\u0065\\u006e'`` is the same word as the
+    ``\\x``-spelled form this already caught, so the argv-structural floors compared
+    against an encoded string and a spelling of a self-protection verb slipped past
+    while its hex twin was refused (found by the GPT 5.6 lane on the deny-view change).
     """
     for esc, sub in _PRINTF_ESCAPES:
         text = text.replace(esc, sub)
@@ -4497,6 +4563,122 @@ _SHELL_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n")
 def _shell_join_continuations(text: str) -> str:
     """Collapse bash ``\\<newline>`` line continuations, as the shell does pre-lex."""
     return _SHELL_LINE_CONTINUATION_RE.sub("", text)
+
+
+def _fold_line_continuations(text: str) -> str:
+    """Remove ``\\<newline>`` exactly where a shell removes it -- quote-aware.
+
+    A shell folds a backslash-newline while lexing, so ``"r\\<newline>m" -rf /``
+    runs ``rm -rf /``.  The deny tiers match text and ``_split_segments`` cuts on
+    the newline, so without folding the continuation is severed before any view is
+    built and every rule authored as a command shape misses that spelling.
+
+    ``_shell_join_continuations`` above looks like the answer and is NOT: it is a
+    bare regex that folds inside SINGLE quotes too, and its comment scopes it
+    deliberately to the self-protection floor's tokenizer input rather than to the
+    matched text of the whole catalog.  Applying it here would fold
+    ``echo 'r\\<newline>m -rf /'`` -- which bash prints literally -- into a denial.
+
+    The contexts were measured against bash rather than assumed (``printf %q`` on
+    the resulting argv):
+
+    ======================  ==================  ========
+    spelling                bash argv           folded?
+    ======================  ==================  ========
+    ``A\\<nl>A BB``          ``<AA><BB>``        yes
+    ``"A\\<nl>A" BB``        ``<AA><BB>``        yes
+    ``'A\\<nl>A' BB``        ``<A\\<nl>A><BB>``   no
+    ``$'A\\<nl>A' BB``       ``<A\\<nl>A><BB>``   no
+    ======================  ==================  ========
+
+    So: fold unquoted and inside double quotes; preserve inside single quotes and
+    inside ANSI-C (``$'…'``) spans.  ``$"…"`` follows the double-quote rule, which
+    falls out of the scan because only ``$'`` opens a preserving span.
+
+    Runs BEFORE the ANSI-C decode, which is the shell's own order: continuations
+    are removed while lexing, and the escape body is interpreted after -- so a
+    preserved ``\\<newline>`` inside ``$'…'`` stays part of that literal.
+
+    An unterminated quote simply runs to the end in that state; the scan never
+    raises, because it feeds the permission gate.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    # None = unquoted, "'" = single, '"' = double, "$'" = ANSI-C.
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote is None:
+            if text.startswith("$'", i):
+                quote = "$'"
+                out.append("$'")
+                i += 2
+                continue
+            if ch in "'\"":
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                folded = _continuation_width(text, i)
+                if folded:
+                    i += folded
+                    continue
+                # The backslash escapes the next character, so that character
+                # cannot open a quote -- consume the pair together.
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                folded = _continuation_width(text, i)
+                if folded:
+                    i += folded
+                    continue
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            out.append(ch)
+            i += 1
+            continue
+        if quote == "$'":
+            # A backslash escapes the next character (including the closing quote),
+            # and a continuation inside this span is LITERAL -- both are consumed
+            # as a pair, which preserves them.
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == "'":
+                quote = None
+            out.append(ch)
+            i += 1
+            continue
+        # Single quotes: nothing is special, not even a backslash.
+        if ch == "'":
+            quote = None
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _continuation_width(text: str, i: int) -> int:
+    """Characters to drop for a continuation at *i*, or 0 if there is none.
+
+    ``text[i]`` is known to be a backslash.  Handles both ``\\n`` and ``\\r\\n``
+    line endings so a CRLF command is folded the same way.
+    """
+    if text.startswith("\\\n", i):
+        return 2
+    if text.startswith("\\\r\n", i):
+        return 3
+    return 0
 
 
 def _redirect_consumes_next(token: str) -> "tuple[bool, bool]":
@@ -10898,6 +11080,201 @@ def _deny_pattern_matches(pattern: str, text: str, is_regex: bool) -> bool:
     return fnmatch.fnmatch(text, pattern.lower())
 
 
+def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]:
+    """The views of ONE shell segment that the deny tiers are matched against.
+
+    *segment* arrives with its ORIGINAL CASE, and every view returned is
+    lowercased.  Case matters for exactly one step: bash's Unicode escape widths
+    are case-sensitive (``\\u`` up to 4 hex digits, ``\\U`` up to 8), so decoding
+    after a ``lower()`` would read ``$'\\u0072f'`` -- which bash passes as ``rf`` --
+    as a single 5-digit code point and miss the rule.  The decode therefore runs
+    FIRST, on the text as written, and the lowercasing happens after.
+
+    The first element is always the raw text (lowercased) -- matched exactly as it
+    was before this helper existed -- so nothing that was denied can stop being
+    denied.  Quote/escape-NORMALIZED re-joins are APPENDED when they differ.
+
+    *emit_self* False walks NESTED PAYLOADS ONLY, emitting no view for *segment*
+    itself.  That is how the whole command is inspected without joining across its
+    separators: ``_split_segments`` is deliberately quote-unaware, so a newline
+    inside a quoted payload (``bash -c 'r\\<newline>m -rf /'``) severs the command
+    into pieces before the payload can be extracted from it -- while re-joining the
+    whole command would fabricate a command that never ran.  Walking it for
+    payloads without emitting its own re-join gets the first without the second.
+
+    ── Why the extra view is needed ──
+    Both deny tiers match TEXT, and a shell removes quoting, escaping and
+    empty-string splices and collapses whitespace runs before the program ever
+    sees its argv.  So every rule authored as a command SHAPE (``rm -rf /``,
+    ``dd if=``, ``chmod 777``) was defeated by re-spelling any one token:
+    ``rm -rf "/"``, ``"rm" -rf /``, ``'rm' -rf /``, ``rm "-rf" /``,
+    ``r''m -rf /`` and ``rm  -rf /`` all run the identical command and none of
+    them CONTAINS the pattern's own text.  Of the ~140 built-in rules only the
+    six self-protection rules and git-publish had an argv-structural floor
+    closing this (see ``_SELF_PROTECTION_FLOOR_PATTERNS``); every other rule was
+    spelling-dependent.
+
+    ── Why the tokenizer is ``_shell_tokens`` and not ``normalize_shell_command``
+    Both share one tokenizer, but the deny view deliberately stops BEFORE
+    ``~``/``$HOME`` expansion, for two reasons.  Expansion is
+    platform-dependent, so it would make the view decide differently per host:
+    it DELETES the literal ``~`` that ``rm -rf ~.*`` is authored to match, and
+    on Windows it yields a drive path (``c:\\users\\…``) that no POSIX-anchored
+    rule matches — so ``rm -rf "~"`` would be caught on Linux by the sibling
+    ``rm -rf /.*`` rule and missed on Windows.  And a denied view becomes the
+    security event log's ``operation`` field, so expanding here would write the
+    operator's real home path into the audit trail on every such denial.  Path
+    IDENTITY (dot segments, ``..``, ``$HOME`` versus the resolved home) is
+    already decided by ``_check_sensitive_via_normalizer`` against the
+    sensitive-path keystone, which is the layer that resolves rather than
+    matches; this view answers only the narrower question of what the shell
+    hands over as argv.
+
+    ── Why this is a per-SEGMENT view, never a whole-command one ──
+    Re-joining tokens with single spaces erases the separators a shell uses to
+    END a command, so normalizing the whole input would FABRICATE a command that
+    was never run: ``echo rm`` + newline + ``-rf /`` is two commands, and a
+    whole-input re-join reads as ``echo rm -rf /``.  The heredoc frames pinned by
+    ``TestStdinProgramTextScoping.test_benign_neighbour_no_longer_reads_as_a_mint``
+    are the concrete case.  Segments come from ``_split_segments``, so no boundary
+    is ever crossed — including inside a nested payload, which is split the same
+    way before being viewed.
+
+    ── Nested shell payloads ──
+    A shell's ``-c`` argument is a COMMAND, and ``shlex`` strips only the OUTER
+    quoting level, so ``bash -c 'dd "if=/dev/zero" of=/dev/sda'`` re-joins with
+    its inner quotes intact and the ``dd if=`` rule still does not match (found
+    by the GPT 5.6 review lane on this change).  Each literal payload is
+    therefore walked and viewed in its own right, reusing
+    :func:`_nested_shell_payloads` — the extractor the self-protection floor
+    already uses, so the ``-c`` / ``eval`` / ``env -S`` / herestring /
+    ``$SHELL -c`` spellings and the ``bash -c -- <script>`` form are recognized
+    here by construction rather than re-enumerated.  Only LITERAL payloads exist
+    to walk: ``eval "$CMD"`` carries no visible script and stays the raw tier's
+    job.
+
+    The walk takes NO numeric depth cap, for the reason
+    :func:`_self_token_frames` records: whatever the number, one more wrapper
+    defeats it.  It terminates structurally instead — a payload is carried inside
+    ONE token of its parent, so it is strictly shorter than the parent's source
+    text, and a chain of strictly shorter strings is finite.
+
+    ── Fail-closed, and it never raises ──
+    This only ever ADDS views.  ``_shell_tokens`` already degrades to whitespace
+    splitting with quote stripping when ``shlex`` rejects the input (so even an
+    unbalanced-quote segment still normalizes), and every window is built inside a
+    guard: this runs in the permission gate, where an exception is a crash rather
+    than a security decision, so a failure drops that window and leaves the raw
+    view standing.  A failure can therefore lose the EXTRA match but never the raw
+    one, so it cannot turn a denied command into an allowed one.
+
+    ── Residual ──
+    Two shapes stay outside every view.  A token split by BOTH quoting and a
+    separator-shaped glue construct (``"rm"$(echo ' ')-rf /``) is in none of them:
+    the raw text is not contiguous and the glue lands on its own segment — the
+    whole-string raw pass covers the glue-ONLY spelling (``git$(echo ' ')push``),
+    and closing the combination needs a normalizer that models substitution,
+    which a re-join is not.  And a variable spelling of a path operand
+    (``rm -rf $HOME``) is by construction not expanded here, per the note above.
+    """
+    views: list[str] = [segment.lower()] if emit_self else []
+    seen_views: set[str] = set(views)
+    # Decode the case-sensitive escapes BEFORE folding case (see the docstring),
+    # then work entirely in lowercase from here on -- the tiers compare lowercased
+    # text, and the payload extractor recognizes lowercase program names.  Guarded
+    # like the walk below: this is the permission gate, so a decoder that raises
+    # must cost the extra view, never the decision.
+    try:
+        start = _decode_shell_quoted_literals(segment).lower()
+    except Exception:
+        logger.debug("deny-view quote decode failed; raw view only", exc_info=True)
+        start = segment.lower()
+    seen_sources: set[str] = {start}
+    # (source, parent_len, is_root): a payload lives inside one token of its parent,
+    # so it is strictly shorter than the parent's source text — which is what bounds
+    # this walk without a numeric cap.  ``is_root`` marks the source the caller
+    # handed in, whose own re-join ``emit_self=False`` suppresses.
+    pending: list[tuple[str, int, bool]] = [(start, len(start) + 1, True)]
+    while pending:
+        source, parent_len, is_root = pending.pop()
+        try:
+            tokens = _shell_tokens(source)
+            if not tokens:
+                continue
+            # No expansion happens above, so an already-lowercased source stays
+            # lowercased through the re-join and needs no second fold.
+            view = " ".join(tokens)
+            if not (is_root and not emit_self) and view not in seen_views:
+                seen_views.add(view)
+                views.append(view)
+            payloads = _nested_shell_payloads(tokens)
+            programs = _argv_programs(tokens) if payloads else []
+            for payload in payloads:
+                if len(payload) >= parent_len:
+                    continue
+                # ``echo bash -c '<script>'`` PRINTS the script, so descending into
+                # it refuses a command that runs nothing (raised as an advisory by
+                # the GPT 5.6 lane).  The repo's own exemption decides this, rather
+                # than a "launcher must be in command position" rule: the launcher
+                # is NOT in command position in ``sudo bash -c …``,
+                # ``timeout 5 bash -c …``, ``nohup``, ``ssh host``, ``xargs`` or
+                # ``env FOO=1 bash -c …``, all of which really do execute, so that
+                # rule would trade this false positive for six bypasses.
+                # ``_data_consumer_exempt`` is a DENYLIST of consumers with the
+                # executing cases already carved out (a piped evaluator, a
+                # substitution in program position, an ``awk``/``sed`` script that
+                # can execute), so a program it does not know stays walked.
+                #
+                # A payload is not necessarily a TOKEN.  ``_nested_shell_payloads``
+                # also returns SYNTHESIZED text — a ``sed`` ``e``-flag replacement,
+                # the tail of a glued herestring (``bash<<<'<script>'``), a glued
+                # ``env -S`` argument, an ``alias`` assignment — which is a
+                # substring or a re-join, not an element of ``tokens``.  Recovering
+                # a position with ``list.index`` therefore raised ``ValueError`` and
+                # propagated out of the permission gate on legitimate input
+                # (``sed 's/x/y/e' notes.txt``): found independently as BLOCKING by
+                # the GPT 5.6 and Opus 4.8 lanes.
+                #
+                # The exemption is decided per OCCURRENCE and fails closed: it is
+                # applied only when the payload appears as a token AND every
+                # occurrence sits in the argv of a data consumer.  A payload with no
+                # token position cannot be proven inert, so it is DESCENDED into —
+                # over-blocking, which is the safe direction here.  Deciding from a
+                # single recovered index would not be sound: a short synthesized
+                # payload can also be a coincidental substring of an unrelated
+                # token, and one wrong position could wrongly exempt a payload that
+                # really executes.
+                occurrences = [i for i, tok in enumerate(tokens) if tok == payload]
+                if occurrences and all(
+                    _data_consumer_exempt(i, payload, programs, tokens) for i in occurrences
+                ):
+                    continue
+                # A payload is a command LINE, so it gets the same PRE-LEX treatment
+                # the top level got: the shell that runs it folds ITS continuations
+                # before lexing, so fold before splitting or the split severs them.
+                # ``bash -c 'r\<newline>m -rf /'`` otherwise yields the pieces ``r``
+                # and ``m -rf /``, and no view holds the command that runs (BLOCKING
+                # from the GPT 5.6 lane).  A view must also not be joined across one
+                # of the payload's own separators.  Only the PIECES are recorded as
+                # walked — recording the payload itself would filter out the single
+                # piece that equals it.
+                for piece in _split_segments(_fold_line_continuations(payload)):
+                    piece = piece.strip()
+                    if piece and piece not in seen_sources:
+                        seen_sources.add(piece)
+                        pending.append((piece, len(source), False))
+        except Exception:
+            # This runs INSIDE the permission gate, where an exception is a crash
+            # rather than a security decision — the hazard ``_normalize_search_path``
+            # documents for the same reason.  Losing one view only costs the EXTRA
+            # match; the raw view is already in ``views`` and the raw tier decides
+            # exactly as it did before this helper existed, so a failure here can
+            # never turn a denied command into an allowed one.
+            logger.debug("deny-view construction failed for a window", exc_info=True)
+            continue
+    return tuple(views)
+
+
 # An interpreter binds the halves to its OWN variables
 # (``n = "<name>"; v = "<verb>"; run([n, v])``) and then uses the names.  Inlining those
 # bindings is the interpreter-side twin of the shell assignment resolution, and it is what
@@ -11032,6 +11409,12 @@ def is_denied(
       - Pass-2 splitting is purely textual; quoted strings and escaped
         separators are split anyway (over-blocking is the safer
         direction).
+      - Each pass-2 segment is matched in TWO views: the raw text, then a
+        quote/escape-normalized re-join of that segment
+        (``_deny_segment_views``), so a rule authored as a command shape is
+        not defeated by re-quoting a token (``rm -rf "/"``), splicing one
+        (``r''m -rf /``) or padding the whitespace.  Strictly additive, and
+        never applied across a separator — see that helper.
       - Heredoc bodies, ``eval``, ``bash -c``, etc., are not parsed
         specially.  If those become evasion vectors in practice, add
         explicit deny patterns for them.
@@ -11189,25 +11572,65 @@ def is_denied(
     # ``$(...)``) into its own segment so it matches the deny pattern in its own
     # right (chaining-bypass protection).  Segments that match a deny pattern
     # AND an exception are allowed with a SEL audit event.
-    segments = _split_segments(lower)
-    for segment in segments:
-        seg_lower = segment.strip()
-        if not seg_lower:
-            continue
-        for pattern, is_regex in all_patterns:
-            if _deny_pattern_matches(pattern, seg_lower, is_regex):
-                exceptions = _DENY_EXCEPTIONS.get(pattern, [])
-                if exceptions and any(fnmatch.fnmatch(seg_lower, e.lower()) for e in exceptions):
-                    if not _emit_deny_exception_event(tool_name, pattern):
-                        _emit_deny_event(tool_name, pattern, seg_lower)
-                        return _reason(pattern)
-                    # Exception granted for this pattern on this segment;
-                    # continue to evaluate any remaining patterns against
-                    # the same segment (a different pattern without an
-                    # exception must still cause a deny).
-                    continue
-                _emit_deny_event(tool_name, pattern, seg_lower)
-                return _reason(pattern)
+    #
+    # Each segment is evaluated in every view ``_deny_segment_views`` returns:
+    # the RAW text first (identical to what this pass matched before that helper
+    # existed), then a quote/escape-normalized re-join of the same segment when
+    # it differs.  The second view is what makes a rule authored as a command
+    # shape hold under re-spelling — ``rm -rf "/"`` and ``"rm" -rf /`` reach the
+    # ``rm -rf /`` rule as the one command they both are.  It is strictly
+    # additive: see that helper for why it is per-segment and why a
+    # normalization failure cannot widen what is allowed.
+    # Segments are split from the ORIGINAL-case input, not from ``lower``, so
+    # ``_deny_segment_views`` can decode bash's case-sensitive Unicode escape
+    # widths before folding case.  The split is unaffected: ``_split_segments``
+    # cuts on ``;`` ``&&`` ``||`` ``|`` newlines and substitution boundaries, none
+    # of which any case mapping produces, so splitting-then-lowercasing and
+    # lowercasing-then-splitting give the same pieces.
+    #
+    # Line continuations are folded FIRST, because the split cuts on the newline
+    # they contain: without this, ``"r\<newline>m" -rf /`` is severed into two
+    # segments and neither contains the command bash actually runs.  The fold is
+    # quote-aware (see ``_fold_line_continuations``) -- pass 1 above still matches
+    # the completely unfolded text, so this only ever adds reach.
+    # The WHOLE command is walked for nested payloads first, with its own re-join
+    # suppressed.  ``_split_segments`` is deliberately quote-unaware, so a newline
+    # inside a quoted payload severs the command before the payload can be
+    # extracted from it -- ``bash -c 'r\<newline>m -rf /'`` arrives as the pieces
+    # ``bash -c 'r\`` and ``m -rf /'`` and the ``-c`` script is never seen (BLOCKING
+    # from the GPT 5.6 lane).  Emitting no view for the command itself is what keeps
+    # this from fabricating one across its separators.
+    folded = _fold_line_continuations(tool_name)
+    segments = [seg.strip() for seg in _split_segments(folded)]
+    segments = [seg for seg in segments if seg]
+    work: list[tuple[str, tuple[str, ...]]] = []
+    # The whole-command payload walk is only needed when the split actually SPLIT
+    # something.  With a single segment the whole command IS that segment, so
+    # walking it twice doubles the payload scan -- which is quadratic in token
+    # count inside ``_nested_shell_payloads`` -- for no view the segment walk does
+    # not already produce.  Measured: skipping the duplicate halves the cost on a
+    # command padded with thousands of interpreter tokens (raised as a stall risk by
+    # the GPT 5.6 lane).
+    if len(segments) != 1 or segments[0] != folded.strip():
+        work.append(("", _deny_segment_views(tool_name, False)))
+    for seg_raw in segments:
+        work.append((seg_raw.lower(), _deny_segment_views(seg_raw)))
+    for seg_lower, segment_views in work:
+        for view in segment_views:
+            for pattern, is_regex in all_patterns:
+                if _deny_pattern_matches(pattern, view, is_regex):
+                    exceptions = _DENY_EXCEPTIONS.get(pattern, [])
+                    if exceptions and any(fnmatch.fnmatch(view, e.lower()) for e in exceptions):
+                        if not _emit_deny_exception_event(tool_name, pattern):
+                            _emit_deny_event(tool_name, pattern, view, raw_segment=seg_lower)
+                            return _reason(pattern)
+                        # Exception granted for this pattern on this segment;
+                        # continue to evaluate any remaining patterns against
+                        # the same segment (a different pattern without an
+                        # exception must still cause a deny).
+                        continue
+                    _emit_deny_event(tool_name, pattern, view, raw_segment=seg_lower)
+                    return _reason(pattern)
     # All windows cleared the deny passes — the input is allowed.  If it was a
     # feature-branch push, emit the deferred allow audit now (final outcome).
     if push_allow_pending:
@@ -11303,7 +11726,9 @@ def _split_segments(command_lower: str) -> list[str]:
     return _CMD_SPLIT_RE.split(command_lower)
 
 
-def _emit_deny_event(tool_name: str, deny_pattern: str, segment: str) -> None:
+def _emit_deny_event(
+    tool_name: str, deny_pattern: str, segment: str, raw_segment: str = ""
+) -> None:
     """Emit a SEL audit event when a command is denied.
 
     Records the operation, matched pattern, and (for pass-2 denials) the
@@ -11311,12 +11736,37 @@ def _emit_deny_event(tool_name: str, deny_pattern: str, segment: str) -> None:
     security-controls guideline that every permission decision — both
     grants and denials — must produce an audit trail.
 
+    *raw_segment* is the segment's UNNORMALIZED text, recorded as a separate
+    ``raw_segment`` field when it differs from *segment*.  A pass-2 match can now
+    come from a quote-normalized view (``_deny_segment_views``), and the view is
+    the more useful thing to show — it names the command that would have run —
+    but the evasion is only visible in the spelling the caller actually
+    submitted, so forensics needs both.  The full raw input is already carried in
+    ``operation``; this pins WHICH segment of it normalized into the match, which
+    a multi-segment command otherwise leaves the reader to re-derive.  Omitted
+    when the two are equal, so an ordinary denial's event does not grow.
+
     Best-effort: SEL logging failures are logged at WARNING and do not
     affect the deny decision (denials are inherently fail-closed; the
     block stands regardless of audit success).
     """
     try:
         sel = SecurityEventLog()
+        # ``redact_and_truncate``, never a bare slice: it redacts over the FULL text
+        # BEFORE cutting, which is the rule that function exists to enforce -- a
+        # credential straddling the 200-char boundary would otherwise be cut in half,
+        # and the fragment no longer matches the credential pattern, so SEL's own
+        # write-path redaction cannot catch it and the partial secret persists in a
+        # dashboard-readable log.  Both fields take it: ``raw_segment`` is new, and
+        # ``segment`` carried the same hazard from a bare slice (found by the GPT 5.6
+        # review lane on the new field).
+        metadata = {
+            "deny_pattern": deny_pattern,
+            "segment": redact_and_truncate(segment, 200) if segment else "",
+            "mechanism": "BUILTIN_DENY_PATTERNS",
+        }
+        if raw_segment and raw_segment != segment:
+            metadata["raw_segment"] = redact_and_truncate(raw_segment, 200)
         sel.log(
             SecurityEvent(
                 event_id=uuid.uuid4().hex[:16],
@@ -11328,11 +11778,7 @@ def _emit_deny_event(tool_name: str, deny_pattern: str, segment: str) -> None:
                 operation=tool_name,
                 outcome="denied",
                 resources=f"deny_pattern={deny_pattern}",
-                metadata={
-                    "deny_pattern": deny_pattern,
-                    "segment": segment[:200] if segment else "",
-                    "mechanism": "BUILTIN_DENY_PATTERNS",
-                },
+                metadata=metadata,
             )
         )
     except Exception:
@@ -11674,6 +12120,186 @@ _EMPTY_QUOTE_RE = re.compile(r'""|\'\'')
 # Regex for $HOME or ${HOME} variable expansion.
 _HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME", re.IGNORECASE)
 
+# ANSI-C (``$'…'``) and locale (``$"…"``) quoting.  Both are QUOTING forms whose
+# value the shell computes before the program sees it, so they are resolved as part
+# of tokenization.  Matched on the RAW text rather than after ``shlex``, which is
+# what makes it safe: ``shlex`` removes the quotes but leaves the ``$`` glued to the
+# content, and at that point ``$'/'`` -> ``$/`` is indistinguishable from a variable
+# reference like ``$HOME``, so stripping the ``$`` post-hoc would eat real variables.
+# Requiring the quote character here means a bare ``$HOME`` never matches.
+#
+# The negated classes EXCLUDE the backslash, and that is a ReDoS fix, not a style
+# choice.  With ``[^']`` a backslash could match either alternative -- ``\\.`` (two
+# characters) or the class (one) -- the textbook ambiguous quoted-string pattern, so
+# an unterminated ``$'`` followed by a run of backslashes forces the engine through
+# ~1.618**n tilings of that run.  This regex runs inside the PreToolUse gate on the
+# full, uncapped command, so that is a hang, not a slowdown (measured: 9 ms at 24
+# backslashes, growing ~1.6x per character).  Excluding the backslash makes the
+# alternation unambiguous -- a backslash is always consumed by ``\\.`` -- while
+# accepting exactly the same language.  Found by the Opus 4.8 review lane.
+_ANSI_C_QUOTE_RE = re.compile(r"\$'((?:\\.|[^'\\])*)'|\$\"((?:\\.|[^\"\\])*)\"", re.DOTALL)
+
+# Single-character ANSI-C escapes that stand for a LITERAL character.  These are
+# the ones bash resolves and a matcher must therefore see resolved: without them
+# ``$'rm -rf \"/\"'`` keeps its backslashes and the rule does not match, while bash
+# passes the plain quotes (BLOCKING from the GPT 5.6 lane).
+_ANSI_C_LITERAL_ESCAPES = {"\\": "\\", "'": "'", '"': '"', "?": "?"}
+# Escapes that stand for a control character.  Mapped to a SPACE rather than the
+# character itself, which is what ``_decode_printf_escapes`` has always done for
+# this family: the value of resolving them here is that a token boundary appears
+# where the shell puts one, and a literal control byte in a matched view would
+# only travel into the audit record.  Deliberate, and the reason this decoder is
+# not simply "what bash produces".
+_ANSI_C_SPACE_ESCAPES = frozenset("abefnrtvE")
+
+
+def _decode_ansi_c_body(body: str) -> str:
+    """Resolve the escapes inside one ``$'…'`` body, in a SINGLE left-to-right pass.
+
+    One pass is the whole point.  Sequential ``str.replace`` calls let one
+    substitution's OUTPUT be re-read as another's input: ``$'\\\\n'`` is an escaped
+    backslash followed by the letter ``n`` (two characters), but a chain that
+    resolves ``\\\\`` first and then looks for ``\\n`` collapses it to whitespace and
+    invents a separator bash never passed.  Consuming each escape atomically here
+    makes that impossible -- the same failure mode as the Unicode-width guess this
+    file already carries a note about.
+
+    Numeric forms keep bash's exact widths (``\\xHH``, ``\\nnn`` octal, ``\\uHHHH``,
+    ``\\UHHHHHHHH``) and the inert guard, so a NUL or lone surrogate stays encoded.
+    An unrecognised escape keeps both characters, as bash does.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in _ANSI_C_LITERAL_ESCAPES:
+            out.append(_ANSI_C_LITERAL_ESCAPES[nxt])
+            i += 2
+            continue
+        if nxt in _ANSI_C_SPACE_ESCAPES:
+            out.append(" ")
+            i += 2
+            continue
+        if nxt == "c" and i + 2 < n and body[i + 2].isascii():
+            # ``\cX`` is a CONTROL character, and ``\cI`` is a TAB -- so
+            # ``bash -c $'rm\\cI-rf /'`` hands the inner shell a tab-separated
+            # ``rm -rf /`` and it runs (BLOCKING from the GPT 5.6 lane; measured,
+            # the inner shell does split on it).  The mapping is MEASURED rather
+            # than derived: ``ord(upper(X)) & 0x1F``, with ``?`` special-cased to
+            # 0x7F -- an XOR-0x40 guess gets ``\\c0`` wrong (bash gives 0x10, not
+            # ``p``).  The result is always a control character, so it takes the
+            # same normalization to a SPACE as the named family above, which is
+            # what puts a token boundary where the shell puts one.
+            #
+            # Restricted to a single ASCII character, because ``str.upper()`` is
+            # not length-preserving outside it: ``"ß".upper()`` is ``"SS"``, and
+            # ``ord`` of that raised ``TypeError`` straight out of the permission
+            # gate on ``echo $'\\cß'`` -- a crash where a security decision belongs
+            # (also BLOCKING, same lane).  A non-ASCII target falls through to the
+            # unrecognised branch and keeps both characters, as bash does for a
+            # spelling it does not define.
+            target = body[i + 2]
+            code = 0x7F if target == "?" else (ord(target.upper()) & 0x1F)
+            if code == 0:
+                # ``\c@`` is a NUL, and bash TRUNCATES the word there -- see the
+                # numeric branch below for the measurement.
+                return "".join(out)
+            out.append(" ")
+            i += 3
+            continue
+        match = _ANSI_C_NUMERIC_ESCAPE_RE.match(body, i)
+        if match:
+            # A NUL TRUNCATES the word -- bash cannot place one in an argv, and what
+            # it does instead is stop there.  Measured on every spelling that can
+            # reach zero: ``$'AA\\0junk'``, ``$'AA\\400junk'``, ``$'AA\\x00junk'``,
+            # ``$'AA\\u0000j'`` and ``$'AA\\c@junk'`` all yield ``AA``, and
+            # ``$'\\0AA'`` yields the empty word.  Leaving the escape encoded instead
+            # was a bypass: ``$'dd\\0junk' if=/dev/zero of=/dev/sda`` ran the
+            # destructive command while the view held ``dd\\0junk if=`` and matched
+            # nothing (BLOCKING from the GPT 5.6 lane).  The OTHER inert codes -- out
+            # of range, lone surrogate -- keep the escape rather than truncating,
+            # because bash does not produce them at all and guessing what it would do
+            # is what the measurements above exist to avoid.
+            numeric_code = _numeric_escape_code(match)
+            if numeric_code == 0:
+                return "".join(out)
+            out.append(_numeric_escape_char(match))
+            i = match.end()
+            continue
+        # Unrecognised: bash keeps the backslash and the character.
+        out.append(body[i : i + 2])
+        i += 2
+    return "".join(out)
+
+
+def _decode_shell_quoted_literals(cmd: str) -> str:
+    """Resolve each ``$'…'`` span, and reduce each ``$"…"`` to plain double quotes.
+
+    ``rm -rf $'/'`` runs exactly what ``rm -rf /`` runs, and ``$'\\x2d\\x76'`` is
+    ``-v``, so a matcher that has not resolved these is reading a spelling the
+    shell never hands over.  An ANSI-C value is re-quoted with ``shlex.quote`` so a
+    value containing whitespace or a quote stays ONE token through ``shlex.split``.
+
+    ``$"…"`` is LOCALE TRANSLATION, and it is NOT ANSI-C -- measured, because
+    treating the two alike was a bypass (BLOCKING from the GPT 5.6 lane).  Bash
+    gives ``$"\\r\\mAA"`` the word ``\\r\\mAA``, byte-identical to plain
+    ``"\\r\\mAA"``: inside double quotes a backslash escapes only ``$``, `````,
+    ``"``, ``\\`` and a newline, so ``\\r`` is a literal backslash-r and NOT a
+    carriage return.  Decoding it as ANSI-C turned that ``\\r`` into whitespace and
+    the command vanished from the view, while the inner shell of
+    ``bash -c $"\\r\\m -rf /"`` resolves the backslashes in its OWN lexing pass and
+    runs the destructive command (measured: it executes ``rmAA`` for
+    ``bash -c $"\\r\\mAA"``).  So the ``$`` is dropped and the double-quoted text is
+    left for ``shlex`` to resolve by double-quote rules -- which also keeps
+    ``rm -rf $"/"`` reaching the rule, since bash's operand there is ``/``.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        ansi_c_body = match.group(1)
+        if ansi_c_body is not None:
+            return shlex.quote(_decode_ansi_c_body(ansi_c_body))
+        return '"' + (match.group(2) or "") + '"'
+
+    return _ANSI_C_QUOTE_RE.sub(_replace, cmd)
+
+
+def _shell_tokens(cmd: str) -> list[str]:
+    """Tokenize *cmd* the way a POSIX shell hands argv to a program.
+
+    Quote removal, backslash de-escaping (``shlex`` POSIX mode), ANSI-C / locale
+    quoting (``$'…'``, ``$"…"`` -- see :func:`_decode_shell_quoted_literals`),
+    empty-string concatenation (``g""it`` -> ``git``) and whitespace-run collapsing
+    -- and NOTHING else: no tilde, no ``$HOME``, no path resolution.  This is the
+    shared core of two callers that need the same token identity but must stop at
+    different points:
+
+    * :func:`normalize_shell_command` continues on to expand ``~``/``$HOME``,
+      because it feeds path matchers that decide FILE identity.
+    * :func:`_deny_segment_views` stops here, because expansion is
+      platform-dependent and would land the operator's real home path in the
+      audit trail -- see that function.
+
+    On parse failure (unbalanced quotes) falls back to whitespace splitting with
+    quote/backslash stripping, so a hostile unterminated quote yields a degraded
+    view rather than no view.
+    """
+    if not cmd or not cmd.strip():
+        return []
+    cmd = _decode_shell_quoted_literals(cmd)
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        # Unbalanced quotes or other parse errors — fall back to basic split.
+        tokens = [t.strip("\"'\\") for t in cmd.split()]
+    # Strip empty-string concatenation artifacts: ca""t -> cat, g''it -> git
+    return [_EMPTY_QUOTE_RE.sub("", token) for token in tokens]
+
 
 def normalize_shell_command(cmd: str) -> list[str]:
     """Normalize a shell command string into a resolved token list.
@@ -11687,10 +12313,11 @@ def normalize_shell_command(cmd: str) -> list[str]:
 
     Returns a list of resolved tokens.  On parse failure (unmatched quotes)
     falls back to basic whitespace splitting with quote/backslash stripping.
-    """
-    if not cmd or not cmd.strip():
-        return []
 
+    Tokenization — everything up to and including the empty-quote collapse — is
+    :func:`_shell_tokens`; the EXPANSION below is what makes this the path
+    normalizer rather than the plain argv view the deny tiers use.
+    """
     # NOTE: $HOME expansion happens AFTER tokenization (in the per-token loop
     # below), NOT here.  The previous pre-shlex expansion inserted the raw home
     # path (e.g. ``C:\Users\name`` on Windows) into the command string before
@@ -11700,20 +12327,9 @@ def normalize_shell_command(cmd: str) -> list[str]:
     # handled: shlex strips quotes and produces a literal ``$HOME/...`` token,
     # which the loop then expands safely without backslash reinterpretation.
 
-    # Tokenize using POSIX shlex — handles quoting, escaping, etc.
-    try:
-        tokens = shlex.split(cmd, posix=True)
-    except ValueError:
-        # Unbalanced quotes or other parse errors — fall back to basic split.
-        tokens = cmd.split()
-        tokens = [t.strip("\"'\\") for t in tokens]
-
     home = os.path.expanduser("~")
     resolved: list[str] = []
-    for token in tokens:
-        # Strip empty-string concatenation artifacts: ca""t -> cat, g''it -> git
-        token = _EMPTY_QUOTE_RE.sub("", token)
-
+    for token in _shell_tokens(cmd):
         # Expand $HOME/${HOME} per-token (after shlex, so Windows backslashes
         # in the expanded path are never reinterpreted as escape characters).
         # Uses a callable replacement to avoid re.error on Windows where the
