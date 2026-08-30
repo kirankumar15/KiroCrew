@@ -4585,6 +4585,17 @@ class _AppAgentNotLoaded(Exception):
     """
 
 
+async def _refresh_project_attachment(slot: _ChatSlot) -> None:
+    """Resolve restored Project state before any session binds its working directory."""
+    if not slot.project_id or slot._project_brief:
+        return
+    from kiro_crew.project_sessions import resolve_project_attachment
+
+    attachment = await asyncio.to_thread(resolve_project_attachment, slot.project_id)
+    slot.project = str(attachment.workspace_dir)
+    slot._project_brief = attachment.brief
+
+
 async def _run_chat(
     state: DashboardState,
     slot: _ChatSlot,
@@ -5253,6 +5264,11 @@ async def _run_chat(
         # after the resolve block). Captured inside the try so the raise below
         # lives OUTSIDE it and is not swallowed by the resolve except.
         _app_agent_unresolved = False
+        # Restored slots persist the Project id and the last known cwd, but not
+        # the derived brief. Resolve the current bundle before the best-effort
+        # agent-binding block: attachment failure must abort rather than letting
+        # get_or_create launch in the stale persisted workspace.
+        await _refresh_project_attachment(slot)
         try:
             cfg = KiroCrewConfig.load()
             provider_name = cfg.agent.provider
@@ -5814,6 +5830,7 @@ async def _run_chat(
                 resumed=resumed,
                 workspace=slot.workspace or None,
                 project=slot.project or None,
+                project_brief=slot._project_brief or None,
                 memory_store=memory_store,
                 compressed_history=compressed,
                 mode=slot.mode,

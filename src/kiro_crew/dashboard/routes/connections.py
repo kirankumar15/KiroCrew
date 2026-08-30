@@ -54,12 +54,26 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/taskrunner/refine/cancel", handlers.api_taskrunner_refine_cancel)
     app.router.add_post("/api/taskrunner/refine/answer", handlers.api_taskrunner_refine_answer)
 
-    # Projects
+    # Portable Project bundles. Literal routes precede the id route so "add"
+    # cannot be interpreted as a project id.
     app.router.add_get("/api/projects", handlers_project.api_projects_list)
-    app.router.add_get("/api/projects/{id}", handlers_project.api_project_get)
     app.router.add_post("/api/projects", handlers_project.api_project_create)
-    app.router.add_put("/api/projects/{id}", handlers_project.api_project_update)
-    app.router.add_delete("/api/projects/{id}", handlers_project.api_project_delete)
+    app.router.add_post("/api/projects/add", handlers_project.api_project_add)
+    app.router.add_patch("/api/projects/{id}", handlers_project.api_project_update)
+    app.router.add_post("/api/projects/{id}/sync", handlers_project.api_project_sync)
+    app.router.add_post("/api/projects/{id}/activate", handlers_project.api_project_activate)
+    app.router.add_delete("/api/projects/{id}/activate", handlers_project.api_project_deactivate)
+    app.router.add_delete("/api/projects/{id}", handlers_project.api_project_remove)
+    app.router.add_get("/api/projects/{id}", handlers_project.api_project_get)
+
+    # Compatibility aliases for the former task-runner "project" API. The
+    # Task Runner portal itself uses /api/taskrunner, but external callers keep
+    # a migration path after /api/projects becomes the bundle authority.
+    app.router.add_get("/api/taskrunner/projects", handlers_project.api_task_projects_list)
+    app.router.add_get("/api/taskrunner/projects/{id}", handlers_project.api_task_project_get)
+    app.router.add_post("/api/taskrunner/projects", handlers_project.api_task_project_create)
+    app.router.add_put("/api/taskrunner/projects/{id}", handlers_project.api_task_project_update)
+    app.router.add_delete("/api/taskrunner/projects/{id}", handlers_project.api_task_project_delete)
     app.router.add_get("/api/activities", handlers_project.api_activities_list)
     app.router.add_post("/api/comments", handlers_project.api_comment_add)
     app.router.add_get("/api/comments", handlers_project.api_comments_list)

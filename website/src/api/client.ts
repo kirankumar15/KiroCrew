@@ -17,6 +17,8 @@ import type {
   SessionTrashResult,
   UpdateCheckResult,
   WorkflowRunSummary,
+  ProjectBundle,
+  ProjectBundlesResponse,
 } from '../types'
 import { ApiError, friendlyErrText } from './apiError'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
@@ -2826,7 +2828,7 @@ export const api = {
     if (before !== undefined) p.set('before', String(before))
     return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '?' + p, { signal }).then(j)
   },
-  createChatSlot: (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string) => post('/api/chat/slots', { ...(name ? { name } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(memory_mode ? { memory_mode } : {}), ...(title ? { title } : {}), ...(clean_mode !== undefined ? { clean_mode } : {}), ...(artifact ? { artifact } : {}), ...(folder_id ? { folder_id } : {}) }).then(j),
+  createChatSlot: (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string, project_id?: string) => post('/api/chat/slots', { ...(name ? { name } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(memory_mode ? { memory_mode } : {}), ...(title ? { title } : {}), ...(clean_mode !== undefined ? { clean_mode } : {}), ...(artifact ? { artifact } : {}), ...(folder_id ? { folder_id } : {}), ...(project_id ? { project_id } : {}) }).then(j),
   /** Inject silent background context into a slot — consumed on the next user
    * message. Used by the artifact companion chat to name the bound artifact so
    * the user's first message needs no slug boilerplate. */
@@ -3018,6 +3020,21 @@ export const api = {
   logLevel: () => fetch('/api/logs/level').then(j),
   setLogLevel: (level: string) => post('/api/logs/level', { level }).then(j),
   // Task runner
+  projectBundles: () => fetch('/api/projects').then(j) as Promise<ProjectBundlesResponse>,
+  createProjectBundle: (name: string, path: string) =>
+    post('/api/projects', { name, path }).then(j) as Promise<ProjectBundle>,
+  addProjectBundle: (source: string) =>
+    post('/api/projects/add', { source }).then(j) as Promise<ProjectBundle>,
+  updateProjectBundle: (id: string, body: import('../types').ProjectBundleUpdate) =>
+    patch('/api/projects/' + encodeURIComponent(id), body).then(j) as Promise<ProjectBundle>,
+  syncProjectBundle: (id: string) =>
+    post('/api/projects/' + encodeURIComponent(id) + '/sync', {}).then(j) as Promise<ProjectBundle>,
+  activateProjectBundle: (id: string, expectedKey: string) =>
+    post('/api/projects/' + encodeURIComponent(id) + '/activate', { expected_key: expectedKey }).then(j) as Promise<ProjectBundle['capabilities']>,
+  deactivateProjectBundle: (id: string) =>
+    del('/api/projects/' + encodeURIComponent(id) + '/activate').then(j) as Promise<ProjectBundle['capabilities']>,
+  removeProjectBundle: (id: string) =>
+    del('/api/projects/' + encodeURIComponent(id)).then(j) as Promise<{ ok: true; id: string }>,
   taskRunnerStatus: () => fetch('/api/taskrunner').then(j),
   startTaskRunner: (spec: string, agent?: string, workspaceDir?: string) => post('/api/taskrunner', { spec, agent: agent || '', workspace_dir: workspaceDir || '' }).then(j),
   cancelTaskRunner: (taskId?: string) => post('/api/taskrunner/cancel', taskId ? { task_id: taskId } : undefined).then(j),

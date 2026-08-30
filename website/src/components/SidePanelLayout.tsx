@@ -49,7 +49,7 @@ interface SidePanelLayoutProps {
    *  Must NOT be localized — it is a storage key, not a label. */
   rememberKey?: string
   footer?: React.ReactNode
-  headerRight?: React.ReactNode
+  headerRight?: React.ReactNode | ((activeTab: string) => React.ReactNode)
   /** Where the mobile layout docks `headerRight`. 'header' (default) keeps it
    *  in the title rows of BOTH levels — right for action buttons (e.g.
    *  Capabilities' Restart), which must stay reachable inside a tab.
@@ -70,6 +70,9 @@ interface SidePanelLayoutProps {
    *  (segment[1] present) for basePath consumers — a second-level selection
    *  is a path segment there, not a `?sub=` param. Must not end in '/'. */
   basePath?: string
+  /** Optional async guard for consumers with unsaved state. Returning false
+   *  leaves the current tab and URL untouched. */
+  beforeTabChange?: (nextTab: string) => boolean | Promise<boolean>
   children: (activeTab: string) => React.ReactNode
 }
 
@@ -86,7 +89,7 @@ export const SidePanelDockContext = React.createContext<'header' | 'bottom-float
 
 const TAB_MEMORY_PREFIX = 'kirocrew:sidepanel-tab:'
 
-export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, footer, headerRight, headerRightDock = 'header', fixedContent, basePath, children }: SidePanelLayoutProps) {
+export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, footer, headerRight, headerRightDock = 'header', fixedContent, basePath, beforeTabChange, children }: SidePanelLayoutProps) {
   const [params, setParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
@@ -149,6 +152,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
   )
 
   const tab = rawTab && tabs.some(t => t.key === rawTab) ? rawTab : (fallbackTab || first)
+  const activeHeaderRight = typeof headerRight === 'function' ? headerRight(tab) : headerRight
   // Mobile is a two-level iOS-style navigation: NO explicit ?tab= means the
   // ROOT LIST (all tabs, grouped, tap to drill), an explicit one means the
   // drilled-in detail. The remembered tab deliberately does NOT auto-drill on
@@ -200,6 +204,11 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
       // state marker is what lets the back control POP this entry instead of
       // writing a duplicate on top of it.
     }, { replace: !isMobile, state: isMobile ? { [SUBNAV_PUSH_STATE]: true } : undefined })
+  }
+  const requestTab = async (nextTab: string) => {
+    if (nextTab === tab && rawTab) return
+    if (beforeTabChange && !await beforeTabChange(nextTab)) return
+    setTab(nextTab)
   }
   /** Mobile back: return to the root list. If THIS stack pushed the current
    *  entry, pop it — a replace-write here would leave [root, root] twins in
@@ -304,7 +313,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
         <div className="flex-1 min-h-0 overflow-y-auto px-4 pb-24 relative">
           <div className="flex items-center justify-between gap-3 pt-3 pb-1">
             <div className="text-2xl font-bold tracking-tight text-text-strong">{title}</div>
-            {headerRight && headerRightDock === 'header' && headerRight}
+            {activeHeaderRight && headerRightDock === 'header' && activeHeaderRight}
           </div>
           {/* role=list, not listbox: these rows NAVIGATE (push a level), they
             * are not a selection — and a listbox may contain only options and
@@ -318,7 +327,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                   {t.dividerBefore && <div className="h-px bg-border mx-2.5 my-2" role="separator" />}
                   <button
                     className={`flex items-center gap-2.5 w-full px-2.5 py-2.5 ${COARSE_TOUCH_TARGET} rounded-md text-[14px] text-left font-medium cursor-pointer border-none bg-transparent text-text transition-colors hover:bg-bg-hover`}
-                    onClick={() => setTab(t.key)}
+                    onClick={() => { void requestTab(t.key) }}
                   >
                     <span className="w-5 h-5 shrink-0 flex items-center justify-center text-muted">{t.icon}</span>
                     <span className="flex-1 min-w-0 truncate">{t.label}</span>
@@ -346,7 +355,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
             * invisible to it, and left-0/right-0 would sit under a landscape
             * notch). pointer-events split so the empty gutter around the
             * capsule stays scrollable. */}
-          {headerRight && headerRightDock === 'bottom-float' && (
+          {activeHeaderRight && headerRightDock === 'bottom-float' && (
             <div
               className="fixed bottom-safe-or-[14px] left-safe right-safe z-20 px-5 pointer-events-none"
               // Translate, not `bottom`: the safe-area class must stay the
@@ -357,7 +366,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
             >
               <div className="pointer-events-auto mx-auto max-w-sm rounded-full border border-border shadow-lg backdrop-blur-xl bg-[color-mix(in_srgb,var(--bg-elevated)_92%,transparent)]">
                 <SidePanelDockContext.Provider value="bottom-float">
-                  {headerRight}
+                  {activeHeaderRight}
                 </SidePanelDockContext.Provider>
               </div>
             </div>
@@ -401,7 +410,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
           {/* header-docked controls (e.g. Capabilities' Restart) stay reachable
             * inside a tab; a bottom-float search lives on the root only —
             * its results deep-link anywhere, so no per-tab copy is needed. */}
-          {headerRight && headerRightDock === 'header' && headerRight}
+          {activeHeaderRight && headerRightDock === 'header' && activeHeaderRight}
         </div>
         )}
         <div data-testid="side-panel-pane" className={`px-4 pt-1 ${fixed ? 'flex-1 min-h-0 flex flex-col' : 'flex-1 pb-8'}`}>
@@ -429,7 +438,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                     ? 'bg-accent-subtle text-accent'
                     : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover'
                 }`}
-                onClick={() => setTab(t.key)}
+                onClick={() => { void requestTab(t.key) }}
               >
                 <span className={`w-4 h-4 shrink-0 flex items-center justify-center ${tab === t.key ? 'text-accent' : 'text-muted'}`}>
                   {t.icon}
@@ -448,7 +457,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
             <div className="text-2xl font-bold tracking-tight text-text-strong">{meta?.label || ''}</div>
             {meta?.description && <div className="text-muted text-sm mt-1">{meta.description}</div>}
           </div>
-          {headerRight}
+          {activeHeaderRight}
         </div>
         <div data-testid="side-panel-pane" className={`px-6 ${fixed ? 'flex-1 min-h-0 flex flex-col' : 'flex-1 pb-8'}`}>
           {children(tab)}

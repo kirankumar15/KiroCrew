@@ -100,6 +100,8 @@ from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_no
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
 from kiro_crew.history import carry_provenance, is_incognito_transcript
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.project_registry import ProjectRegistry
+from kiro_crew.project_sessions import ProjectSessionError, resolve_project_attachment
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
 from kiro_crew.safety_override import safety_override
@@ -2000,6 +2002,70 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     name = body.get("name")
     agent = body.get("agent", "")
     model = body.get("model", "")
+    project_id = body.get("project_id", "")
+    if not isinstance(project_id, str):
+        return web.json_response(
+            {"error": "project_id must be a string", "code": "project_invalid_request"},
+            status=400,
+        )
+    project_id = project_id.strip() if isinstance(project_id, str) else ""
+    project_attachment = None
+    if project_id:
+        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+        if not is_owner_dashboard_request(request):
+            try:
+                await asyncio.to_thread(
+                    lambda: sel().log_api_access(
+                        caller=request.get("user", "dashboard"),
+                        operation="project_attach",
+                        outcome="denied",
+                        source="dashboard",
+                        resources="non_owner_block",
+                    )
+                )
+            except Exception:
+                logger.debug("SEL audit for denied Project attachment failed", exc_info=True)
+            return web.json_response(
+                {"error": "owner authorization required", "code": "owner_only"}, status=403
+            )
+        try:
+            await asyncio.to_thread(
+                lambda: sel().log_api_access(
+                    caller=request.get("user", "dashboard"),
+                    operation="project_attach",
+                    outcome="allowed",
+                    source="dashboard",
+                    resources=f"project={project_id}",
+                )
+            )
+        except Exception:
+            logger.error("SEL audit for Project attachment failed", exc_info=True)
+            return web.json_response(
+                {
+                    "error": "Project permission audit is unavailable",
+                    "code": "project_audit_unavailable",
+                },
+                status=503,
+            )
+        registry = request.app.get("project_registry")
+        project_registry = registry if isinstance(registry, ProjectRegistry) else None
+        try:
+            project_attachment = await asyncio.to_thread(
+                resolve_project_attachment,
+                project_id,
+                registry=project_registry,
+            )
+        except ProjectSessionError as exc:
+            if exc.code == "project_not_found":
+                return web.json_response(
+                    {"error": str(exc), "code": exc.code},
+                    status=404,
+                )
+            return web.json_response(
+                {"error": str(exc), "code": exc.code},
+                status=409,
+            )
     # Folder membership at BIRTH. Assigning it afterwards (client PATCH) is
     # visibly too late: get_or_create_slot broadcasts the new slot before this
     # handler returns, so the dashboard renders it at the top level for a frame
@@ -2167,6 +2233,18 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             # would turn this 404 into an existence oracle for slots the caller
             # may not know about. The prose stays in `error` for logs.
             return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        if project_attachment is not None:
+            if slot.total_messages > 0 and slot.project_id != project_attachment.project_id:
+                return web.json_response(
+                    {
+                        "error": "Cannot change Project after messages have been sent. Open a new session instead.",
+                        "code": "project_rebind_requires_new_session",
+                    },
+                    status=409,
+                )
+            slot.project_id = project_attachment.project_id
+            slot.project = str(project_attachment.workspace_dir)
+            slot._project_brief = project_attachment.brief
         # Pin title if explicitly provided (prevents auto-title from overwriting)
         title = (body.get("title") or "").strip()[:200] if isinstance(body, dict) else ""
         if title:
@@ -2289,7 +2367,7 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # A pinned title must persist too (not just a folder move): without the
     # write, a restart rehydrates the previous title with a refreshable "auto"
     # origin and the background refresh may rewrite the pin.
-    if folder_id or title:
+    if folder_id or title or project_attachment is not None:
         await save_slot_off_loop(state, slot, force=True)
     # Speculative session creation: overlap the ACP handshake with the user's
     # think-time before their first message. No-op unless session.eager_spawn.
@@ -4967,6 +5045,8 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
         )
     slot.workspace = ws_name
     slot.project = default_project_dir(ws_name)
+    slot.project_id = ""
+    slot._project_brief = ""
     logger.info("Slot %s workspace switched to %r, resetting session", name, ws_name)
     await _reset_slot_session(state, slot, _history_key_for(name))
     state.push_slots_update()
@@ -5006,6 +5086,11 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
             return web.json_response({"error": "Access denied"}, status=403)
     old_project = slot.project
     slot.project = project
+    # A manually selected directory is not evidence of Project-bundle identity.
+    # Clear the durable relation rather than leaving a session claiming one
+    # Project while executing in an unrelated tree.
+    slot.project_id = ""
+    slot._project_brief = ""
     logger.info("Slot %s project set to %r", name, project)
     sel().log_api_access(
         caller=request.get("user", "dashboard"),
