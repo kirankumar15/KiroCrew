@@ -691,13 +691,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # per-step modes; provision wraps the pod CLI argv) and the spawn
         # carries resource_limit_preexec() — routing again here would nest
         # sandboxes. The chokepoint is applied at the call sites.
-        "apps/builtins/dev_fleet/server.py::worker",
+        "apps/builtins/dev_fleet/runtime.py::worker",
         # Dev Fleet builtin backend: async version routes all git/gh through
         # _run_cmd which calls sandboxed_spawn_argv (the chokepoint). Only
         # _resolve_primary_checkout uses subprocess.run directly (one-shot
         # git rev-parse at startup, no agent input, no sandbox needed).
-        "apps/builtins/dev_fleet/server.py::_resolve_primary_checkout",
-        "apps/builtins/dev_fleet/server.py::worker",
+        "apps/builtins/dev_fleet/repository.py::_resolve_primary_checkout",
+        "apps/builtins/dev_fleet/runtime.py::worker",
         # dep_sync stands in for `pip install -e .` on a checkout whose console
         # script is locked, and it spawns the same shapes that step did:
         # `<target python> -c <fixed metadata/version probe>` and `<target python>
@@ -709,7 +709,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # from that checkout's own declarations -- the same ones `pip install -e .`
         # would have read, so this adds no surface the step it replaces did not
         # already have. Routing here would also NEST sandboxes: dep_sync runs as a
-        # sync step, which server.py::worker already wrapped through
+        # sync step, which runtime.py::worker already wrapped through
         # sandboxed_spawn_argv, and a filesystem-scoped wrapper around pip would
         # block the venv writes that are the point of the step.
         #
@@ -737,7 +737,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # wrapped through sandboxed_spawn_argv before handing it to the runner.
         # So all three of its spawns are already inside that sandbox, and routing
         # them again would nest one sandbox inside itself; the chokepoint is
-        # applied at the call site, exactly as for server.py::worker.
+        # applied at the call site, exactly as for runtime.py::worker.
         #
         # No argv is agent-influenced. _extract spawns
         # `<git> -C <repo> show <remote>/<base branch>:website/<fixed filename>`:

@@ -75,7 +75,7 @@ Four profiles:
 |---------|---------|--------|
 | `tool` (default) | Every ordinary agent-influenced spawn | The full rlimit ceiling plus `oom_score_adj=1000` |
 | `session_host` | The trusted ACP session-host spawns (`acp/client.py`, `acp/runtime.py`) | RAISES NOFILE to the inherited hard limit and does nothing else. A session host multiplexes many MCP pipe pairs, and the 1024 cap caused EMFILE crashes. No OOM bias: a trusted session host must not be the preferred kill target |
-| `build` | The dev-fleet build spawns (`apps/builtins/dev_fleet/server.py`) | Vite and npm need thousands of descriptors; keeps the OOM bias |
+| `build` | The dev-fleet build spawns (`apps/builtins/dev_fleet/runtime.py`) | Vite and npm need thousands of descriptors; keeps the OOM bias |
 | `none` | The user's own interactive terminal | No rlimits, no OOM bias, so the shim has nothing to deliver |
 
 Async, shim-routed spawns cover MCP server probes (`mcp_discovery.py`), the app

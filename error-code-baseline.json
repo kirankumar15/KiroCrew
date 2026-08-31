@@ -15,7 +15,7 @@
     "apps/builtins/code_review_sage/backend/routes.py": {
       "dynamic_status": 2
     },
-    "apps/builtins/dev_fleet/server.py": {
+    "apps/builtins/dev_fleet/http_api.py": {
       "dynamic_status": 1,
       "missing_code": 19
     },

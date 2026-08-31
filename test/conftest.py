@@ -523,7 +523,7 @@ def _disable_dev_fleet_background_tasks(monkeypatch):
     still be running when the test's client tears down, and cancelling it then
     is what leaked into unrelated tests and flaked ``Gateway Tests (macOS)``
     (issue #1832). A test that wants the real refresher overrides this itself
-    via ``monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)``.
+    via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
     monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
 

@@ -62,10 +62,10 @@ The registry is an app implementation, not an App SDK surface.
 
 Dev Fleet tracks run descriptors in the module-memory `_RUNS` registry and
 keeps active tasks and subprocesses in `_ACTIVE_RUNS`
-(`src/kiro_crew/apps/builtins/dev_fleet/server.py`, `_RUNS` and `_ACTIVE_RUNS`).
+(`src/kiro_crew/apps/builtins/dev_fleet/runtime.py`, `_RUNS` and `_ACTIVE_RUNS`).
 Its fleet payload overlays `sync_run_id` and per-worktree provision run IDs at
 request time in `_with_live_run_pointers`; `DevFleetPage` uses those pointers
-to reattach a mounted page to a current run (`server.py`,
+to reattach a mounted page to a current run (`http_api.py`,
 `_with_live_run_pointers`; `website/src/pages/DevFleetPage.tsx`, sync and
 provision reattach effects).
 
@@ -73,7 +73,7 @@ The run records and pointers are process memory, so this reattachment applies
 within the current gateway process rather than supplying restart durability.
 During `dev_fleet_cleanup`, the app closes admission for new runs, snapshots
 active work, and kills tracked process trees (`server.py`,
-`dev_fleet_cleanup` and `_kill_tree`). That cleanup prevents a stopped gateway
+`dev_fleet_cleanup`; `runtime.py`, `_kill_tree`). That cleanup prevents a stopped gateway
 from leaving Dev Fleet subprocesses behind; it also shows why a durable record
 cannot imply that its original process is still executable.
 

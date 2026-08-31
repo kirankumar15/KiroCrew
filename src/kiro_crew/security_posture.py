@@ -1559,7 +1559,15 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # this app's panel, not a core egress path.
         "apps/builtins/code_review_sage/sage_lib/followup.py",
         "apps/builtins/code_review_sage/backend/routes.py",
-        "apps/builtins/dev_fleet/server.py",
+        # Dev Fleet's redactor wrapper and the cohesive owners that apply it to
+        # the app's own API/state/worktree surfaces. These were previously all
+        # housed in server.py and retain the same non-core-egress classification.
+        "apps/builtins/dev_fleet/runtime.py",
+        "apps/builtins/dev_fleet/http_api.py",
+        "apps/builtins/dev_fleet/fleet_state.py",
+        "apps/builtins/dev_fleet/repository.py",
+        "apps/builtins/dev_fleet/live.py",
+        "apps/builtins/dev_fleet/worktree_ops.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
         # Live translation redacts the MODEL's answer before writing it to the
