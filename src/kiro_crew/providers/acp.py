@@ -470,8 +470,8 @@ class AcpProvider(LLMProvider):
         the "kiro or kas" set positively so the shared-runtime start path, the
         cli.json overlay recovery, and the skip-live-effort branch stop being
         spelled ``not is_claude_backend`` — which would hand the kiro-family
-        path to every harness added later. The dormant claude AcpClient seam is
-        not a member.
+        path to every harness added later. The claude AcpClient is deliberately
+        not a member: it runs one process per session and shares no runtime.
         """
         return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
 
@@ -1393,9 +1393,9 @@ class AcpProvider(LLMProvider):
         ``start()``), which issues a fresh ``session/new`` on the already-running
         process, skipping subprocess spawn + the ``initialize`` handshake. This is
         the primitive a warm session pool uses to reuse one worker across
-        independent tasks without leaking context between them. The dormant
-        claude-backend seam would delegate to its own client-side reset the same
-        way (the fork's ``AcpClient`` does not ship it — hence the type ignore).
+        independent tasks without leaking context between them. The claude backend
+        would delegate to its own client-side reset the same way (its ``AcpClient``
+        does not ship one — hence the type ignore).
         """
         await self._client.new_conversation()  # type: ignore[attr-defined]
 

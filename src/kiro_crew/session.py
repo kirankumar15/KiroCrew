@@ -193,21 +193,22 @@ from kiro_crew.stats import Stats
 from kiro_crew.watchdog import CleanupHook, SessionWatchdog
 
 # The standalone ClaudeCodeProvider was removed in the KiroACP-only refactor;
-# the public core ships kiro-cli (ACP) only. The name is kept (always None) so
-# the legacy ``ClaudeCodeProvider is not None and isinstance(...)`` guards below
-# short-circuit cleanly. The claude-agent-acp seam survives via
-# ``_is_claude_backend`` (the internal companion re-registers Claude Code).
+# Claude Code is now driven through the ACP adapter instead. The name is kept
+# (always None) so the legacy ``ClaudeCodeProvider is not None and
+# isinstance(...)`` guards below short-circuit cleanly. The live path is
+# ``_is_claude_backend``, on a harness the public build ships as selectable.
 ClaudeCodeProvider = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
 
 def _is_claude_backend(provider: Any) -> bool:
-    """Check if a provider drives the claude-agent-acp seam via the ACP adapter.
+    """Check if a provider drives claude-agent-acp via the ACP adapter.
 
-    Returns True when an AcpProvider wraps claude-agent-acp (backend="claude").
-    Dormant in the public core (the factory never selects it); the internal
-    companion re-registers the Claude Code provider over this same seam.
+    Returns True when an AcpProvider wraps claude-agent-acp (backend="claude"),
+    which the public build offers: ``BASELINE_SELECTABLE_BACKENDS`` includes it, so
+    the factory selects it whenever an operator has chosen it and the adapter is
+    installed.
     """
     from kiro_crew.providers.acp import AcpProvider  # circular import: providers -> session
 

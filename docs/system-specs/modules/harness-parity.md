@@ -2,8 +2,22 @@
 
 A *harness* is the agent process Kiro Crew drives over ACP. Kiro Crew has one
 first-class harness — `kiro-cli` (`ACP_BACKEND_KIRO`, spelled `""`) — and a
-growing set of adapted ones: the dormant `ACP_BACKEND_CLAUDE` seam, `KAS`
+growing set of adapted ones: Claude Code (`ACP_BACKEND_CLAUDE`), `KAS`
 (`ACP_BACKEND_KAS`), and whatever a bring-your-own (BYO) adapter registers next.
+
+All three are selectable on a plain public build.
+`BASELINE_SELECTABLE_BACKENDS` equals `ACP_BACKENDS_KNOWN`, so every id this core
+can spell is one an operator can choose — pinned by
+`test_agent_backend_editable.py::test_baseline_ships_every_known_backend`, which
+guards against a future NARROWING rather than a widening. Claude Code in
+particular is a shipped harness and not a dormant seam: `acp/client.py` owns the
+whole Claude spawn path and the adapter is a public npm package, so an earlier
+revision that left it out of the baseline removed only the switch, never a
+capability. Whether the binaries are INSTALLED on a given machine is a different
+question, answered by `agent_sdk/backend_install.py`'s probe rather than by
+selectability. Read the invariants below against that tree: three harnesses can
+serve a real session today, so a site that spells "kiro" by exclusion is already
+wrong on two of them.
 
 *Parity* here does not mean equal treatment. It means the opposite, stated
 precisely: **an added harness may only adapt itself to the seams the Kiro
@@ -15,8 +29,8 @@ The failure mode this file exists to prevent is not a broken adapter — that
 fails loudly on its own first session. It is the *silent capture* of the Kiro
 path: a call site that spells "kiro" as `not is_<other>_backend`, so harness
 number three inherits a capability, a sandbox waiver, or a session label that
-nobody granted it, and the Kiro user who never opted into BYO pays for it. Two
-such sites shipped before this file existed
+nobody granted it, and the Kiro user who never chose another harness pays for it.
+Two such sites shipped before this file existed
 (`AcpProvider.is_session_sharing_eligible`, `AcpRuntime.spawn`'s
 `is_kiro_cli`); both read as correct until you count the backends.
 
@@ -56,8 +70,10 @@ and Kiro stops being the guaranteed path.
 
 The whole group is one rule with several faces: **no call site may express
 "this is the Kiro harness" as the absence of another harness.** A negative test
-is correct exactly until the next harness exists, and it fails *open* — the new
-harness is treated as Kiro.
+is correct only while one harness can start, and it fails *open* — the other
+harness is treated as Kiro. Three are selectable today, so `not
+is_claude_backend` is not a rule waiting on a future harness to break it: it
+already reads TRUE for KAS on a plain public build.
 
 | Id | Guarantees | Pinned by | Constrains |
 |---|---|---|---|
@@ -113,4 +129,8 @@ source of truth for what blocks.
    harness does not land yet — say so in the PR instead of widening a seam.
 4. A new harness adds rows to `ACP_BACKENDS_KNOWN`, a `PROVIDER_LABEL_*`, and
    an explicit decision for every Group B membership set. "Inherited the
-   default" is not a decision.
+   default" is not a decision. Note that `ACP_BACKENDS_KNOWN` and
+   `BASELINE_SELECTABLE_BACKENDS` are now equal, so adding an id to the first
+   without adding it to the second is the NARROWING that
+   `test_baseline_ships_every_known_backend` fails on — the id becomes spellable
+   but unreachable, and that state needs a stated reason rather than a default.

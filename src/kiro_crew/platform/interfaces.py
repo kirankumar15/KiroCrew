@@ -66,9 +66,10 @@ class InterceptDecision(enum.Enum):
 class ProviderRegistry(Protocol):
     """The LLM-provider factory + ACP-backend registration seam.
 
-    The public edition ships Kiro-CLI-ACP only.  The companion uses
-    ``register_acp_backends`` to re-register a Claude backend through the dormant
-    ``ACP_BACKEND_CLAUDE`` seam without the core changing.
+    The public edition ships every KNOWN ACP backend as selectable, so this seam
+    exists for a harness the core does NOT ship: an edition calls
+    ``register_acp_backends`` and its id becomes selectable without the core
+    changing.
     """
 
     def create_factory(self, cfg: "KiroCrewConfig") -> Callable[..., Any]:
@@ -94,7 +95,7 @@ class ProviderRegistry(Protocol):
         should be able to choose. Registering the provider alone leaves the harness
         runnable but unreachable: the dashboard's backend switch, its PATCH
         allowlist and the config load path all derive from that registry, so an
-        unregistered id renders as "not enabled in this build" and is coerced back
+        unregistered id is not offered in the dashboard at all and is coerced back
         to the default on load.
         """
         ...

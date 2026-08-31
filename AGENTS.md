@@ -80,10 +80,18 @@ This repo is the de-Amazoned public fork of an internal package. Never re-add:
   holds): `sso_status.py`, `browser/auth.py`, `dashboard/handlers/sso_login.py`,
   `tunnel/manager.py`, `aim_agents.py`.
 - **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to
-  `acp` and kiro-cli is REQUIRED. Keep the dormant `ACP_BACKEND_CLAUDE` /
-  `_is_claude` seam in `acp/client.py` so an internal companion can re-register
-  Claude Code; do NOT re-add the public registration glue. A harness added at
-  `agent.acp_backend` is a different question and is governed by
+  `acp` and kiro-cli is REQUIRED. `ACP_BACKEND_CLAUDE` is a **publicly selectable
+  harness**, not a dormant seam: `acp/client.py` owns its whole spawn path and the
+  adapter it needs is a public npm package, so it sits in
+  `BASELINE_SELECTABLE_BACKENDS` and any operator with the two binaries can choose it.
+  Two consequences to keep in mind rather than undo: a Claude session starts with **no
+  Crew MCP tools** (`_claude_session_mcp_servers` defaults to `[]`), and a tool
+  pre-approved in Claude's own settings — including a `.claude/settings.json` inside a
+  cloned project — never reaches Crew's approval path, so its deny rules and audit log
+  do not see that call. Both are disclosed on the Agent Backend panel and in
+  `docs/system-specs/features/claude-code-provider.md`; do not widen the harness's
+  reach further without closing them. A harness added at `agent.acp_backend` is
+  governed by
   [Harness parity](#harness-parity-kiro-is-first-class-the-rest-are-adapted) —
   adapted, never a second `agent.provider` value.
 - **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,

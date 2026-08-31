@@ -393,7 +393,7 @@ def _append_compaction_notice(
 
     This is the single chokepoint for emitting a compaction notice — every
     compaction path (auto-compaction status events and the ``/compact`` slash
-    command, the kiro backend and the dormant claude seam alike) must route
+    command, the kiro and claude backends alike) must route
     through here so the tag is never accidentally dropped.
 
     Defense-in-depth: callers already redact, but since this chokepoint posts to

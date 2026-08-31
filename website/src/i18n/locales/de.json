@@ -9732,6 +9732,7 @@
       "agentBackendTab": {
         "agent_backend": "Agent-Backend",
         "claude_code": "Claude Code",
+        "claude_uses_its_own_permissions": "Claude Code fragt normalerweise nach, bevor es handelt, und {{productName}} prüft diese Anfrage. Ein in Claudes eigenen Einstellungen vorab genehmigtes Tool — auch über eine .claude/settings.json im Projekt — fragt jedoch nicht, sodass die Ablehnungsregeln und das Audit-Log diesen Aufruf nicht sehen.",
         "could_not_load_the_agent_backend": "Das Agent-Backend konnte nicht geladen werden.",
         "could_not_save_the_agent_backend": "Das Agent-Backend konnte nicht gespeichert werden.",
         "default_all_features_supported": "Standard. Alle Funktionen werden unterstützt.",
@@ -9744,7 +9745,6 @@
         "missing_components": "Auf diesem Rechner fehlt: {{components}}",
         "missing_components_with_command": "Auf diesem Rechner fehlt: {{components}}. Installieren mit: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "Neue Sitzungen verwenden diesen Agenten. Eine bereits geöffnete Sitzung behält den Agenten, mit dem sie gestartet ist – ein Wechsel hier ändert sie nicht mitten in der Sitzung.",
-        "not_enabled_in_this_build": "In diesem Build nicht aktiviert",
         "retry": "Erneut versuchen",
         "set_is_fixed_at_gateway_start": "Welche Agenten hier erscheinen, wird beim Start des Gateways festgelegt. Eine verwaltete Installation kann die Auswahl per Richtlinie einschränken; Änderungen an dieser Richtlinie greifen beim nächsten Start."
       },

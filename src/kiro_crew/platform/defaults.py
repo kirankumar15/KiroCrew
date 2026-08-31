@@ -47,18 +47,20 @@ from kiro_crew.platform.interfaces import (
 
 
 class DefaultProviderRegistry:
-    """Kiro-CLI-ACP only.  Leaves the dormant ACP_BACKEND_CLAUDE seam untouched."""
+    """Registers nothing: every KNOWN backend is already in the baseline."""
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
 
     def register_acp_backends(self) -> None:
-        # The public edition registers no extra ACP backends.  The companion
-        # re-registers a Claude backend here via the acp/client.py:_is_claude
-        # seam, and pairs it with
-        # ``acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)`` so the
-        # dashboard switch, the PATCH allowlist and the config load path all see
-        # it — the provider alone is runnable but unreachable.
+        # Nothing to register, and nothing this seam could register: the baseline now
+        # covers every id in ``ACP_BACKENDS_KNOWN``, and
+        # ``register_selectable_backend`` rejects an id outside that set, so there is
+        # no id it accepts that is not already selectable. The seam stays because the
+        # ProviderRegistry protocol declares it and an edition overrides this method;
+        # an edition adding a genuinely new harness has to widen
+        # ``ACP_BACKENDS_KNOWN`` as well, which is a core change, not an extension
+        # point this hook opens on its own.
         return None
 
 

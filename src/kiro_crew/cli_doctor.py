@@ -356,10 +356,10 @@ def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
     return linux
 
 
-# KiroCrew's agent backend is kiro-cli (the sole public ACP backend). The
-# claude-agent-acp binary below is only the dormant protocol seam an internal
-# companion re-registers (see acp/client.py) — report it, when present, as that
-# optional seam rather than as a user-facing backend.
+# kiro-cli is the DEFAULT agent backend; the claude-agent-acp binary below belongs
+# to Claude Code, which is also selectable. Doctor reports it as an optional
+# backend, and the verdict comes from ``agent_sdk.probe_backend`` so doctor and the
+# dashboard cannot give different answers.
 _CLAUDE_ACP_BIN = "claude-agent-acp"
 
 # Managed servers doctor must NEVER add to ``allowedTools``.
@@ -999,6 +999,58 @@ def _doctor_managed_service_policy(issues: list[str]) -> None:
     print("  watchdog:    ⚠️  installed definition predates managed-service defaults")
     print("               Fix: run `kirocrew service install` once, then restart the service")
     issues.append("managed service definition is outdated")
+
+
+def _doctor_claude_backend() -> None:
+    """Report Claude Code as an optional agent backend, installed or not.
+
+    Its own function, not an inline block, so a test can exercise the reporting
+    without running the whole doctor -- the full ``_doctor()`` shells out to
+    ``kiro-cli whoami`` and probes the host, and a test must not reach an
+    operator's real installation to check three print statements.
+
+    Claude Code needs TWO binaries and the probe names whichever is absent, so a
+    half-install does not read as a total one. Never a hard failure: it is an
+    optional backend and kiro-cli is the floor. The verdict comes from
+    ``agent_sdk.probe_backend`` -- the same owner ``GET /api/acp-backends`` uses --
+    so doctor and the dashboard cannot give different answers.
+    """
+    try:
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+        from kiro_crew.agent_sdk import INSTALLED, MISSING, probe_backend
+
+        claude_state = probe_backend(ACP_BACKEND_CLAUDE)
+    except Exception:
+        claude_state = None
+    if claude_state is None:
+        print("  claude-acp:  ⚠️  could not check")
+    elif claude_state.installed == INSTALLED:
+        # The probe resolves the adapter through the spawn's own resolver, which honours
+        # CLAUDE_AGENT_ACP_BIN, a vendored node_modules and a mise shim -- none of which
+        # a plain PATH lookup sees. So `which` is best-effort here and its miss must not
+        # print as a location: naming the path only when we actually have one beats
+        # printing "✅ None" for a working install.
+        #
+        # Says "installed", NOT "selectable": this branch reads the INSTALL probe, and
+        # whether the deployment may select the backend is a separate answer that
+        # ``apply_selectable_denials`` can say no to. Calling an install "selectable"
+        # would print the opposite of the truth on a policy-denied deployment.
+        where = shutil.which(_CLAUDE_ACP_BIN)
+        if where:
+            print(f"  claude-acp:  ✅ {where} (Claude Code installed)")
+        else:
+            print("  claude-acp:  ✅ resolved off PATH (Claude Code installed)")
+    elif claude_state.installed == MISSING:
+        missing = ", ".join(claude_state.missing_components) or "components"
+        print(f"  claude-acp:  ⏭  {missing} not found (optional agent backend)")
+        if claude_state.install_command:
+            print(f"               {claude_state.install_command}")
+    else:
+        # UNKNOWN: the check itself failed. Reporting that as "not found" would send
+        # someone to install what they may already have -- the exact collapse the
+        # probe's three-valued verdict exists to prevent, and which the dashboard
+        # also refuses to make.
+        print("  claude-acp:  ⚠️  could not check")
 
 
 def _doctor_path_launcher() -> None:
@@ -2444,9 +2496,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Dependencies ──
     print("Dependencies")
-    # kiro-cli is THE agent backend for the public build. claude-agent-acp is
-    # only the dormant protocol seam (re-registered by an internal companion),
-    # so report it as optional and report kiro-cli as the backend.
+    # kiro-cli is the DEFAULT agent backend and the floor every deployment keeps.
+    # Claude Code is selectable too (``BASELINE_SELECTABLE_BACKENDS``), so it is
+    # reported as a real optional backend -- present or absent -- rather than only
+    # when it happens to be installed. The verdict comes from the same owner the
+    # dashboard asks, so doctor and the panel cannot disagree.
     kiro = shutil.which(KIRO_CLI_BIN)
     if kiro:
         print(f"  kiro-cli:    ✅ {kiro}")
@@ -2466,12 +2520,10 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  kiro login:  ⚠️  could not check")
         _doctor_headless_auth(issues)
     else:
-        print("  kiro-cli:    ⏭  not found (the agent backend)")
+        print("  kiro-cli:    ⏭  not found (the default agent backend)")
         print("               Install kiro-cli per its docs, then: kiro-cli login")
 
-    claude_acp = shutil.which(_CLAUDE_ACP_BIN)
-    if claude_acp:
-        print(f"  claude-acp:  ✅ {claude_acp} (dormant seam — not used by the public core)")
+    _doctor_claude_backend()
 
     git = shutil.which("git")
     if git:

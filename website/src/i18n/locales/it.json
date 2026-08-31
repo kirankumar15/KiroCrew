@@ -9878,6 +9878,7 @@
       "agentBackendTab": {
         "agent_backend": "Backend dell’agente",
         "claude_code": "Claude Code",
+        "claude_uses_its_own_permissions": "Claude Code di norma chiede il permesso prima di agire, e {{productName}} filtra quella richiesta. Ma uno strumento pre-approvato nelle impostazioni di Claude — incluso un .claude/settings.json all'interno del progetto — non chiede nulla, quindi le regole di rifiuto e il registro di audit non vedono quella chiamata.",
         "could_not_load_the_agent_backend": "Non è stato possibile caricare il backend dell’agente.",
         "could_not_save_the_agent_backend": "Impossibile salvare il backend dell’agente.",
         "default_all_features_supported": "Predefinito. Tutte le funzionalità sono supportate.",
@@ -9890,7 +9891,6 @@
         "missing_components": "Mancante su questa macchina: {{components}}",
         "missing_components_with_command": "Mancante su questa macchina: {{components}}. Installalo con: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "Le nuove sessioni usano questo agente. Una sessione già aperta mantiene quello con cui è stata avviata: cambiarlo qui non la modifica a metà sessione.",
-        "not_enabled_in_this_build": "Non abilitato in questa build",
         "retry": "Riprova",
         "set_is_fixed_at_gateway_start": "Quali agenti compaiono qui viene deciso all'avvio del gateway. Un deployment gestito può limitare l'insieme tramite policy; modificare quella policy ha effetto al prossimo avvio."
       },

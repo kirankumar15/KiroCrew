@@ -170,8 +170,8 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
 
 # Backends served by AcpRuntime + AcpSessionHandle — the kiro-agent family
-# (kiro-cli and KAS) whose single process hosts N sessions via demux. The
-# dormant claude-agent-acp seam runs one AcpClient per session and is NOT a
+# (kiro-cli and KAS) whose single process hosts N sessions via demux.
+# claude-agent-acp runs one AcpClient per session and is NOT a
 # member. Membership drives the shared runtime start path and the kiro-family
 # spawn conventions: members read the cli.json effort/tool-search overlay and
 # receive effort at spawn, whereas claude applies it via a live push after the
@@ -222,12 +222,13 @@ KAS_CLIENT_CAPABILITIES: dict = {
 }
 
 # ── Claude backend permission modes ──
-# Values an edition writes into a per-session settings.local.json
-# ``permissions.defaultMode`` when it drives the dormant ``ACP_BACKEND_CLAUDE``
-# seam. ``default`` = per-tool approval; ``auto`` = the SDK auto-accept mode
-# (Auto-mode / permission-UI parity). Inert in the public core (kiro-cli only);
-# defined here so the client's ``permission_mode`` kwarg and a companion share
-# one canonical vocabulary rather than duplicating string literals.
+# Values written into a per-session settings.local.json
+# ``permissions.defaultMode`` for the ``ACP_BACKEND_CLAUDE`` backend.
+# ``default`` = per-tool approval; ``auto`` = the SDK auto-accept mode
+# (Auto-mode / permission-UI parity). Nothing in the base client writes that file
+# today — it is an edition override — so these are defined here to give the
+# client's ``permission_mode`` kwarg and any writer one canonical vocabulary
+# rather than duplicating string literals.
 CC_PERMISSION_MODE_DEFAULT = "default"
 CC_PERMISSION_MODE_AUTO = "auto"
 

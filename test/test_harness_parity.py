@@ -108,9 +108,12 @@ def test_unselectable_backend_degrades_to_kiro(persisted: object) -> None:
     Includes the non-string shapes a hand-edited config.json can hold: a gate
     that raises here turns a typo into a gateway that will not boot.
 
-    ``claude`` is in the list on purpose: it is a KNOWN id that this build does not
-    register, and the one gate reads the registry, so it degrades like any other
-    unselectable value. Registering it is what makes it survive.
+    ``claude`` is in the list on purpose, and now for the opposite reason: it ships in
+    the public baseline, so it must SURVIVE rather than degrade. The assertion below is
+    conditional on membership precisely so this row proves the gate reads the registry
+    instead of hardcoding a verdict. ``byo-harness`` covers the unknown-id case, and a
+    known id that policy has denied is covered in
+    ``test_agent_backend_governance.py``.
     """
     resolved = _normalize_acp_backend(persisted)
     assert resolved in selectable_backends()
@@ -126,16 +129,27 @@ def test_registering_a_backend_makes_it_survive_load() -> None:
     moment ago now survives, with no second gate and no code change anywhere else.
     Ordering is the edition's to get right -- registration must precede the first
     config load.
+
+    Claude Code ships in the public baseline, so the degrading starting state is
+    constructed here rather than borrowed from it. Both module sets are snapshotted:
+    ``register_selectable_backend`` writes the baseline too, and restoring only the
+    effective set would leak a widened baseline into the rest of the run.
     """
-    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
+    baseline_before = set(acp_backends._baseline)
     before = set(acp_backends._selectable)
     try:
+        acp_backends._baseline.discard(ACP_BACKEND_CLAUDE)
+        acp_backends._selectable.discard(ACP_BACKEND_CLAUDE)
+        assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
+
         acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)
         assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_CLAUDE
     finally:
+        acp_backends._baseline.clear()
+        acp_backends._baseline.update(baseline_before)
         acp_backends._selectable.clear()
         acp_backends._selectable.update(before)
-    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
+    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_CLAUDE
 
 
 def test_config_load_never_reads_the_platform_context(monkeypatch) -> None:

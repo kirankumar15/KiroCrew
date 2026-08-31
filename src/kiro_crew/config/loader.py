@@ -38,7 +38,7 @@ from kiro_crew import __version__, model_registry, platform_compat, windows_acl
 # The one gate stays where the pre-registry code already gated — inside
 # ``_normalize_acp_backend`` on the way out of config.json. Only what it reads
 # changed: the registry, instead of a frozen literal.
-from kiro_crew.acp_backends import resolve_selected_backend
+from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, resolve_selected_backend
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
 from kiro_crew.atomic_write import atomic_write, on_event_loop
@@ -1515,7 +1515,7 @@ def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str,
     """Remove kiro-cli's model credential from a child that does not consume it.
 
     Counterpart to :func:`inject_kiro_cli_api_key` for every ACP backend other
-    than kiro (the dormant Claude seam, and KAS): the credential authenticates
+    than kiro (Claude Code, and KAS): the credential authenticates
     kiro-cli's OWN v2 agent loop, and it is deliberately NOT in
     ``sandbox._AGENT_DENIED_ENV_KEYS``, so without this an inherited copy in the
     raw ``os.environ`` snapshot would ride into an agent process that has no use
@@ -9251,12 +9251,27 @@ class KiroCrewConfig:
         the same way (``agent.model``, collapsed through
         :meth:`_resolve_agent_model` when it is the ``auto`` sentinel).
 
-        The result is translated through ``model_registry.to_acp_id`` exactly
-        as the factory does — canonical keys become kiro ids, and ``auto``
-        collapses to ``""`` (``to_acp_id``, NOT ``to_provider_id``: kiro serves
-        the registry aliases as distinct real models — see its docstring).
-        ``""`` means nothing is pinned anywhere: kiro-cli resolves the model
-        itself and the effort overlay cannot be keyed.
+        The result is translated into the namespace of the backend that will
+        actually be asked to run it: ``to_provider_id(…, "claude_code")`` for
+        the claude backend, ``model_registry.to_acp_id`` otherwise (canonical
+        keys become kiro ids). ``auto`` collapses to ``""`` either way.
+
+        Keying the translation on the backend is what the warm-pool model-switch
+        path already does (``session_allocation``, via ``is_claude_backend``).
+        Hardcoding ``to_acp_id`` here meant a COLD start handed the claude
+        adapter a kiro-namespaced id — which its ``set_config_option`` rejects,
+        and which nothing withheld, because the pre-wire availability guard is
+        deliberately kiro-only (the two backends advertise in different
+        namespaces, so that check cannot be widened — see
+        ``acp.client.model_is_unusable``). A warm claim of the same pinned model
+        translated correctly, so the failure depended on whether a pooled
+        process happened to exist. Not reachable from the default config:
+        ``auto`` pins nothing, and the client skips the send entirely.
+
+        ``to_acp_id``, NOT ``to_provider_id``, is the non-claude choice because
+        kiro serves the registry aliases as distinct real models — see its
+        docstring. ``""`` means nothing is pinned anywhere: the backend resolves
+        the model itself and the effort overlay cannot be keyed.
         """
         if global_model is None:
             global_model = self.agent.model
@@ -9268,7 +9283,11 @@ class KiroCrewConfig:
             m = global_model
         else:
             m = self._resolve_named_agent_model(agent) or global_model
-        return model_registry.to_acp_id(m) if m else ""
+        if not m:
+            return ""
+        if self.agent.acp_backend == ACP_BACKEND_CLAUDE:
+            return model_registry.to_provider_id(m, "claude_code")
+        return model_registry.to_acp_id(m)
 
     @staticmethod
     def _resolve_named_agent_model(agent: str, agents_dir: Path | None = None) -> str:
@@ -9455,11 +9474,12 @@ class KiroCrewConfig:
             #      silently falling through to the backend's own choice.
             # "" at the end means nothing is pinned anywhere; AcpClient
             # normalizes "" to DEFAULT_MODEL, same as None.
-            # Selection + to_acp_id translation live in acp_effective_model —
-            # SHARED with the spawn-side effort verdict (subagent.py) so the
-            # reported outcome cannot drift from what this gate actually keys
-            # on. (The translation rationale — why to_acp_id and not
-            # to_provider_id — is documented on that method.)
+            # Selection + the per-backend id translation live in
+            # acp_effective_model — SHARED with the spawn-side effort verdict
+            # (subagent.py) so the reported outcome cannot drift from what this
+            # gate actually keys on. (Why the translation is keyed on the
+            # backend, and why to_acp_id is the non-claude choice, is documented
+            # on that method.)
             m = self.acp_effective_model(agent, model_override, global_model=model)
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
@@ -9538,9 +9558,9 @@ def build_provider_factory(cfg: "KiroCrewConfig") -> Callable:
     Routes through ``current_context().providers.create_factory(cfg)`` (the CPP
     ``ProviderRegistry`` extension point) instead of calling
     ``cfg.create_provider_factory()`` directly, so an edition can supply an
-    alternate provider factory (e.g. re-registering an extra ACP backend through
-    the dormant ``ACP_BACKEND_*`` seam).  The ``Default`` ProviderRegistry returns
-    exactly ``cfg.create_provider_factory()``, so the public edition is
+    alternate provider factory (e.g. registering an ACP backend the core does not
+    ship, through the ``ACP_BACKEND_*`` seam).  The ``Default`` ProviderRegistry
+    returns exactly ``cfg.create_provider_factory()``, so the public edition is
     behaviorally identical to calling it directly.
 
     Fail-closed: a :class:`PlatformCompositionError` (a non-standalone host that

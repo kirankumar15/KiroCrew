@@ -56,10 +56,23 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
 
 # ── The selectable registry ──
 
-#: What the public edition ships. ``ACP_BACKEND_CLAUDE`` is deliberately absent:
-#: it is a dormant seam reached by its own provider, not something a public build
-#: can serve a session with.
-BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+#: What the public edition ships.
+#:
+#: ``ACP_BACKEND_CLAUDE`` is included because the public build can genuinely serve a
+#: session with it: ``acp/client.py`` owns the whole spawn path (the ``_is_claude``
+#: branch, ``_resolve_claude_acp_bin``, ``_resolve_claude_code_executable``) and the
+#: adapter it needs is a PUBLIC npm package (``CLAUDE_ACP_NPM_PKG``). Nothing about it
+#: is edition-private. An earlier revision left it out and described it as a "dormant
+#: seam ... not something a public build can serve a session with", which made the
+#: option render as permanently unavailable on exactly the builds that could run it —
+#: the switch was the only missing piece, not the harness.
+#:
+#: Whether it is USABLE on a given machine is a separate question with its own answer:
+#: :mod:`kiro_crew.agent_sdk.backend_install` probes for the two binaries and the
+#: dashboard reports what is absent plus the command that installs it.
+BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
+    {ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS}
+)
 
 # ── Policy-facing spelling ──
 # A governance rule is written by a human into ``security_policy.json`` and is
@@ -116,8 +129,9 @@ def register_selectable_backend(backend: str) -> None:
 
     Called from an edition's ``ProviderRegistry.register_acp_backends`` alongside
     the provider registration itself — registering the provider without this
-    leaves the harness runnable but unreachable, which is exactly the state the
-    hard-coded list produced ("Not enabled in this build" on a build that had it).
+    leaves the harness runnable but unreachable, which is exactly the state a
+    hard-coded list produced: an option absent from the dashboard on a build that
+    could run it.
 
     Writes the BASELINE and the effective set together, so an edition that
     registers after a policy pass has already run is still visible to the next

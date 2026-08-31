@@ -9586,6 +9586,7 @@
       "agentBackendTab": {
         "agent_backend": "エージェントバックエンド",
         "claude_code": "Claude Code",
+        "claude_uses_its_own_permissions": "Claude Code は通常、実行前に承認を求め、{{productName}} がその要求を審査します。しかし Claude 自身の設定（プロジェクト内の .claude/settings.json を含む）で事前承認されたツールは要求を出さないため、拒否ルールと監査ログはその呼び出しを認識しません。",
         "could_not_load_the_agent_backend": "エージェントバックエンドを読み込めませんでした。",
         "could_not_save_the_agent_backend": "エージェントバックエンドを保存できませんでした。",
         "default_all_features_supported": "デフォルト。すべての機能に対応しています。",
@@ -9598,7 +9599,6 @@
         "missing_components": "このマシンにありません: {{components}}",
         "missing_components_with_command": "このマシンにありません: {{components}}。次でインストールします: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "新しいセッションはこのエージェントを使用します。すでに開いているセッションは開始時のエージェントを維持し、ここで切り替えてもセッション中に変わることはありません。",
-        "not_enabled_in_this_build": "このビルドでは有効になっていません",
         "retry": "再試行",
         "set_is_fixed_at_gateway_start": "ここに表示されるエージェントは gateway の起動時に決まります。管理された環境ではポリシーで対象を制限できます。ポリシーの変更は次回の起動時に反映されます。"
       },

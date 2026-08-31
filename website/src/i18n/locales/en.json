@@ -6392,6 +6392,7 @@
       "agentBackendTab": {
         "agent_backend": "Agent Backend",
         "claude_code": "Claude Code",
+        "claude_uses_its_own_permissions": "Claude Code normally asks before it acts, and {{productName}} gates that request. But a tool pre-approved in Claude's own settings — including a .claude/settings.json inside the project — never asks, so the deny rules and audit log do not see it.",
         "could_not_load_the_agent_backend": "Could not load the agent backend.",
         "could_not_save_the_agent_backend": "Could not save the agent backend.",
         "default_all_features_supported": "Default. All features supported.",
@@ -6404,7 +6405,6 @@
         "missing_components": "Missing on this machine: {{components}}",
         "missing_components_with_command": "Missing on this machine: {{components}}. Install with: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "New sessions use this agent. A session that is already open keeps the one it started with — switching here does not change it mid-session.",
-        "not_enabled_in_this_build": "Not enabled in this build",
         "retry": "Retry",
         "set_is_fixed_at_gateway_start": "Which agents appear here is decided when the gateway starts. A managed deployment can restrict the set by policy; editing that policy takes effect on the next start."
       },

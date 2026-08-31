@@ -1111,8 +1111,8 @@ def _supply_live_enum(entry: dict) -> None:
 
     The field carries no static ``enum`` on purpose (see ``AgentConfig``): an
     edition registers its backends at boot, strictly after ``SCHEMA_REGISTRY`` is
-    built, so a frozen list could only be wrong — it would call a registered
-    backend "not enabled in this build" while the PATCH allowlist accepted it.
+    built, so a frozen list could only be wrong — it would omit a registered
+    backend from the dashboard while the PATCH allowlist accepted it.
 
     Resolved from the same owner as the PATCH allowlist and the config load path,
     so the three cannot disagree. One binding today, so it is spelled once rather

@@ -2379,8 +2379,8 @@ class AcpClient:
     def _is_kiro(self) -> bool:
         """True when this client drives kiro-cli (the AcpClient default).
 
-        AcpClient serves exactly two backends — kiro-cli and the dormant claude
-        seam — so this is the positive spelling of the sites that used to read
+        AcpClient serves exactly two backends — kiro-cli and claude-agent-acp —
+        so this is the positive spelling of the sites that used to read
         ``not self._is_claude`` (harness-parity H5). KAS runs on AcpRuntime, not
         AcpClient, so it never reaches this property.
         """
@@ -2399,13 +2399,14 @@ class AcpClient:
     def _claude_session_mcp_servers(self) -> list:
         """MCP server array passed to a claude ``session/new`` / ``session/load``.
 
-        Overridable seam for the dormant ``_is_claude`` backend. The Default is
-        ``[]`` so the public core (kiro-cli only, which gets its servers via
-        ``--agent``) is byte-identical. An internal companion that re-registers
-        a Claude backend over the ``ACP_BACKEND_CLAUDE`` seam overrides this to
-        inject the kirocrew-core/cron + user MCP servers — the claude adapter
-        does not read ``kirocrew.mcp.json`` on its own, so without this a claude
-        session would have zero MCP tools.
+        Overridable seam. The Default is ``[]``, which is byte-identical for kiro-cli
+        (it gets its servers via ``--agent``) but is a REAL GAP for claude: the
+        claude-agent-acp adapter does not read ``kirocrew.mcp.json`` on its own, so a
+        claude session started on a build that does not override this has zero MCP
+        tools. The harness itself works — prompts, streaming, permissions — but Crew's
+        own tools are absent. An edition overrides this to inject the
+        kirocrew-core/cron + user MCP servers; closing it for the public build means
+        translating ``kirocrew.mcp.json`` into this array here.
         """
         return []
 
@@ -2824,11 +2825,10 @@ class AcpClient:
     async def _spawn(self) -> None:
         """Start the ACP backend subprocess with stdio pipes.
 
-        KiroCrew's public core only ever drives the kiro-cli backend. The
-        claude-agent-acp branch below is the dormant protocol seam (see
-        ``ACP_BACKEND_CLAUDE``): the public provider factory never selects it,
-        so it is unreachable here, but an internal companion that re-registers
-        a Claude backend reuses this same client over the seam.
+        Two backends reach here, and the claude-agent-acp branch below is now a
+        live path on a public build: ``ACP_BACKEND_CLAUDE`` is in
+        ``BASELINE_SELECTABLE_BACKENDS``, so an operator who has the adapter can
+        select it and this branch spawns it.
         """
         # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
         # slow storage; the loop must never wait on the kernel here.
@@ -3456,11 +3456,11 @@ class AcpClient:
         rather than loop. Returns the session/new response dict (possibly still
         without a sessionId, which the caller treats as a hard failure).
 
-        The claude-backed substitution retry path is the dormant ``_is_claude``
-        seam (kiro-cli never emits this advisory); the public core drives only
-        kiro-cli, so ``mcpServers`` stays ``[]`` and the settings re-seed is
-        best-effort via ``getattr`` — the deleted cc_agent glue is re-added by
-        the internal companion, not the public core.
+        The substitution retry is a claude-only path (kiro-cli never emits this
+        advisory). On a build that does not override ``_claude_session_mcp_servers``,
+        ``mcpServers`` stays ``[]`` and the settings re-seed is best-effort via
+        ``getattr``: the re-seed helper is an edition override, so the base client
+        must tolerate its absence rather than assume it.
         """
         new_params: dict = {
             "cwd": await self._session_work_dir(),
@@ -3512,9 +3512,8 @@ class AcpClient:
             self._model = substitute
             # Re-seed settings.local.json so the fresh SettingsManager the adapter
             # builds for the retry resolves the substitute model (it merges
-            # settings sources each session/new). The re-seed helper lives in the
-            # internal companion's cc_agent glue; guard so the public core (which
-            # never reaches this dormant _is_claude branch) does not AttributeError.
+            # settings sources each session/new). The re-seed helper is an edition
+            # override, so guard for its absence rather than assume it exists.
             _reseed = getattr(self, "_write_claude_local_settings", None)
             if callable(_reseed):
                 try:

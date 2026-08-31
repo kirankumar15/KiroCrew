@@ -213,14 +213,28 @@ export function AgentBackendTab() {
     probeQ.data?.backends.find(b => b.id === value)
 
   /**
-   * Not selectable = this build/policy will not serve it. Read from the schema
-   * first, since that is the set the PATCH validates against; the probe's own
-   * `selectable` is the same fact from the same source, so it is honoured too and
-   * the two cannot disagree in a way that lets a dead option look live. Both fall
-   * open when absent.
+   * Not selectable = this build or the live policy will not serve it. Read from the
+   * schema first, since that is the set the PATCH validates against; the probe's own
+   * `selectable` is the same fact from the same source, so it is honoured too and the
+   * two cannot disagree in a way that lets a dead option look live. Both fall open
+   * when absent, so an in-flight query or a 403 hides nothing.
    */
   const unavailable = (value: string) =>
     (selectable ? !selectable.includes(value) : false) || probe(value)?.selectable === false
+
+  /**
+   * The agents this panel renders at all.
+   *
+   * An agent the deployment may not select is HIDDEN, not shown disabled. A greyed
+   * chip invites the reader to find out how to enable it, and under a managed policy
+   * there is nothing they can do — the answer is not on their machine. Advertising a
+   * forbidden option is also the opposite of what a restriction is for.
+   *
+   * `current` is always kept, whatever the verdict. The backend degrades a denied
+   * persisted value to the floor on load, so this should not arise; if it ever does,
+   * a control rendering no selected chip is a worse failure than one extra row.
+   */
+  const visible = [KIRO, CLAUDE, KAS].filter(value => value === current || !unavailable(value))
 
   /**
    * Installed === 'missing' is the only verdict that disables. `'unknown'` and an
@@ -235,8 +249,31 @@ export function AgentBackendTab() {
    * a positive install verdict still gates the control.
    */
   const needsRestart = (value: string) => probe(value)?.restart_required === true
-  const disabledOption = (value: string) =>
-    unavailable(value) || notInstalled(value) || needsRestart(value)
+  /**
+   * Selectability is deliberately NOT part of this: an unselectable agent is absent
+   * from `visible` rather than disabled, so the only reasons a rendered chip is dead
+   * are ones the user can act on — install the binary, or restart the gateway.
+   */
+  const disabledOption = (value: string) => notInstalled(value) || needsRestart(value)
+
+  /**
+   * A standing caveat about the harness itself, independent of whether it is
+   * installed. Unlike `status`, this does not change with the probe.
+   *
+   * The DEFAULT path is gated: Claude asks, `claude-agent-acp` turns that into
+   * `session/request_permission`, and Crew's own approval path decides. What escapes
+   * is narrower and worth stating precisely -- a tool ALREADY pre-approved in Claude's
+   * own settings never asks at all, because the SDK approves an allow-rule match
+   * before consulting the client. Those settings include a `.claude/settings.json`
+   * inside the project directory, which is the copy an operator did not write.
+   *
+   * That is documented, intended Claude behaviour rather than a defect here, but it
+   * means the guarantee differs per harness. An operator choosing between harnesses is
+   * choosing between governance models, so the panel names the difference instead of
+   * letting them find it in a shell command that never asked.
+   */
+  const caveat = (value: string): string =>
+    value === CLAUDE ? i18nT('pages.developer.agentBackendTab.claude_uses_its_own_permissions') : ''
 
   const NAME: Record<string, string> = {
     [KIRO]: i18nT('pages.developer.agentBackendTab.kiro_cli'),
@@ -244,22 +281,25 @@ export function AgentBackendTab() {
     [KAS]: i18nT('pages.developer.agentBackendTab.kas_kiro_agent'),
   }
 
+  const ICON: Record<string, React.ReactNode> = {
+    [KIRO]: <Terminal size={14} />,
+    [CLAUDE]: <Sparkles size={14} />,
+    [KAS]: <Bot size={14} />,
+  }
+
   /**
    * The one status line a row carries, derived rather than authored per agent.
    *
-   * The order is strict, because the reasons are not equally actionable. Not-enabled
-   * is checked FIRST and off the schema, so a build that starts shipping an agent
-   * stops calling it unavailable without an edit here — and there is no point naming
-   * an install for a backend this build would refuse anyway. `missing` comes next
-   * because it is the one line that tells the user what to DO, and it names the
-   * command only when the server had one to give. `unknown` follows and must never
-   * read as missing; it reports a failed check, not an absent binary. Only then do
-   * the pre-existing default/experimental lines apply. KIRO is the all-supported
-   * descriptor, so it gets that sentence; anything else that is selectable is not,
-   * so it gets `Experimental` rather than a claim.
+   * The order is strict, because the reasons are not equally actionable. There is no
+   * not-selectable line: such an agent is not rendered at all, so every line here
+   * describes something the reader can act on. `missing` comes first because it is the
+   * one line that tells the user what to DO, and it names the command only when the
+   * server had one to give. `unknown` follows and must never read as missing; it
+   * reports a failed check, not an absent binary. Only then do the pre-existing
+   * default/experimental lines apply. KIRO is the all-supported descriptor, so it gets
+   * that sentence; anything else is not, so it gets `Experimental` rather than a claim.
    */
   const status = (value: string): string => {
-    if (unavailable(value)) return i18nT('pages.developer.agentBackendTab.not_enabled_in_this_build')
     const row = probe(value)
     if (row?.installed === 'missing') {
       const components = row.missing_components.join(', ')
@@ -290,36 +330,21 @@ export function AgentBackendTab() {
           configKey={CONFIG_KEY}
           value={current}
           disabled={patchMut.isPending}
-          options={[
-            {
-              value: KIRO,
-              label: NAME[KIRO],
-              icon: <Terminal size={14} />,
-              disabled: disabledOption(KIRO),
-              describedById: statusId(KIRO),
-            },
-            {
-              value: CLAUDE,
-              label: NAME[CLAUDE],
-              icon: <Sparkles size={14} />,
-              disabled: disabledOption(CLAUDE),
-              describedById: statusId(CLAUDE),
-            },
-            {
-              value: KAS,
-              label: NAME[KAS],
-              icon: <Bot size={14} />,
-              disabled: disabledOption(KAS),
-              describedById: statusId(KAS),
-            },
-          ]}
+          options={visible.map(value => ({
+            value,
+            label: NAME[value],
+            icon: ICON[value],
+            disabled: disabledOption(value),
+            describedById: statusId(value),
+          }))}
           onChange={v => patchMut.mutate(v)}
         />
-        {/* One line per agent, always all three — the reader is choosing BETWEEN
-            them, so showing only the selected one's status would hide the very
-            comparison the control is for. */}
+        {/* One line per agent the panel offers — the reader is choosing BETWEEN them,
+            so showing only the selected one's status would hide the very comparison
+            the control is for. Agents this deployment may not select are absent from
+            `visible`, so they carry no line either. */}
         <dl className="mt-2 space-y-1.5">
-          {[KIRO, CLAUDE, KAS].map(value => (
+          {visible.map(value => (
             <div key={value} className="flex gap-2 text-[11px] leading-relaxed">
               <dt className={`shrink-0 font-semibold ${value === current ? 'text-text-strong' : 'text-muted'}`}>
                 {NAME[value]}
@@ -329,6 +354,7 @@ export function AgentBackendTab() {
                 className={`m-0 ${disabledOption(value) ? 'text-warn' : 'text-muted'}`}
               >
                 {status(value)}
+                {caveat(value) && <div className="mt-0.5 text-muted">{caveat(value)}</div>}
               </dd>
             </div>
           ))}

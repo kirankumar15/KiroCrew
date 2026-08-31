@@ -9586,6 +9586,7 @@
       "agentBackendTab": {
         "agent_backend": "에이전트 백엔드",
         "claude_code": "Claude Code",
+        "claude_uses_its_own_permissions": "Claude Code는 보통 실행 전에 승인을 요청하며 {{productName}}이(가) 그 요청을 심사합니다. 하지만 Claude 자체 설정(프로젝트 내 .claude/settings.json 포함)에서 미리 승인된 도구는 요청하지 않으므로 거부 규칙과 감사 로그가 해당 호출을 보지 못합니다.",
         "could_not_load_the_agent_backend": "에이전트 백엔드를 불러올 수 없습니다.",
         "could_not_save_the_agent_backend": "에이전트 백엔드를 저장할 수 없습니다.",
         "default_all_features_supported": "기본값입니다. 모든 기능이 지원됩니다.",
@@ -9598,7 +9599,6 @@
         "missing_components": "이 컴퓨터에 없음: {{components}}",
         "missing_components_with_command": "이 컴퓨터에 없음: {{components}}. 다음으로 설치하세요: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "새 세션은 이 에이전트를 사용합니다. 이미 열려 있는 세션은 시작할 때의 에이전트를 유지하며, 여기서 전환해도 세션 중에는 바뀌지 않습니다.",
-        "not_enabled_in_this_build": "이 빌드에서는 활성화되지 않았습니다",
         "retry": "다시 시도",
         "set_is_fixed_at_gateway_start": "여기에 표시되는 에이전트는 gateway가 시작될 때 결정됩니다. 관리형 배포는 정책으로 이 집합을 제한할 수 있으며, 정책 변경은 다음 시작 시 적용됩니다."
       },
