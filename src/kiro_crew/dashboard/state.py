@@ -2963,6 +2963,7 @@ class _ChatSlot:
         "_resumed_count",
         "_hook_continuation_depth",
         "_todo",
+        "_mcp_report",
         "_on_message",
         "_on_question_retired",
         "_has_reader_flag",
@@ -3217,6 +3218,13 @@ class _ChatSlot:
         # None = the agent has never used its todo tool in this slot, which the
         # UI renders as "no pill" rather than "an empty list".
         self._todo: dict[str, Any] | None = None
+        # What THIS slot's agent session reported about its MCP servers, as
+        # published by the ACP layer at session init and updated by later
+        # registration frames. None = this slot has no live session that
+        # reported, which the UI must render as absence of knowledge — NOT as
+        # "no servers". Cleared on session reset: the report is evidence, and a
+        # report describing a torn-down session is worse than none.
+        self._mcp_report: dict[str, Any] | None = None
         # Callback for broadcasting messages via global SSE
         self._on_message: object | None = None  # Callable[[str, dict], None] | None
         # Announce stateless question cards this slot retires, so every client
@@ -3768,6 +3776,33 @@ class _ChatSlot:
             "total": len(tasks),
             "current": current,
         }
+
+    def set_mcp_report(self, report: dict[str, Any] | None) -> bool:
+        """Replace this slot's MCP session report. True when it changed.
+
+        The payload is built and sanitized by
+        :class:`kiro_crew.acp.mcp_session_report.McpSessionReport`, which owns
+        redaction and the per-bucket caps; this only stores what it produced, so
+        a caller cannot widen those bounds by writing here.
+        """
+        normalised = report if isinstance(report, dict) else None
+        if normalised == self._mcp_report:
+            return False
+        self._mcp_report = normalised
+        return True
+
+    def clear_mcp_report(self) -> bool:
+        """Drop the report because this slot's session is gone. True if it had one.
+
+        Distinct from ``set_mcp_report(None)`` only in intent: it is called from
+        the session-reset funnel so a report can never outlive the session it
+        describes and be read as the next one's.
+        """
+        return self.set_mcp_report(None)
+
+    def mcp_report_payload(self) -> dict[str, Any] | None:
+        """The stored MCP session report, or None when this slot has none."""
+        return self._mcp_report
 
     def note_disk_tail(self, *candidates: str | None) -> None:
         """Record the newest ``ts`` known to be ON DISK for this session.
@@ -6974,6 +7009,7 @@ class DashboardState:
         out = []
         subs = getattr(self, "subagents", None)
         for s in self._slots.values():
+            self._drop_orphaned_mcp_report(s)
             d = self.serialize_slot(
                 s,
                 include_check_status=include_check_status,
@@ -6982,6 +7018,28 @@ class DashboardState:
             d["subagents_running"] = bool(subs and subs.running_agents_for(f"dashboard:{s.key}"))
             out.append(d)
         return out
+
+    def _drop_orphaned_mcp_report(self, slot: "_ChatSlot") -> None:
+        """Drop a slot's MCP session report once its session is gone.
+
+        A report describes exactly ONE session, so it must not outlive it. Every
+        teardown path could clear it at its own call site, but there are many —
+        the reset funnel, the reload and reset-conversation routes, the queued
+        discard, a channel handler, the cron reaper, the task runner — and an
+        invariant spread across that many sites is one a new call site silently
+        breaks. Validating HERE cannot be bypassed: this is the single projector
+        both ``/api/chat/slots`` and the WebSocket snapshot go through, so a stale
+        report can never be served no matter which path removed the session.
+
+        The key derivation mirrors ``chat_utils.effective_session_key`` — a
+        channel-born slot's turns run on the channel's own session — and is
+        inlined because ``chat_utils`` imports this module.
+        """
+        if slot.mcp_report_payload() is None:
+            return
+        session_key = getattr(slot, "linked_session_key", "") or f"dashboard:{slot.key}"
+        if not self.sessions.has_session(session_key):
+            slot.clear_mcp_report()
 
     @contextlib.contextmanager
     def suspend_slots_push(self) -> "Iterator[None]":

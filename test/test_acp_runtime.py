@@ -4654,6 +4654,107 @@ def _metadata_frame(session_id: str) -> JsonRpcMessage:
     )
 
 
+def _mcp_failure_frame(session_id: str, server: str, error: str) -> JsonRpcMessage:
+    return JsonRpcMessage.from_dict(
+        {
+            "method": "_kiro.dev/mcp/server_init_failure",
+            "params": {"sessionId": session_id, "serverName": server, "error": error},
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_init_records_the_session_mcp_report():
+    """Registration frames the drain consumes become this session's report.
+
+    Parity with AcpClient._drain_notifications: without this the frames are
+    consumed and the session has no way to say which servers started.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "kirocrew-core"))
+    q["sA"].put_nowait(_mcp_failure_frame("sA", "slack-mcp", "spawn ENOENT"))
+    q["sA"].put_nowait(_metadata_frame("sA"))
+
+    await handle.drain_init(duration=0.5, idle_exit=0.05)
+
+    payload = handle.mcp_session_report().payload()
+    assert payload is not None
+    assert payload["ready"] == ["kirocrew-core"]
+    assert payload["failed"] == ["slack-mcp"]
+    assert payload["failures"] == {"slack-mcp": "spawn ENOENT"}
+
+
+@pytest.mark.asyncio
+async def test_drain_init_skips_a_stale_backlog_report():
+    """A pre-switch backlog frame is drained but NOT credited to this report.
+
+    ``ignore_queued_reports`` marks the already-queued frames as the PRE-switch
+    agent's roster. Recording one would show a server the current agent does not
+    have as mounted here; leaving it out only understates, which the report
+    renders as "no report" rather than "not mounted".
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "previous-agent-server"))
+
+    await handle.drain_init(
+        duration=0.2, idle_exit=0.01, no_report_ceiling=0.05, ignore_queued_reports=True
+    )
+
+    assert q["sA"].empty()  # still drained, as the arming docstring promises
+    assert handle.mcp_session_report().payload() is None
+
+
+@pytest.mark.asyncio
+async def test_drain_init_records_a_post_backlog_report_after_a_switch():
+    """After the stale backlog is exhausted, the active agent's own report counts."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "previous-agent-server"))
+
+    async def _after_switch() -> None:
+        await asyncio.sleep(0.05)
+        q["sA"].put_nowait(_mcp_initialized_frame("sA", "current-agent-server"))
+
+    feeder = asyncio.create_task(_after_switch())
+    try:
+        await handle.drain_init(
+            duration=0.3, idle_exit=0.05, no_report_ceiling=0.5, ignore_queued_reports=True
+        )
+    finally:
+        await feeder
+
+    payload = handle.mcp_session_report().payload()
+    assert payload is not None
+    assert payload["ready"] == ["current-agent-server"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_records_the_wire_roster(monkeypatch):
+    """The report carries the roster session/new actually sent.
+
+    A different fact from the agent spec on disk, which is what the dashboard's
+    other MCP views read.
+    """
+    rt, _, _ = _make_runtime()
+
+    async def _fake_send(method, params, timeout=None):
+        if method == METHOD_SESSION_NEW:
+            return {"sessionId": "sid-roster"}
+        return {}
+
+    monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+    servers = [{"name": "kirocrew-core", "command": "x"}, {"name": "kirocrew-cron"}]
+
+    handle = await rt.create_session(cwd="/w", agent="kirocrew", mcp_servers=servers)
+
+    assert handle.mcp_session_report().configured == ("kirocrew-core", "kirocrew-cron")
+
+
 @pytest.mark.asyncio
 async def test_drain_init_waits_past_idle_window_for_first_mcp_report(monkeypatch):
     """#2627: the idle shortcut is not eligible before the first MCP

@@ -69,6 +69,7 @@ from kiro_crew.acp.liveness import (
     boottime_now,
     consult_offloaded,
 )
+from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
@@ -614,6 +615,11 @@ class AcpSessionHandle:
         # OAuth requests collected by drain_init(). Dashboard startup drains
         # this list through AcpSessionProvider after create_session returns.
         self._pending_oauth_requests: list[dict[str, str]] = []
+        # What THIS session's MCP servers reported at init — parity with
+        # AcpClient._mcp_report. On the shared runtime the frames are staged
+        # per sessionId before this handle's queue exists, so the report is
+        # genuinely this session's and not the process's.
+        self._mcp_report = McpSessionReport()
         # JSON-RPC request id -> {"once","always","reject"} optionId map, so
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
@@ -2565,6 +2571,7 @@ class AcpSessionHandle:
                         kind=EVENT_MCP_OAUTH_REQUEST,
                         server_name=request["serverName"],
                         oauth_url=request["oauthUrl"],
+                        runtime_global=msg.fanout_no_owner,
                     )
                 elif action == "mcp_server_initialized":
                     params = msg.params or {}
@@ -2576,6 +2583,7 @@ class AcpSessionHandle:
                         yield AcpEvent(
                             kind=EVENT_MCP_SERVER_INITIALIZED,
                             server_name=server_name,
+                            runtime_global=msg.fanout_no_owner,
                         )
                 elif action == "mcp_server_init_failure":
                     params = msg.params or {}
@@ -2597,6 +2605,7 @@ class AcpSessionHandle:
                             kind=EVENT_MCP_SERVER_INIT_FAILURE,
                             server_name=server_name,
                             text=err,
+                            runtime_global=msg.fanout_no_owner,
                         )
 
             # Timeout — no complete received. Yield a terminal EVENT_COMPLETE with a
@@ -2917,6 +2926,15 @@ class AcpSessionHandle:
         self._pending_oauth_requests.clear()
         return pending
 
+    def mcp_session_report(self) -> McpSessionReport:
+        """This session's MCP registration report — parity with AcpClient.
+
+        Does NOT drain: the report is the session's standing answer to "which
+        servers actually started here". An unreported server means *not
+        reported*, never *not mounted*.
+        """
+        return self._mcp_report
+
     async def drain_init(
         self,
         duration: float = _MCP_DRAIN_DURATION,
@@ -2992,6 +3010,17 @@ class AcpSessionHandle:
             drained += 1
             try:
                 action = classify_notification(msg)
+                if not stale_backlog:
+                    # Deliberately narrower than the "still drained and
+                    # processed normally" treatment the stale backlog gets
+                    # otherwise: those frames describe the PRE-switch agent's
+                    # roster, so recording one could show a server the current
+                    # agent does not have as mounted here. Skipping it can
+                    # instead leave a server that is genuinely up looking
+                    # unreported until it reports again — and that is the safe
+                    # direction, because the report renders an unreported server
+                    # as "no report", never as "not mounted".
+                    self._mcp_report.record_frame(msg)
                 if not reported and not stale_backlog and action in _MCP_DRAIN_REPORT_ACTIONS:
                     # First server report: arm the idle shortcut and give the
                     # remaining servers up to ``duration`` from this point.

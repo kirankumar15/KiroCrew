@@ -2852,6 +2852,10 @@ class AcpRuntime:
 
         # Populate state from session/new response (configOptions, available models)
         handle.store_session_config(resp)
+        # The roster this session put on the wire. Set BEFORE drain_init so the
+        # report can be read as "of the N we sent, these reported" rather than
+        # as a bare list of names.
+        handle.mcp_session_report().begin_session(mcp_servers)
 
         mode_switched = False
         # Set agent mode if specified. If set_mode raises, no handle is returned
@@ -3101,6 +3105,9 @@ class AcpRuntime:
             crew_agent=_crew,
         )
         handle.store_session_config(resp)
+        # session/load re-initializes this session's servers, so the resumed
+        # session gets its own report against the roster load re-declared.
+        handle.mcp_session_report().begin_session(mcp_servers)
 
         mode_switched = False
         # Activate the agent (mirrors AcpClient step 4 — set_mode applies to a
