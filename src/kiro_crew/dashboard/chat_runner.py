@@ -61,6 +61,7 @@ from kiro_crew.context_management import (
     strip_plan_markers,
     validate_plan_format,
 )
+from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.chat_persistence import _build_history_prefix, save_slot_off_loop
 from kiro_crew.dashboard.chat_summary import generate_session_summary
 from kiro_crew.dashboard.chat_title import (
@@ -6504,17 +6505,101 @@ async def _run_chat(
                     and event.tool_call_id not in _dir_consumed_out
                     and session_directive.has_marker(_out)
                 ):
-                    logger.warning(
-                        "session-directive NOT APPLIED: marker present but the tool "
-                        "call carried no core-MCP identity "
-                        "(tool_call_id=%s, mcp_server_name=%r, tool_name=%r, "
-                        "expected mcp_server_name=%r). Either a forged marker, or "
-                        "this ACP backend does not emit _meta.kiro identity.",
-                        event.tool_call_id,
-                        _seen_tool_identity.get(event.tool_call_id, ("", ""))[0],
-                        _seen_tool_identity.get(event.tool_call_id, ("", ""))[1],
-                        session_directive.CORE_MCP_SERVER,
-                    )
+                    # The identity gate found nothing to trust. Before treating
+                    # that as a lost directive, look for the OUT-OF-BAND record:
+                    # the tool publishes its validated payload straight to the
+                    # gateway under a kernel-verified X-Session-Key, so on a
+                    # backend that emits no ``_meta.kiro`` this is the delivery
+                    # path that still works. The marker is only the HINT that a
+                    # record may be waiting — its content is never read here, so a
+                    # forged marker buys a lookup that finds nothing (or finds
+                    # only what this same session legitimately published).
+                    #
+                    # ISOLATION FIRST, though: a NATIVE sub-agent's tool calls
+                    # surface as flat events on this parent stream (tagged in
+                    # _native_tc_card) and have no independently bindable slot of
+                    # their own. On a backend that emits no ``_meta.kiro`` such a
+                    # frame reaches here with _dir_tool == "", while the record the
+                    # child's tool parked is keyed by the PARENT's session — so
+                    # claiming it would apply the child's directive to the parent,
+                    # the exact mutation the marker path below refuses. Refuse it
+                    # here too, on the same terms and with the same audit, BEFORE
+                    # the claim: a claim is destructive (it removes the record), so
+                    # ordering the check first also keeps a legitimate parent
+                    # directive from being consumed by a child's frame.
+                    if event.tool_call_id in _native_tc_card:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="mcp-directive",
+                            tool_name=_seen_tool_identity.get(event.tool_call_id, ("", ""))[1],
+                            outcome="denied",
+                        )
+                        _out = _redact_tool_field(
+                            session_directive.strip_marker(_out)
+                            + (
+                                "\n\n[Not applied: a session-bound tool called "
+                                "from a sub-agent has no session to act on.]"
+                            )
+                        )
+                        _dir_consumed_out[event.tool_call_id] = _out
+                        # Refusing to APPLY is not enough: the record the child's
+                        # tool parked is keyed by the parent and nothing in it says
+                        # who published it, so leaving it queued only defers the
+                        # mutation to the next frame that reaches this path. Drop
+                        # the session's queue outright. That can also discard a
+                        # directive the PARENT legitimately parked in the same
+                        # turn — accepted deliberately: a lost directive is a
+                        # missed effect the model can retry, whereas a retained
+                        # one is a cross-session mutation. Fail closed, and only
+                        # in this branch (the normal path still claims).
+                        directive_queue.discard(session_key)
+                        _oob = []
+                    else:
+                        _oob = directive_queue.claim(session_key)
+                    if _oob:
+                        _applied: list[str] = []
+                        for _rec in _oob:
+                            _applied.append(
+                                await apply_session_directive(
+                                    state,
+                                    slot,
+                                    session_key,
+                                    str(_rec.get("kind") or ""),
+                                    dict(_rec.get("args") or {}),
+                                    producer_is_user_facing=_directive_user_origin,
+                                )
+                            )
+                        logger.info(
+                            "session-directive applied OUT OF BAND for %s "
+                            "(tool_call_id=%s, records=%d): this backend emits no "
+                            "_meta.kiro identity, so the marker could not be "
+                            "trusted and the gateway-parked payload was used.",
+                            session_key,
+                            event.tool_call_id,
+                            len(_oob),
+                        )
+                        # Same surface contract as the marker path: the applier's
+                        # real outcome replaces the tool's own (deliberately
+                        # non-committal) text, re-redacted because that string
+                        # interpolates LLM-derived values.
+                        _out = _redact_tool_field(
+                            session_directive.strip_marker(_out) + "\n\n" + "\n".join(_applied)
+                        )
+                        _dir_consumed_out[event.tool_call_id] = _out
+                    elif event.tool_call_id not in _dir_consumed_out:
+                        logger.warning(
+                            "session-directive NOT APPLIED: marker present but the "
+                            "tool call carried no core-MCP identity and no "
+                            "out-of-band record was parked "
+                            "(tool_call_id=%s, mcp_server_name=%r, tool_name=%r, "
+                            "expected mcp_server_name=%r). Either a forged marker, "
+                            "or this ACP backend emits no _meta.kiro identity AND "
+                            "could not reach the gateway to park the payload.",
+                            event.tool_call_id,
+                            _seen_tool_identity.get(event.tool_call_id, ("", ""))[0],
+                            _seen_tool_identity.get(event.tool_call_id, ("", ""))[1],
+                            session_directive.CORE_MCP_SERVER,
+                        )
                 if not _dir_tool and event.tool_call_id in _dir_consumed_out:
                     # A LATER frame for a directive we already consumed: replay
                     # the output we produced instead of letting the raw marker
@@ -6602,6 +6687,12 @@ async def _run_chat(
                             # a mid-stream partial frame must not burn the
                             # mapping the final frame still needs.
                             _pending_dir_tool.pop(event.tool_call_id, None)
+                            # The tool ALSO parked this payload out of band (one
+                            # publish per emit, unconditionally — the tool cannot
+                            # know which consumer will run). Applying both would
+                            # arm two loops or render two cards, so retire the
+                            # twin now that the marker path has taken it.
+                            directive_queue.discard(session_key)
                             _out = _redact_tool_field(
                                 await apply_session_directive(
                                     state,
