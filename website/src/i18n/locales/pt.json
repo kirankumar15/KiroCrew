@@ -13149,6 +13149,8 @@
         "set_up_a_new_one": "Set up a new one",
         "chat_on_a_crew": "Conversar em um Crew",
         "chat_on_a_crew_desc": "Adiciona “New chat on crew” ao menu de criação, que inicia uma sessão executada em um Crew conectado. Inacabado: ela abre no painel do próprio Crew, e sessões executadas em um Crew ainda não aparecem aqui.",
+        "auto_connect": "Conectar crews automaticamente",
+        "auto_connect_desc": "Quando ativado, abrir o app web conecta cada crew automaticamente e os reconecta quando você volta para a aba. Desative para conectar um crew somente ao alternar para ele.",
         "crews_you_can_switch_to": "Instâncias para as quais você pode alternar",
         "up_to_warm": "Up to {{n}} stay warm at once",
         "no_crews": "Ainda não há instâncias. Configure uma ou adicione uma máquina que você já tem.",
