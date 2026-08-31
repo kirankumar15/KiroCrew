@@ -2927,6 +2927,7 @@ class _ChatSlot:
         "agent",
         "model",
         "reasoning_effort",
+        "autocompact_pct",
         "mode",
         "workspace",
         "project",
@@ -3047,6 +3048,7 @@ class _ChatSlot:
         "_disk_older_durable_count",
         "_disk_window_len",
         "_disk_meta_created_at",
+        "_disk_meta_observed",
         "_disk_tail_ts",
         "_frozen_prefix_cache",
         "_pending_rewrite",
@@ -3088,6 +3090,10 @@ class _ChatSlot:
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
+        # Per-session auto-compact threshold override (percent). None = follow
+        # the global session.autocompact_pct. Persisted with the slot and
+        # re-seeded into the SessionManager after restore.
+        self.autocompact_pct: float | None = None
         # "" = default chat, "orchestrator" = orchestrated chat
         self.mode = mode
         self.workspace = workspace
@@ -3526,6 +3532,14 @@ class _ChatSlot:
         # deleted window into the latter. Empty means "never observed a disk
         # identity" (fresh slot), which the guard treats as no evidence.
         self._disk_meta_created_at: str = ""
+        # Whether this slot has ever READ its metadata record from disk,
+        # independent of that record carrying a ``created_at``. A LEGACY
+        # record (pre-identity metadata) hydrates with an empty
+        # ``_disk_meta_created_at``, which alone cannot distinguish "never
+        # persisted" from "observed a legacy file" — and the autocompact
+        # endpoint's delete-won guard must refuse a first-create for the
+        # latter (an empty read there is a delete witness, not a fresh slot).
+        self._disk_meta_observed: bool = False
         # The newest ``ts`` seen on disk at the last save, INCLUDING rows this
         # slot never observed. A subagent, cron, or CLI appending to a session a
         # live tab also has open writes rows that ``_save_slot_to_history``

@@ -12,6 +12,7 @@ import re
 import tempfile
 import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from itertools import islice
@@ -27,10 +28,13 @@ from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     KiroCrewConfig,
     _workspace_name_for_dir,
     config_dir,
     default_project_dir,
+    published_autocompact_pct,
     resolve_agent_bindings,
 )
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
@@ -98,7 +102,7 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
-from kiro_crew.history import carry_provenance, is_incognito_transcript
+from kiro_crew.history import carry_provenance, is_incognito_transcript, metadata_now_iso
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
@@ -4636,6 +4640,267 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "model": model_name})
 
 
+# INVARIANT (autocompact writes): the whole persist->mutate span of a threshold
+# POST runs under this lock, KEYED BY THE TRANSCRIPT KEY (slot_history_key) --
+# not the slot name -- so concurrent requests commit strictly in
+# lock-acquisition order even when two slot names alias one transcript
+# (channel-linked slots resolve distinct names onto one file; GPT round 12).
+# A delayed older request can neither overwrite a newer threshold nor tear
+# persisted vs live state.
+# WeakValueDictionary: an entry lives exactly as long as some request holds a
+# reference, so idle keys leak nothing. asyncio.Lock is single-loop, matching
+# the dashboard's one-event-loop-per-process model.
+_autocompact_write_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _autocompact_lock(history_key: str) -> asyncio.Lock:
+    """Return the (lazily created) autocompact write lock for a transcript key."""
+    lock = _autocompact_write_locks.get(history_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _autocompact_write_locks[history_key] = lock
+    return lock
+
+
+async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
+    """GET/POST /api/chat/slots/{slot}/autocompact — per-session compact threshold.
+
+    GET returns the slot's override (``pct``, null when it follows the global),
+    the current global (``global_pct``), and the valid range. POST takes
+    ``{"pct": <number|null>}``: a number sets this session's override (rejected
+    outside the documented range, matching the global knob's PATCH validation),
+    null clears it back to the global. The value applies to the live session
+    immediately via the SessionManager override map and persists with the slot
+    metadata, so it survives gateway restarts.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # Session-aware ownership gate, not the slot-only check: the POST writes the
+    # override keyed by effective_session_key(slot), so a linked app-owned slot
+    # (channel stem) would let an app modify a foreign session's threshold and
+    # metadata. _check_slot_app_ownership authorizes the key the write actually
+    # lands on, same as /context and /note.
+    request_app = request.get("app", "")
+    denied = _check_slot_app_ownership(slot, name, request_app, "slot_autocompact")
+    if denied is not None:
+        return denied
+    if request.method == "GET":
+        return web.json_response(
+            {
+                "pct": slot.autocompact_pct,
+                "global_pct": published_autocompact_pct(),
+                "min": AUTOCOMPACT_PCT_MIN,
+                "max": AUTOCOMPACT_PCT_MAX,
+            }
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_json"}, status=400
+        )
+    if "pct" not in body:
+        return web.json_response(
+            {"error": "pct is required (number or null)", "code": "pct_required"}, status=400
+        )
+    pct = body["pct"]
+    if pct is not None:
+        # bool is an int subclass; True would otherwise read as 1.0 and be
+        # rejected by range, but reject it explicitly for a clear error.
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return web.json_response(
+                {"error": "pct must be a number or null", "code": "pct_not_a_number"}, status=400
+            )
+        try:
+            pct = float(pct)
+        except OverflowError:
+            # An int too large for a float; out of range by definition.
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if pct != pct:  # NaN
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if not (AUTOCOMPACT_PCT_MIN <= pct <= AUTOCOMPACT_PCT_MAX):
+            return web.json_response(
+                {
+                    "error": (
+                        f"pct must be between {AUTOCOMPACT_PCT_MIN:g} "
+                        f"and {AUTOCOMPACT_PCT_MAX:g}"
+                    ),
+                    "code": "pct_out_of_range",
+                },
+                status=400,
+            )
+    # GPT round 9: serialize the whole persist->mutate span. Without the lock,
+    # two concurrent POSTs (e.g. two dashboard tabs) interleave across the
+    # persist await and the OLDER request's persist + mutations can commit
+    # after the newer one's, silently reverting the user's latest choice or
+    # tearing persisted vs live state. Keyed by the TRANSCRIPT key (round 12):
+    # two slot names that alias one transcript must serialize against each
+    # other, not only against themselves.
+    history_key = slot_history_key(slot)
+    async with _autocompact_lock(history_key):
+        # Same window as /context: authorized before the body read, so re-decide
+        # against the slot as it is now, ahead of the first write.
+        stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+        if stale is not None:
+            return stale
+        # The lock covers exactly the key it was acquired for. A slot whose
+        # link moved while this request awaited the lock would write a file
+        # the held lock does not cover -- refuse retryably instead.
+        if slot_history_key(slot) != history_key:
+            return web.json_response(
+                {"error": "slot was relinked; retry", "code": "conflict_retry"}, status=409
+            )
+        # Persist FIRST, mutate after: if the metadata write raises, the live
+        # threshold and the slot field must be left untouched, or the client gets
+        # a 500 while the server silently runs on the new value until restart
+        # reverts it. The dirty flush early-outs on an empty message window, so a
+        # message-less slot's override would never reach disk via _dirty alone --
+        # write the metadata directly under the same delete-won guard the
+        # empty-window merge uses (GPT round 10): a bare update_metadata upserts,
+        # so a threshold POST racing a permanent delete_session (no tombstone)
+        # would RECREATE the unlinked transcript -- the deletion reports success
+        # and the session resurrects. The guard admits a merge into the record
+        # this slot knows (created_at identity), a first create only for a slot
+        # whose session has never been on disk, and refuses everything else:
+        # a missing record for a known identity is the delete witness, and a
+        # mismatched created_at is another writer's fresh file after a delete.
+        if state.conversation_log:
+            conv_log = state.conversation_log
+            known_created_at = slot._disk_meta_created_at
+            observed_on_disk = slot._disk_meta_observed
+            guard_state: dict = {"ran": False, "observed_created_at": ""}
+
+            def _delete_won_guard(meta: dict) -> bool:
+                guard_state["ran"] = True
+                if not meta:
+                    if known_created_at or observed_on_disk:
+                        # An empty read for a slot that has OBSERVED its record
+                        # on disk is the delete witness. The observed bit is
+                        # what covers a LEGACY record (pre-identity metadata,
+                        # no created_at): identity alone would read as "never
+                        # persisted" and this write would recreate the
+                        # just-deleted transcript as a first create (GPT local
+                        # mirror, round 12).
+                        return False
+                    # First create: MINT the identity here (inside the locked
+                    # section) and write it with the fields, so the record's
+                    # created_at is known to this slot from birth. Without
+                    # this the guard stays unarmed after the first POST and a
+                    # queued second write could recreate a just-deleted
+                    # transcript (GPT round 11).
+                    minted = metadata_now_iso()
+                    fields_to_write["created_at"] = minted
+                    guard_state["observed_created_at"] = minted
+                    return True
+                if known_created_at and meta.get("created_at") != known_created_at:
+                    return False
+                observed = str(meta.get("created_at") or "")
+                if not observed:
+                    # LEGACY record still present: same file, but without an
+                    # identity every later delete stays invisible to this
+                    # guard. Backfill one with this write (the full save does
+                    # the same via ``existing_meta.get("created_at") or
+                    # slot.created_at``), so the slot is armed from here on.
+                    observed = metadata_now_iso()
+                    fields_to_write["created_at"] = observed
+                guard_state["observed_created_at"] = observed
+                return True
+
+            fields_to_write: dict = {"autocompact_pct": pct}
+
+            def _persist_and_mirror() -> bool:
+                # ONE critical section for the disk commit AND the live field
+                # mirror. Every metadata writer of this transcript (the full
+                # save and the empty-window merge) reads the slot fields
+                # INSIDE this same reentrant per-file lock at write time, so
+                # holding it across commit+mirror means no save can pair a
+                # committed threshold with a stale slot field and flush the
+                # old value back over it (GPT local mirror: the endpoint-only
+                # asyncio.Lock cannot order against executor-thread saves).
+                with conv_log._locked(history_key):
+                    applied = conv_log.update_metadata_if(
+                        history_key,
+                        fields_to_write,
+                        _delete_won_guard,
+                    )
+                    if applied:
+                        observed_identity = guard_state["observed_created_at"]
+                        # Mirror EVERY live slot whose CURRENT transcript key is
+                        # the one this commit wrote -- not just the requesting
+                        # one: channel-linked aliases resolve distinct slot
+                        # names onto one file, and a sibling left holding the
+                        # old value would persist it back over the acknowledged
+                        # commit on its next flush (GPT server round 12).
+                        # Membership is re-derived here, NOT assumed for the
+                        # requesting slot: a slot rebound during the persist no
+                        # longer writes this file, and mirroring it would apply
+                        # a live change its reauthorization is about to deny
+                        # (round-7 invariant). Snapshot the values() view --
+                        # the event loop may mutate the dict concurrently.
+                        for other in list(state._slots.values()):
+                            if slot_history_key(other) == history_key:
+                                other.autocompact_pct = pct
+                                if observed_identity:
+                                    other._disk_meta_created_at = observed_identity
+                                    other._disk_meta_observed = True
+                    return applied
+
+            try:
+                applied = await asyncio.to_thread(_persist_and_mirror)
+            except Exception:
+                logger.exception("Slot %s autocompact_pct persist failed", name)
+                return web.json_response(
+                    {"error": "could not persist threshold", "code": "persist_failed"}, status=500
+                )
+            if not applied:
+                if guard_state["ran"]:
+                    # Deletion won: the session this write targeted is gone (or
+                    # replaced). Do not resurrect it and do not mutate live state.
+                    return web.json_response(
+                        {"error": "session was deleted", "code": "session_deleted"}, status=409
+                    )
+                # update_metadata_if fails CLOSED on an unreadable record without
+                # running the guard -- a failed write, not a delete witness.
+                logger.warning("Slot %s autocompact_pct persist skipped: record unreadable", name)
+                return web.json_response(
+                    {"error": "could not persist threshold", "code": "persist_failed"}, status=500
+                )
+            # The guard identity and the live threshold were mirrored to every
+            # slot sharing the transcript INSIDE the locked worker above; the
+            # assignments below re-state them for this slot only for the
+            # no-persistence path's sake and are idempotent here.
+            # INVARIANT for this handler: every write is immediately preceded by an
+            # authorization decision with NO await between them. The persist await
+            # above is itself a rebind window (same mechanism as the body read), so
+            # re-decide again before the live mutations. The persisted metadata is
+            # keyed by the pre-await transcript key and is inert for a rebound slot:
+            # its restore path re-validates, and a denied caller gets the same 404.
+            stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+            if stale is not None:
+                return stale
+        slot.autocompact_pct = pct
+        # Apply live: the compaction gate reads the SessionManager override map,
+        # so the new threshold binds on the very next context reading.
+        state.sessions.set_autocompact_pct(effective_session_key(slot), pct)
+        logger.info("Slot %s autocompact_pct set to %r", name, pct)
+        # Keep the slot metadata flush in sync too (no-op for empty slots).
+        slot._dirty = True
+        return web.json_response(
+            {"ok": True, "pct": pct, "global_pct": published_autocompact_pct()}
+        )
+
+
 async def api_chat_slots_model(request: web.Request) -> web.Response:
     """POST /api/chat/slots/model — set the model for ALL chat slots (bulk).
 
@@ -5956,6 +6221,7 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
     # recognize a file recreated by another writer after a permanent delete
     # (the delete-won guard in ``_save_slot_to_history``).
     slot._disk_meta_created_at = str(meta.get("created_at") or "")
+    slot._disk_meta_observed = bool(meta)
     # On a member key the pin came from the BINDING at slot creation above and
     # metadata may not override it (same tamperable file the guard refused to
     # trust). On an ordinary key, mode="member" may not ride in either — the

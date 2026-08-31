@@ -333,6 +333,7 @@ def surface_channel_session(
     # append-created transcripts, so the observed on-disk value is the only
     # honest anchor (the slot's own construction time never matches it).
     slot._disk_meta_created_at = str(meta.get("created_at") or "")
+    slot._disk_meta_observed = bool(meta)
     if meta.get("model"):
         slot.model = meta["model"]
     if meta.get("workspace"):

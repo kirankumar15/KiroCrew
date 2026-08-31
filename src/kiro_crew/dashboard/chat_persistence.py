@@ -20,6 +20,8 @@ from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import agent_model_map
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     CHAT_ENTRY_CACHE_BYTES_DEFAULT,
     CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
     KiroCrewConfig,
@@ -217,6 +219,32 @@ def _validate_reasoning_effort(raw: object) -> str:
     if raw:
         logger.warning("Discarding invalid persisted reasoning_effort: %r", raw)
     return ""
+
+
+def _validate_autocompact_pct(raw: object) -> float | None:
+    """Return *raw* as a threshold percent within the documented range, else None.
+
+    Restore-path twin of the endpoint validation: a tampered or corrupted
+    metadata file must not seed an override that can never fire (over the max)
+    or that thrashes compaction (under the min). Out-of-range finite values
+    clamp — matching how the loader treats the global knob — while
+    non-numeric/NaN values are discarded.
+    """
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            value = float(raw)
+        except OverflowError:
+            # An int too large for a float; a corrupted metadata file must not
+            # abort the restore path.
+            logger.warning("Discarding oversized persisted autocompact_pct")
+            return None
+        if value != value:  # NaN
+            logger.warning("Discarding NaN persisted autocompact_pct")
+            return None
+        return min(max(value, AUTOCOMPACT_PCT_MIN), AUTOCOMPACT_PCT_MAX)
+    if raw is not None:
+        logger.warning("Discarding invalid persisted autocompact_pct: %r", raw)
+    return None
 
 
 def save_all_slots_to_history(state: DashboardState) -> None:
@@ -902,6 +930,7 @@ def _rehydrate_slot_from_history(
         # recognize a file recreated by another writer after a permanent
         # delete (delete-won guard).
         slot._disk_meta_created_at = str(meta.get("created_at") or "")
+        slot._disk_meta_observed = bool(meta)
         # Member keys keep the binding-derived agent/mode: transcript metadata
         # is the operator-editable file the pin must not re-derive from.
         if meta.get("agent") and _member_identity is None:
@@ -926,6 +955,8 @@ def _rehydrate_slot_from_history(
                 )
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+        if meta.get("autocompact_pct") is not None:
+            slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
             slot.workspace = meta["workspace"]
         if meta.get("project"):
@@ -985,6 +1016,13 @@ def _rehydrate_slot_from_history(
             # Skipped, the slot would answer from a dashboard-only session and the
             # channel thread would stop seeing its replies.
             slot.linked_session_key = str(meta["linked_session_key"])
+        # Re-seed the live compaction threshold. The SessionManager's override
+        # map is process-local, so a rehydrated slot must push its persisted
+        # value back or the session silently compacts at the global threshold.
+        # After the link assignment above, so a channel-born slot seeds the
+        # session its turns actually run on.
+        if slot.autocompact_pct is not None and state.sessions:
+            state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
         # Restore the persisted tab_id so cross-restart fork chaining survives.
         # get_or_create_slot (called by our caller) assigns a fresh random uuid to
         # slot._tab_id; if we don't overwrite it here, the next _flush_dirty_slots
@@ -1372,6 +1410,7 @@ def _apply_recent_session(
     # recognize a file recreated by another writer after a permanent delete
     # (delete-won guard).
     slot._disk_meta_created_at = str(meta.get("created_at") or "")
+    slot._disk_meta_observed = bool(meta)
     # Member keys keep the binding-derived agent/mode: transcript metadata is
     # the operator-editable file the pin must not re-derive from.
     if meta.get("agent") and _member_identity is None:
@@ -1393,6 +1432,8 @@ def _apply_recent_session(
             logger.debug("Failed to resolve model for restored slot %s", slot_name, exc_info=True)
     if meta.get("reasoning_effort"):
         slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+    if meta.get("autocompact_pct") is not None:
+        slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
     if meta.get("project"):
@@ -1458,6 +1499,9 @@ def _apply_recent_session(
         real_key = state.sessions.channel_key_for_stem(key)
         if real_key:
             slot.linked_session_key = real_key
+    # Re-seed the live compaction threshold (see _rehydrate_slot_from_history).
+    if slot.autocompact_pct is not None and state.sessions:
+        state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
     tab_id = meta.get("tab_id")
     if not tab_id:
         tab_id = uuid.uuid4().hex[:12]
@@ -2597,6 +2641,11 @@ def _save_slot_to_history(
                     "color_theme": slot.color_theme or "",
                     "memory_mode": slot.memory_mode,
                     "model": slot.model,
+                    # None means "follow the global threshold" and is the
+                    # cleared value (rehydrate reads it with ``is not None``),
+                    # so the override is CLEARABLE: written even when None,
+                    # like the other clearable fields above.
+                    "autocompact_pct": slot.autocompact_pct,
                 }
                 if slot.title and slot.title != slot.key:
                     fields["title"] = slot.title
@@ -2869,6 +2918,9 @@ def _save_slot_to_history(
             meta_line["model"] = slot.model
             if slot.reasoning_effort:
                 meta_line["reasoning_effort"] = slot.reasoning_effort
+            # Unconditional, matching the empty-window merge mirror: None is
+            # the cleared "follow the global" value, not an absent field.
+            meta_line["autocompact_pct"] = slot.autocompact_pct
             if slot.mode:
                 meta_line["mode"] = slot.mode
             if slot.workspace and slot.workspace != "default":
@@ -3116,6 +3168,7 @@ def _save_slot_to_history(
             # preserves every other field, so ``created_at`` — the only field
             # this identity depends on — survives a rotation unchanged.
             slot._disk_meta_created_at = str(meta_line.get("created_at") or "")
+            slot._disk_meta_observed = True
             # Enforce the session byte cap on THIS path too, against the FROZEN
             # PREFIX. ``_maybe_rotate`` used to have exactly one caller
             # (``ConversationLog.append``), so a transcript written only through
