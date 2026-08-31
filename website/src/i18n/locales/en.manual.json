@@ -1138,6 +1138,8 @@
       "constants": {
         "blocked_figma_app_missing_hint": "Open the file in Figma desktop and try again, or export the frames as PNGs and drop them here.",
         "blocked_figma_app_missing_say": "I can’t reach Figma — the desktop app isn’t running, or I don’t have the Figma tools available.",
+        "blocked_figma_export_needed_hint": "Export each frame as a PNG and drop them in as screenshots — I critique the pixels either way.",
+        "blocked_figma_export_needed_say": "I can’t pull frames straight from a Figma link here — I don’t run the Figma desktop tools.",
         "blocked_figma_file_closed_hint": "Open it in Figma desktop, then try again.",
         "blocked_figma_file_closed_say": "Figma is running, but that file isn’t open.",
         "blocked_figma_no_permission_auth_lead": "Figma access is per account, and I read whatever the desktop app has open — I have no login of my own. Here is how to fix it.",
@@ -1147,8 +1149,6 @@
         "blocked_figma_no_permission_auth_tail": "If access isn’t coming, exporting the frames as PNGs works just as well — I critique pixels either way.",
         "blocked_figma_no_permission_hint": "Ask for access, or export the frames as PNGs and drop them here.",
         "blocked_figma_no_permission_say": "Your Figma account can’t view that file.",
-        "blocked_no_access_auth_lead": "Git access is set up per machine, not per app — do it once and every private repo works, here and everywhere else. Run these in your terminal.",
-        "blocked_no_access_auth_tail": "Then come back and press Try again. I never ask for or store a token — anything pasted into this app would end up in a saved transcript.",
         "blocked_no_access_hint": "If you have it checked out, give me the folder path instead.",
         "blocked_no_access_say": "I couldn’t open that repo. It’s either private (and I have no credentials for it) or it doesn’t exist — GitHub returns the same error for both.",
         "blocked_not_found_hint": "Check the owner and name, or give me a local folder path.",
