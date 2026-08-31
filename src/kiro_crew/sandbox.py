@@ -108,6 +108,21 @@ _POLICY_CACHE_LEAF = "policy_cache"
 _VOICE_RUNTIME_LEAF = os.path.join("run", "voice-runtime")
 #: The data home the ``$HOME``-relative entries below assume.
 _CREW_HOME_DEFAULT = ".kiro/crew"
+#: The governance-keystone leaves (``security._CREW_SECRET_LEAVES``), spelled here so
+#: this module needs no import from ``security``. Pinned equal to that source-of-truth
+#: by ``test_governance_distribution`` so the launcher list and the security floor
+#: cannot drift. Used both as ``$HOME``-relative entries in the dir lists below and,
+#: joined with the RESOLVED data home, by ``_relocated_keystone_dirs`` so a relocated
+#: ``KIROCREW_HOME`` does not carry the ceiling out from under the launcher mask.
+_KEYSTONE_LEAVES: tuple[str, ...] = (
+    "security_policy.json",
+    "admission_policy.json",
+    "computer_use.json",
+    "denied_commands.json",
+    "profiles",
+    "sel_hmac.key",
+    "token_signing.key",
+)
 
 _STRICT_DIRS: list[str] = [
     ".kiro/crew-auth-staging",
@@ -139,6 +154,31 @@ _STRICT_DIRS: list[str] = [
     # loader trusts when deciding whether the cache is this host's last-known-good.
     ".kiro/crew/policy_cache",
     ".kirocrew/policy_cache",
+    # The governance keystone (``security._CREW_SECRET_LEAVES``). Bind-mount-hidden in
+    # every mode for the same reason as the vault and cache above: ``is_sensitive_path``
+    # is the shared read+write gate for the agent's in-process tool calls, but a spawned
+    # ``python -c`` does an OS ``open()`` that never routes through it — so the ceiling the
+    # agent must be unable to reach has to be hidden HERE too. These are the ceiling
+    # document (``security_policy.json``), the admission and denied-command opt-out
+    # ceilings, the computer-use enable, the per-surface ``profiles`` dir, and the
+    # SEL/token signing keys. Listed as explicit literals rather than sourced from
+    # ``sensitive_home_dirs()`` at runtime: the child classifies each entry with its own
+    # ``isdir``/``isfile`` (see the loop note below), so wiring the ~90-entry list in would
+    # only add a per-entry host stat on the event loop for every async spawn.
+    ".kiro/crew/security_policy.json",
+    ".kirocrew/security_policy.json",
+    ".kiro/crew/admission_policy.json",
+    ".kirocrew/admission_policy.json",
+    ".kiro/crew/computer_use.json",
+    ".kirocrew/computer_use.json",
+    ".kiro/crew/denied_commands.json",
+    ".kirocrew/denied_commands.json",
+    ".kiro/crew/profiles",
+    ".kirocrew/profiles",
+    ".kiro/crew/sel_hmac.key",
+    ".kirocrew/sel_hmac.key",
+    ".kiro/crew/token_signing.key",
+    ".kirocrew/token_signing.key",
     ".kiro/crew/run/voice-runtime",
     ".kirocrew/run/voice-runtime",
 ]
@@ -164,6 +204,25 @@ _STANDARD_DIRS: list[str] = [
     # loader trusts when deciding whether the cache is this host's last-known-good.
     ".kiro/crew/policy_cache",
     ".kirocrew/policy_cache",
+    # The governance keystone (``security._CREW_SECRET_LEAVES``) — hidden in every mode
+    # (see _STRICT_DIRS note above): a spawned ``python -c`` does an OS ``open()`` that
+    # never routes through the ``is_sensitive_path`` tool gate, so the ceiling documents,
+    # opt-out ceilings, computer-use enable, ``profiles`` dir and signing keys are
+    # bind-mount-hidden here too.
+    ".kiro/crew/security_policy.json",
+    ".kirocrew/security_policy.json",
+    ".kiro/crew/admission_policy.json",
+    ".kirocrew/admission_policy.json",
+    ".kiro/crew/computer_use.json",
+    ".kirocrew/computer_use.json",
+    ".kiro/crew/denied_commands.json",
+    ".kirocrew/denied_commands.json",
+    ".kiro/crew/profiles",
+    ".kirocrew/profiles",
+    ".kiro/crew/sel_hmac.key",
+    ".kirocrew/sel_hmac.key",
+    ".kiro/crew/token_signing.key",
+    ".kirocrew/token_signing.key",
     ".kiro/crew/run/voice-runtime",
     ".kirocrew/run/voice-runtime",
 ]
@@ -194,6 +253,25 @@ _CC_DIRS: list[str] = [
     # loader trusts when deciding whether the cache is this host's last-known-good.
     ".kiro/crew/policy_cache",
     ".kirocrew/policy_cache",
+    # The governance keystone (``security._CREW_SECRET_LEAVES``) — hidden in every mode
+    # (see _STRICT_DIRS note above): a spawned ``python -c`` does an OS ``open()`` that
+    # never routes through the ``is_sensitive_path`` tool gate, so the ceiling documents,
+    # opt-out ceilings, computer-use enable, ``profiles`` dir and signing keys are
+    # bind-mount-hidden here too.
+    ".kiro/crew/security_policy.json",
+    ".kirocrew/security_policy.json",
+    ".kiro/crew/admission_policy.json",
+    ".kirocrew/admission_policy.json",
+    ".kiro/crew/computer_use.json",
+    ".kirocrew/computer_use.json",
+    ".kiro/crew/denied_commands.json",
+    ".kirocrew/denied_commands.json",
+    ".kiro/crew/profiles",
+    ".kirocrew/profiles",
+    ".kiro/crew/sel_hmac.key",
+    ".kirocrew/sel_hmac.key",
+    ".kiro/crew/token_signing.key",
+    ".kirocrew/token_signing.key",
     ".kiro/crew/run/voice-runtime",
     ".kirocrew/run/voice-runtime",
 ]
@@ -236,6 +314,43 @@ def _relocated_policy_cache_dirs() -> list[str]:
         logger.debug("could not resolve the policy-cache path for sandbox masking", exc_info=True)
         return []
     return [] if resolved == default else [resolved]
+
+
+def _relocated_keystone_dirs() -> list[str]:
+    """The governance keystone's RESOLVED paths, when the data home is not under ``$HOME``.
+
+    Same shape and same reasoning as :func:`_relocated_policy_cache_dirs`, applied to the
+    seven ceiling leaves in ``_KEYSTONE_LEAVES``. The dir-list entries are ``$HOME``-relative
+    and joined with ``Path.home()``, so ``KIROCREW_HOME=/srv/crew`` moves the data home out
+    from under them and the launcher would stop masking ``security_policy.json`` and the
+    signing keys on a relocated home. The keystone must not inherit that limitation: the
+    argument the cache makes for itself holds at least as strongly here, since these ARE the
+    ceiling documents and the SEL/token signing keys, and ``security._sensitive_launch_targets``
+    already anchors the same leaves against the resolved home for the in-process gate — the
+    OS-sandbox mask has to match so the two mechanisms do not diverge on a relocated home.
+
+    Returns only the leaves whose resolved path differs from the ``$HOME``-relative form the
+    lists already cover, so the default layout gains no duplicate rule.
+
+    Uses ``os.path.normpath``, NOT ``realpath``, for the reason spelled out in
+    :func:`_relocated_policy_cache_dirs`: this runs on the event loop for every async spawn,
+    and a link-resolving syscall on a stalled NFS home would freeze the gateway. Never raises:
+    a data home that cannot be resolved yields nothing and the ``$HOME``-relative entries still
+    apply.
+    """
+    try:
+        base = str(config_dir())
+        home = str(Path.home())
+        out: list[str] = []
+        for leaf in _KEYSTONE_LEAVES:
+            resolved = os.path.normpath(os.path.join(base, leaf))
+            default = os.path.normpath(os.path.join(home, _CREW_HOME_DEFAULT, leaf))
+            if resolved != default:
+                out.append(resolved)
+        return out
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the keystone paths for sandbox masking", exc_info=True)
+        return []
 
 
 _voice_runtime_paths_lock = threading.Lock()
@@ -660,6 +775,20 @@ def _is_policy_cache_dir(path: str) -> bool:
     spawn path.
     """
     return os.path.basename(path.rstrip("/" + os.sep)) == _POLICY_CACHE_LEAF
+
+
+def _is_keystone_leaf(path: str) -> bool:
+    """Whether *path* is one of the governance-keystone leaves, by leaf name.
+
+    Matched on the leaf rather than a resolved path so it holds for every spelling the
+    dir lists carry — the ``$HOME``-relative default, the legacy ``~/.kirocrew`` entry,
+    and the relocated form from :func:`_relocated_keystone_dirs` — without a filesystem
+    call on the spawn path, mirroring :func:`_is_policy_cache_dir`. The leaf names
+    (``security_policy.json``, ``profiles``, the signing keys, …) are specific enough not
+    to collide with the credential dirs (``.aws``, ``.gnupg``, …) the seatbelt profile also
+    denies, so the macOS write deny keyed on this stays scoped to the keystone.
+    """
+    return os.path.basename(path.rstrip("/" + os.sep)) in _KEYSTONE_LEAVES
 
 
 def _is_voice_runtime_dir(path: str) -> bool:
@@ -2055,6 +2184,7 @@ def _build_launcher_script(
     hide_ssh = sandbox_level == "strict"
     hidden_dirs = [os.path.join(home, d) for d in dirs]
     hidden_dirs.extend(_relocated_policy_cache_dirs())
+    hidden_dirs.extend(_relocated_keystone_dirs())
     hidden_dirs.extend(_voice_runtime_sandbox_paths())
     hidden_dirs.extend(os.path.abspath(path) for path in extra_hidden_dirs)
     unhidden = [
@@ -2874,6 +3004,7 @@ def _build_seatbelt_profile(
     for target in (
         [os.path.join(home, d) for d in dirs]
         + _relocated_policy_cache_dirs()
+        + _relocated_keystone_dirs()
         + list(_voice_runtime_sandbox_paths())
     ):
         if _hidden_path_contains_visible_path(
@@ -2901,13 +3032,21 @@ def _build_seatbelt_profile(
             rules.append(f'(deny file-read* (require-all (subpath "{escaped}") {exceptions}))')
         else:
             rules.append(f'(deny file-read* (subpath "{escaped}"))')
-        if _is_policy_cache_dir(target) or _is_voice_runtime_dir(target):
+        if (
+            _is_policy_cache_dir(target)
+            or _is_voice_runtime_dir(target)
+            or _is_keystone_leaf(target)
+        ):
             # Linux bind-mounts these roots away, which blocks both directions.
             # macOS needs an explicit write deny as well as the read rule above:
             # governance metadata is a trust root, while a writable voice-runtime
-            # image would race the gateway's authenticated decoder spawn. Keep this
-            # scoped to the two execution/trust roots; widening it to every entry
-            # would break paths such as .aws that legitimately refresh state.
+            # image would race the gateway's authenticated decoder spawn, and the
+            # keystone leaves ARE the ceiling — rewriting ``security_policy.json`` or a
+            # signing key is a ceiling change, not mere disclosure, so the read deny is
+            # not enough on its own; the write direction is the more serious half and has
+            # to close on macOS too. Keep this scoped to the execution/trust roots and the
+            # keystone leaves; widening it to every entry would break paths such as .aws
+            # that legitimately refresh state.
             rules.append(f'(deny file-write* (subpath "{escaped}"))')
         # Deny creating a HARDLINK whose target is under this dir.
         # Seatbelt's file-read* deny is path-based, so a hardlink at a
