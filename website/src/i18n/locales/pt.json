@@ -6001,7 +6001,7 @@
       "pane_failed_to_load": "Falha ao carregar o painel",
       "retry": "Tentar novamente",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "O túnel parece conectado, mas o painel remoto nunca carregou. Ele pode estar\n                  reiniciando — tente novamente ou troque de aba acima.",
-      "this_tab_stays_until_you_disconnect_the_instance": "Esta aba permanece até você desconectar a instância em Configurações → Instâncias."
+      "this_tab_stays_until_you_disconnect_the_instance": "Esta aba permanece até você desconectar a instância em Configurações → Instâncias remotas."
     },
     "issuePanel": {
       "add_to_chat": "Adicionar ao chat",

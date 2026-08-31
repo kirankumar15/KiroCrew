@@ -4290,7 +4290,7 @@
       "loading_pane": "Loading pane…",
       "retry": "Retry",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "The tunnel looks connected but the remote dashboard never loaded. It may be\n                  restarting — retry, or switch tabs above.",
-      "this_tab_stays_until_you_disconnect_the_instance": "This tab stays until you disconnect the instance in Settings → Instances."
+      "this_tab_stays_until_you_disconnect_the_instance": "This tab stays until you disconnect the instance in Settings → Remote Instances."
     },
     "jobForm": {
       "a_short_label_for_this_job": "A short label for this job",

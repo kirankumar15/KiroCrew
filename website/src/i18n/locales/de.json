@@ -5903,7 +5903,7 @@
       "pane_failed_to_load": "Bereich konnte nicht geladen werden",
       "retry": "Wiederholen",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "Der Tunnel scheint verbunden zu sein, aber das Remote-Dashboard wurde nie geladen. Es startet möglicherweise\n                  neu — versuchen Sie es erneut oder wechseln Sie oben die Tabs.",
-      "this_tab_stays_until_you_disconnect_the_instance": "Dieser Tab bleibt, bis Sie die Instanz unter Einstellungen → Instanzen trennen."
+      "this_tab_stays_until_you_disconnect_the_instance": "Dieser Tab bleibt, bis Sie die Instanz unter Einstellungen → Remote-Instanzen trennen."
     },
     "issuePanel": {
       "add_to_chat": "Zum Chat hinzufügen",

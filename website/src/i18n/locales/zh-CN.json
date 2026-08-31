@@ -5805,7 +5805,7 @@
       "pane_failed_to_load": "窗格加载失败",
       "retry": "重试",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "隧道看起来已连接，但远程仪表板始终未加载。它可能正在\n                  重启 — 请重试，或切换上方的标签页。",
-      "this_tab_stays_until_you_disconnect_the_instance": "此标签页会一直保留，直到你在“设置 → 实例”中断开此实例。"
+      "this_tab_stays_until_you_disconnect_the_instance": "此标签页会一直保留，直到你在“设置 → 远程实例”中断开此实例。"
     },
     "issuePanel": {
       "add_to_chat": "添加到对话",

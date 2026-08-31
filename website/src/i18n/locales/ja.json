@@ -5805,7 +5805,7 @@
       "pane_failed_to_load": "ペインの読み込みに失敗",
       "retry": "再試行",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "トンネルは接続されているように見えますが、リモートダッシュボードは読み込まれません。再起動している可能性があります。\n                  再試行するか、上部のタブを切り替えてください。",
-      "this_tab_stays_until_you_disconnect_the_instance": "このタブは、設定 → インスタンスでインスタンスを切断するまで表示されたままです。"
+      "this_tab_stays_until_you_disconnect_the_instance": "このタブは、設定 → リモートインスタンスでインスタンスを切断するまで表示されたままです。"
     },
     "issuePanel": {
       "add_to_chat": "チャットに追加",

@@ -6001,7 +6001,7 @@
       "pane_failed_to_load": "Caricamento del pannello non riuscito",
       "retry": "Riprova",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "Il tunnel sembra connesso ma la dashboard remota non si è mai caricata. Potrebbe essere\n                  in fase di riavvio — riprova oppure cambia scheda qui sopra.",
-      "this_tab_stays_until_you_disconnect_the_instance": "Questa scheda resta finché non disconnetti l'istanza in Impostazioni → Istanze."
+      "this_tab_stays_until_you_disconnect_the_instance": "Questa scheda resta finché non disconnetti l'istanza in Impostazioni → Istanze remote."
     },
     "issuePanel": {
       "add_to_chat": "Aggiungi alla chat",
