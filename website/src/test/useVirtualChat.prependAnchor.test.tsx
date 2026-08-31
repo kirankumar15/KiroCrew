@@ -176,10 +176,10 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
 
   /** Mounts 30 rows, then scrolls up so stick is released and the window sits
    *  mid-transcript — the state a user reading history is in. */
-  function mountScrolledUp() {
+  function mountScrolledUp(initial: Item[] = mkItems(30)) {
     const scrollerRef: RefObject<HTMLDivElement | null> = { current: null }
     let scrollTop = 0
-    const view = rtlRender(<Harness items={mkItems(30)} scrollerRef={scrollerRef} />)
+    const view = rtlRender(<Harness items={initial} scrollerRef={scrollerRef} />)
     const el = scrollerRef.current!
     Object.defineProperty(el, 'scrollTop', {
       configurable: true, get: () => scrollTop, set: (v: number) => { scrollTop = v },
@@ -198,10 +198,10 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
    *  hold the old position. `scrollHeight` is derived from the live children
    *  here (not the fixed constant) so growing the transcript really does move
    *  the bottom, which is what the follow pin is asserted against. */
-  function mountAtBottom() {
+  function mountAtBottom(initial: Item[] = mkItems(30)) {
     const scrollerRef: RefObject<HTMLDivElement | null> = { current: null }
     let scrollTop = 0
-    const view = rtlRender(<Harness items={mkItems(30)} scrollerRef={scrollerRef} />)
+    const view = rtlRender(<Harness items={initial} scrollerRef={scrollerRef} />)
     const el = scrollerRef.current!
     Object.defineProperty(el, 'scrollTop', {
       configurable: true, get: () => scrollTop, set: (v: number) => { scrollTop = v },
@@ -405,4 +405,99 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
     expect(after).not.toBeNull()
     expect(Math.abs(after! - before!.top)).toBeLessThanOrEqual(1)
   })
+
+  // ---- Mid-list SPLICE: a transient "thinking" row mounting and unmounting
+  // between already-rendered output (issue #6076) ----
+  //
+  // Both directions grow/shrink the count while index 0 keeps its key, so
+  // neither is a prepend and neither is a tail append: every index from the
+  // splice point on MOVES. That is what separates them from TRIGGER 3 — the
+  // mounted DOM nodes still carry the previous commit's indices, so resolving
+  // them through the new `items` names the wrong row.
+
+  /** Index `key` currently occupies in `list`. */
+  function indexOf(list: Item[], key: string): number {
+    return list.findIndex((it) => it.id === key)
+  }
+
+  it('holds the reading position when a row is SPLICED IN above the reader', () => {
+    const base = mkItems(30)
+    const { el, view, scrollerRef } = mountScrolledUp(base)
+
+    const before = topVisible(el)
+    expect(before).not.toBeNull()
+    const at = indexOf(base, before!.key)
+    expect(at).toBeGreaterThan(0)
+
+    // A "thinking" placeholder appearing directly above the row being read.
+    const spliced = [...base.slice(0, at), { id: 'ghost' }, ...base.slice(at)]
+    act(() => { view.rerender(<Harness items={spliced} scrollerRef={scrollerRef} />) })
+
+    // Not vacuous: the ghost really did mount between the rendered rows.
+    expect(screenTopOf(el, 'ghost')).not.toBeNull()
+    const after = screenTopOf(el, before!.key)
+    expect(after).not.toBeNull()
+    expect(Math.abs(after! - before!.top)).toBeLessThanOrEqual(1)
+  })
+
+  it('holds the reading position when a row is REMOVED above the reader', () => {
+    const base = mkItems(30)
+    const { el, view, scrollerRef } = mountScrolledUp(base)
+
+    const before = topVisible(el)
+    expect(before).not.toBeNull()
+    const at = indexOf(base, before!.key)
+    expect(at).toBeGreaterThan(0)
+
+    // The same ghost row unmounting: content ABOVE the reader disappears, so
+    // the transcript is pulled UP under them — the symptom's other half, and
+    // the case no trigger covered.
+    const removed = base[at - 1].id
+    const pruned = base.filter((it) => it.id !== removed)
+    act(() => { view.rerender(<Harness items={pruned} scrollerRef={scrollerRef} />) })
+
+    // Not vacuous: the row above the reader is genuinely gone.
+    expect(screenTopOf(el, removed)).toBeNull()
+    const after = screenTopOf(el, before!.key)
+    expect(after).not.toBeNull()
+    expect(Math.abs(after! - before!.top)).toBeLessThanOrEqual(1)
+  })
+
+  it('still follows to the bottom when a row is SPLICED IN while PINNED', () => {
+    const base = mkItems(30)
+    const { el, view, scrollerRef, readScrollTop } = mountAtBottom(base)
+
+    const beforeTop = readScrollTop()
+    const spliced = [...base.slice(0, 10), { id: 'ghost' }, ...base.slice(10)]
+    act(() => { view.rerender(<Harness items={spliced} scrollerRef={scrollerRef} />) })
+    act(() => { frames.forEach((cb) => cb(0)); frames.length = 0 })
+
+    // Holding position here would be the regression: a pinned reader follows
+    // the output down, mid-list splice or not.
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
+    expect(readScrollTop()).toBe(el.scrollHeight - CLIENT)
+  })
+
+  it('keeps following after a row is REMOVED while PINNED', () => {
+    const base = mkItems(30)
+    const { el, view, scrollerRef } = mountAtBottom(base)
+
+    const pruned = base.filter((it) => it.id !== 'm10')
+    act(() => { view.rerender(<Harness items={pruned} scrollerRef={scrollerRef} />) })
+    act(() => { frames.forEach((cb) => cb(0)); frames.length = 0 })
+
+    // The removal must not steal stick: the next streamed message still lands
+    // at the bottom.
+    act(() => {
+      view.rerender(<Harness items={[...pruned, { id: 'z0' }]} scrollerRef={scrollerRef} />)
+    })
+    act(() => { frames.forEach((cb) => cb(0)); frames.length = 0 })
+
+    expect(el.scrollTop).toBe(el.scrollHeight - CLIENT)
+    const appended = screenTopOf(el, 'z0')
+    expect(appended).not.toBeNull()
+    expect(appended!).toBeGreaterThanOrEqual(0)
+    expect(appended!).toBeLessThan(CLIENT)
+  })
+
 })

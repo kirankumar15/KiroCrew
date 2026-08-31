@@ -469,7 +469,7 @@ export function useVirtualChat<T>(
   const heightAnchorPendingRef = useRef<{ key: string; top: number } | null>(null)
 
   /**
-   * ONE compensation routine, THREE triggers, ONE capture point.
+   * ONE compensation routine, FIVE triggers, ONE capture point.
    *
    *   TRIGGER 1 — prepend (load-older history): every index shifts up, so
    *     pre-existing rows move down by the inserted height.
@@ -482,8 +482,27 @@ export function useVirtualChat<T>(
    *     re-priced from the running MEAN of the measured ones — so the height
    *     credited above the reader changes anyway and the transcript slides
    *     (measured in the harness: a row at screen offset 0 landed at 500).
+   *   TRIGGER 4 — mid-list INSERT (a transient "thinking" row mounts between rows
+   *     that are already on screen): the count grows and index 0 keeps its key,
+   *     which reads exactly like TRIGGER 3, but every index from the splice point
+   *     on MOVES. Left on trigger 3's path it anchored on a MIS-KEYED row,
+   *     because that path resolves a mounted node's previous-commit index through
+   *     the NEW items.
+   *   TRIGGER 5 — mid-list REMOVE (that same row unmounts): the height above the
+   *     reader SHRINKS and the transcript is pulled up under them. No trigger
+   *     covered a shrink at all (issue #6076).
+   *   TRIGGER 6 — mid-list SWAP: the thinking row leaves and its replacement
+   *     arrives in ONE commit, which React batching makes the ordinary streaming
+   *     shape. The net count is unchanged, so a count-delta trigger reads it as a
+   *     no-op. It participates in the height RETIREMENT below but deliberately
+   *     captures NO anchor: the single consumer is invalidated by `windowRange`
+   *     and `itemCount`, and an equal-count swap moves neither, so an anchor
+   *     taken here would sit in the slot and be spent on an unrelated later
+   *     commit — the exact stranded-anchor hazard the render-phase capture
+   *     exists to remove. Compensating it needs a new invalidation key in that
+   *     consumer, which is its own change; tracked in #7234.
    *
-   * All three are "the height above the reader grew"; the correction is
+   * All five are "the height above the reader changed"; the correction is
    * identical, so they share this slot and the single consumer below. A parallel
    * path would fight this one for `scrollTop`, which is why append folds in here
    * rather than getting an anchor slot of its own.
@@ -518,6 +537,9 @@ export function useVirtualChat<T>(
    *  it shares a commit with part 1 and would otherwise consume a prepend anchor
    *  before the re-base kept its row mounted — see part 2. */
   const rebaseScheduledRef = useRef(false)
+  /** Keys of rows that LEFT the list in this render, handed to the height owner
+   *  once it exists (it is constructed further down) — see its drain site. */
+  const retiredKeysRef = useRef<string[] | null>(null)
   /** Previous render's identity. `items` is held because `itemsRef` has already
    *  advanced by the time the capture runs, while the mounted nodes still carry
    *  the PREVIOUS commit's indices. */
@@ -558,14 +580,115 @@ export function useVirtualChat<T>(
       anchorCapturedThisRender = true
     }
   }
-  // TRIGGER 3's predicate, read BEFORE the mirror below advances: the count grew
-  // while index 0 kept its key, which is a TAIL append (a front insert renames
-  // index 0 and is trigger 1's; a slot switch changes the session).
-  const tailAppended =
-    itemCount > prependPrev.count &&
-    prependPrev.session === sessionId &&
-    prependPrev.firstKey !== null &&
-    prependFirstKey === prependPrev.firstKey
+  // ---- Count-change classification, read BEFORE the mirror advances ----
+  //
+  // What the branches below need is which PRE-EXISTING INDICES moved, because the
+  // mounted nodes in `elIndexRef` carry the PREVIOUS commit's indices: a node's
+  // index still names its own row after a tail append, and names the WRONG row
+  // after any splice above it.
+  const sameSessionCount = prependPrev.session === sessionId && prependPrev.firstKey !== null
+  // A front insert renames index 0 (trigger 1's case) and a slot switch changes
+  // the session; both are excluded from everything below.
+  const frontKeyHeld = prependFirstKey === prependPrev.firstKey
+  // Did any PRE-EXISTING position change hands? That one question separates a
+  // tail append from a mid-list insert, and detects a same-count swap.
+  //
+  // Exact, not sampled. The cheap proxy this replaces read only the LAST
+  // pre-existing index, which a replacement anywhere ABOVE it satisfies while
+  // still stranding the replaced row's measurement -- so an artifact card
+  // refreshed in place, or a row replaced while another is appended, left a
+  // height in the mean that no live row justified.
+  //
+  // Cost is a scan, but not a re-keying one: the overwhelmingly common commit is
+  // a token append, which rebuilds the array while REUSING every element object
+  // except the streaming row's. Reference equality settles those rows without
+  // calling `getKey` at all, so the usual commit costs N pointer comparisons and
+  // zero allocation. A key is only computed for a position whose object actually
+  // changed, which is the only place a departure can hide.
+  const sharedCount = Math.min(prependPrev.count, itemCount)
+  let movedIndex = -1
+  for (let i = 0; i < sharedCount; i++) {
+    const prevItem = prependPrev.items[i]
+    const nextItem = items[i]
+    if (prevItem === nextItem) continue
+    if (prevItem === undefined || nextItem === undefined) { movedIndex = i; break }
+    if (getKey(prevItem, i) !== getKey(nextItem, i)) { movedIndex = i; break }
+  }
+  const anyIndexMoved = movedIndex >= 0
+  const grewInSession = itemCount > prependPrev.count && sameSessionCount && frontKeyHeld
+  /** TRIGGER 3 — the count grew and nothing pre-existing moved. */
+  const tailAppended = grewInSession && !anyIndexMoved
+  /** TRIGGER 4 — a row appeared above at least one row that is already mounted. */
+  const midListInserted = grewInSession && anyIndexMoved
+  /** TRIGGER 5 — a row LEFT the list. Head paging is excluded by `frontKeyHeld`
+   *  (trimming the head renames index 0), so the height retirement below never
+   *  drops a paged-out row's measurement out of the mean that prices the rows
+   *  the reader is about to page back into. */
+  const rowsRemoved = itemCount < prependPrev.count && sameSessionCount && frontKeyHeld
+  /** TRIGGER 6 — a row left and another arrived in ONE commit, so the count never
+   *  moved while a position changed hands. Keyed on the same scan as 3-vs-4, so
+   *  it catches an INTERIOR replacement and not merely one at the boundary, while
+   *  the ordinary commit (a token append: same count, same keys) still does no
+   *  work here. */
+  const rowsSwapped =
+    itemCount === prependPrev.count && sameSessionCount && frontKeyHeld && anyIndexMoved
+
+  // TRIGGERS 4, 5 and 6 — a mid-list splice, any direction. All three RETIRE the
+  // heights of the rows that left; the two that move the count also capture the
+  // anchor, through the one capture point and the one consumer: both are "a row
+  // came or went above the reader", and the correction part 2 already performs
+  // does not care which direction. Placed BEFORE trigger 2 so that in a render
+  // which does both, the splice's key mapping wins over the window branch's
+  // live-items mapping — the whole point being that live-items mapping is what is
+  // wrong here.
+  //
+  // Staged 'ready' (correct only, never a re-base): a transient row moves the
+  // anchor by one index, so it stays inside the mounted window and is
+  // measurable. A splice wide enough to unmount it leaves `rowTopFrom` unable to
+  // resolve the row and part 2 stands down — the pre-existing behaviour for an
+  // unmeasurable anchor, not a new failure mode.
+  if (midListInserted || rowsRemoved || rowsSwapped) {
+    const survivingKeys = new Set<string>()
+    for (let i = 0; i < items.length; i++) survivingKeys.add(getKey(items[i], i))
+    // The swap is excluded HERE, not from the branch: part 2 is invalidated by
+    // `windowRange` and `itemCount`, so on an equal-count commit it does not run
+    // and the anchor would be stranded in the slot for an unrelated later commit
+    // to spend. Retirement below has no such dependency. See #7234.
+    if ((midListInserted || rowsRemoved) && !anchorCapturedThisRender && !stickRef.current) {
+      const spliceEl = scrollerRef.current
+      const spliceAnchor = spliceEl
+        ? captureTopAnchorFrom(spliceEl, elIndexRef.current.entries(), (idx) => {
+            // PREVIOUS items at the node's PREVIOUS index, filtered to rows that
+            // survive this commit — trigger 1's resolution, for the same reason:
+            // it is the only mapping that names the row the node actually shows.
+            const it = prependPrev.items[idx]
+            if (!it) return null
+            const k = getKey(it, idx)
+            return survivingKeys.has(k) ? k : null
+          })
+        : null
+      if (spliceAnchor) {
+        shiftAnchorRef.current = spliceAnchor
+        shiftStageRef.current = 'ready'
+        anchorCapturedThisRender = true
+      }
+    }
+    // Keyed on KEY DEPARTURE, not on the net count falling: the harm is a
+    // measurement outliving its row, and a commit that drops the thinking row
+    // while adding output nets to growth or to zero with the ghost's height still
+    // pricing the transcript. `survivingKeys` is already built above for the
+    // anchor, so the general detector costs one pass over the previous items and
+    // no extra allocation. Independent of stick: a departed row's measurement is
+    // wrong for a pinned reader too. Drained by the height owner further down.
+    const departed: string[] = []
+    for (let i = 0; i < prependPrev.items.length; i++) {
+      const it = prependPrev.items[i]
+      if (!it) continue
+      const k = getKey(it, i)
+      if (!survivingKeys.has(k)) departed.push(k)
+    }
+    if (departed.length > 0) retiredKeysRef.current = departed
+  }
   prependPrevRef.current = { session: sessionId, count: itemCount, firstKey: prependFirstKey, items }
 
   // Window range for what is currently mounted. Initial state is the TAIL of
@@ -782,6 +905,36 @@ export function useVirtualChat<T>(
     heightIndexRef.current.setEstimate(estimatedHeight)
   }
   const heightIndex = heightIndexRef.current
+
+  // A transient row is MEASURED while it is mounted, and `getHeight` prices every
+  // UNMEASURED row from the running MEAN of the measured ones — so a measurement
+  // is never local to its own row. When the row then leaves the list its height
+  // stays in the cache and goes on pricing the transcript, holding the height
+  // credited above the reader at a value no live row justifies; a "thinking"
+  // placeholder is a fraction of a real message tall, so everything above the
+  // reader stays under-priced until the entry is evicted — and past a reload,
+  // once the blob is persisted. Compensating the commit cannot reach that: the
+  // reprice recurs on every later sync. Retire it instead, HERE — after the owner
+  // exists — so the reprice lands in the SAME commit whose shift the splice
+  // capture above already compensates. Retiring KEEPS the measurement itself (see
+  // HeightCache.retire), which is what makes an optimistic removal the server
+  // later refuses restorable rather than re-priced: regenerate and edit-resend
+  // both snapshot, truncate, and replace the snapshot back on refusal.
+  //
+  // The tree is re-synced HERE rather than left to the `offsetIndex` memo below,
+  // because that memo is keyed on `itemCount` and an equal-count SWAP moves none
+  // of its dependencies: the memo body would not run, and the spacers this render
+  // reads would keep prices the retirement just invalidated. A render-phase
+  // `sync` is the same call the memo makes, at the same phase, so the geometry
+  // read further down sees the corrected tree in this commit. On a commit that
+  // DOES change the count the memo syncs too, which is idempotent -- a second
+  // walk over the same heights.
+  const retiredKeys = retiredKeysRef.current
+  if (retiredKeys) {
+    retiredKeysRef.current = null
+    heightIndex.retire(retiredKeys)
+    heightIndex.sync(itemCount)
+  }
 
   // ---- Height lookup ----
   // Kept as a stable getter because the O(N) free functions still take one.
