@@ -6605,6 +6605,7 @@
       "cancel": "Cancelar",
       "do_not_publish_anything": "Não publique nada que você não colocaria na internet aberta.",
       "exposure_window_persistent": "Este link continuará público até você recolher ou destruir a implantação.",
+      "exposure_window_persistent_withdrawable": "Este link continuará público até você torná-lo privado ou cancelar a publicação.",
       "exposure_window_ttl_many": "Este link ficará público por {{count}} horas e depois será excluído automaticamente.",
       "exposure_window_ttl_one": "Este link ficará público por {{count}} hora e depois será excluído automaticamente.",
       "exposure_window_ttl_other": "Este link ficará público por {{count}} horas e depois será excluído automaticamente.",

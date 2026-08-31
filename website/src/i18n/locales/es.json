@@ -6605,6 +6605,7 @@
       "cancel": "Cancelar",
       "do_not_publish_anything": "No publiques nada que no pondrías en la internet abierta.",
       "exposure_window_persistent": "Este enlace seguirá siendo público hasta que retires o destruyas el despliegue.",
+      "exposure_window_persistent_withdrawable": "Este enlace seguirá siendo público hasta que lo hagas privado o anules su publicación.",
       "exposure_window_ttl_many": "Este enlace será público durante {{count}} horas y luego se eliminará automáticamente.",
       "exposure_window_ttl_one": "Este enlace será público durante {{count}} hora y luego se eliminará automáticamente.",
       "exposure_window_ttl_other": "Este enlace será público durante {{count}} horas y luego se eliminará automáticamente.",

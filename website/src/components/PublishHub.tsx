@@ -15,7 +15,7 @@ import { api, type AppPublishProvider } from '../api/client'
 import { Card, Btn } from './ui'
 import PublicPublishAckModal from './PublicPublishAckModal'
 import SimpleSelect from './SimpleSelect'
-import type { Artifact } from '../types'
+import type { Artifact, PublishProviderDescriptor } from '../types'
 import { safeHttpUrl } from '../lib/safeUrl'
 
 import { i18nT } from '../i18n/t'
@@ -26,6 +26,14 @@ interface UnifiedProvider {
   configured: boolean
   setupRoute: string
   app?: AppPublishProvider
+  /** Set for a row from the CORE registry (GET /api/artifacts/publish-providers).
+   *  Its presence is what routes a publish at the artifact endpoint instead of the
+   *  app row's declared endpoint -- see `requestPreview`. */
+  core?: PublishProviderDescriptor
+  /** The provider's own remedy text, rendered in place when `configured` is false.
+   *  Only a provider knows WHICH action makes it available, so a core row explains
+   *  itself here rather than sending the user to a generic setup page. */
+  installHint?: string
 }
 
 const ICONS: Record<string, typeof Globe> = { Globe, Upload, Settings, ExternalLink }
@@ -77,6 +85,7 @@ export function readPublishOutcome(
 export function buildProviderList(
   appProviders: AppPublishProvider[],
   kind: string,
+  coreProviders: PublishProviderDescriptor[] = [],
 ): UnifiedProvider[] {
   const list: UnifiedProvider[] = []
   for (const p of appProviders) {
@@ -88,6 +97,29 @@ export function buildProviderList(
       configured: p.configured,
       setupRoute: p.setupRoute,
       app: p,
+    })
+  }
+  // Core-registry rows come SECOND, and an id already claimed by an app row is
+  // skipped. An enabled app may declare a row under a core destination's id, and
+  // the pre-existing resolution for that clash is app-first (test_publish_providers
+  // asserts the APP's endpoint wins). Ordering the merge this way keeps that
+  // behaviour rather than quietly reversing it.
+  const claimed = new Set(list.map(p => p.id))
+  for (const c of coreProviders) {
+    if (!c.capable || claimed.has(c.name)) continue
+    list.push({
+      id: c.name,
+      label: c.display_name,
+      icon: Globe,
+      // `available` is the core registry's word for the same thing `configured` means
+      // to an app row: usable right now, without the user going and setting something
+      // up first. Missing means available -- the field is documented as omitted by
+      // older gateways, so treating absence as "needs setup" would mark every
+      // destination on such a gateway unusable.
+      configured: c.available !== false,
+      setupRoute: '',
+      core: c,
+      installHint: c.install_hint,
     })
   }
   return list
@@ -107,7 +139,17 @@ export function PublishHub({
     staleTime: 30_000,
   })
   const appProviders = providersQuery.data?.providers ?? []
-  const unified = buildProviderList(appProviders, artifact.kind)
+  // The core registry is a SECOND source and the panel has to read both. The app
+  // endpoint deliberately omits built-in destinations ("registered frontend-side and
+  // are not returned here"), so a provider registered by the edition -- which is how
+  // a stock build gets any publish destination at all -- appears nowhere without this.
+  const coreQuery = useQuery({
+    queryKey: ['artifact-publish-providers', artifact.kind],
+    queryFn: () => api.getArtifactPublishProviders(artifact.kind),
+    staleTime: 30_000,
+  })
+  const coreProviders = coreQuery.data?.providers ?? []
+  const unified = buildProviderList(appProviders, artifact.kind, coreProviders)
 
   const [selectedId, setSelectedId] = useState<string>('')
   const [preview, setPreview] = useState<Record<string, unknown> | null>(null)
@@ -141,6 +183,16 @@ export function PublishHub({
     setScanBlocked(null)
     setPreview(null)
     try {
+      if (selected.core) {
+        // A core row does NOT publish here. PublicPublishAckModal is the blocking
+        // acknowledgment in front of every action that creates a publicly accessible
+        // website (#3599), and it is reached from the confirm step -- so posting on this
+        // first click would make content world-readable with no consent shown at all.
+        // The backend has no preview to return for this path, so the confirm step is
+        // entered locally: consent is about what is ABOUT to happen, not about a digest.
+        setPreview({ requires_confirm: true, core: true })
+        return
+      }
       const resp = await api.publishToProvider(artifact.slug, selected.id, selected.app, selectedTtlHours())
       const outcome = readPublishOutcome(resp)
       if (resp?.requires_confirm) {
@@ -192,6 +244,22 @@ export function PublishHub({
     publishInFlight.current = true
     setBusy(true)
     try {
+      if (selected.core) {
+        // Reached only from the acknowledgment, same as the app path. A core row MUST NOT
+        // go through the deploy endpoint below: with no app endpoint that path falls back
+        // to `/api/deploy/deploy`, the per-artifact deploy machinery this destination
+        // exists to replace.
+        const resp = await api.publishArtifactToCoreProvider(artifact.slug, selected.id)
+        const outcome = readPublishOutcome(resp)
+        if (!outcome) {
+          // Same condition, same wording as the app path below: the response carried
+          // neither a link nor a publication.
+          setResult({ error: typeof resp?.error === 'string' ? resp.error : i18nT('components.publishHub.unexpected_response') })
+        } else {
+          setResult('error' in outcome ? { error: outcome.error } : { url: outcome.url })
+        }
+        return
+      }
       const endpoint = selected.app?.endpoint || '/api/deploy/deploy'
       const payload: Record<string, unknown> = {
         site_id: artifact.slug,
@@ -272,10 +340,15 @@ export function PublishHub({
                 type="button"
                 className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md border border-border hover:border-accent/40 hover:bg-accent-subtle transition-all text-left cursor-pointer"
                 onClick={() => {
-                  if (!p.configured) {
-                    navigate(p.setupRoute || '/deploy')
-                  } else {
+                  if (p.configured) {
                     setSelectedId(p.id)
+                  } else if (p.core) {
+                    // Select it rather than navigating. A core destination's setup is
+                    // described by its OWN hint, shown below; sending the user to the
+                    // deploy setup page would explain a different destination's flow.
+                    setSelectedId(p.id)
+                  } else {
+                    navigate(p.setupRoute || '/deploy')
                   }
                 }}
               >
@@ -285,6 +358,11 @@ export function PublishHub({
                   {!p.configured && (
                     <div className="text-[11px] text-warn flex items-center gap-1">
                       <Settings size={10} /> {i18nT('components.publishHub.setup_required')}
+                    </div>
+                  )}
+                  {!p.configured && p.installHint && (
+                    <div className="mt-1.5 text-[11px] leading-relaxed text-muted whitespace-pre-line">
+                      {p.installHint}
                     </div>
                   )}
                 </div>
@@ -364,6 +442,11 @@ export function PublishHub({
             {i18nT('components.publishHub.publish')} <span className="font-mono font-semibold text-text">{artifact.slug}</span> {i18nT('components.publishHub.via')}{' '}
             <span className="font-semibold text-text">{selected.label}</span>?
           </div>
+          {/* A core destination declaring no expiration support gets no TTL control at all.
+              Offering it would be a lie: the core publish route carries no TTL, so choosing
+              "72 hours" would hand back a persistent public link while the user believed the
+              exposure was time-boxed. */}
+          {!(selected.core && !selected.core.sharing_model.supports_expiration) && (
           <div>
             <label className="text-[11px] text-muted block mb-1">{i18nT('components.publishHub.ttl_time_to_live')}</label>
             <SimpleSelect
@@ -373,6 +456,7 @@ export function PublishHub({
               aria-label={i18nT('components.publishHub.ttl_time_to_live')}
             />
           </div>
+          )}
           <div className="flex gap-2">
             <Btn primary onClick={requestPreview} disabled={busy}>
               {busy ? i18nT('components.publishHub.checking') : <><Upload size={12} /> {i18nT('components.publishHub.publish')}</>}
@@ -409,6 +493,14 @@ export function PublishHub({
         open={!!ack}
         target={artifact.slug}
         ttlHours={selectedTtlHours()}
+        // The default sentence names `recall` and `destroy` -- the deploy surface's
+        // actions. A core destination has neither, so it would be telling the user their
+        // way out is something that does not exist. Say what actually ends the exposure.
+        persistentExposureNote={
+          selected?.core
+            ? i18nT('components.publicPublishAckModal.exposure_window_persistent_withdrawable')
+            : undefined
+        }
         busy={busy}
         onCancel={() => setAck(null)}
         onConfirm={() => {

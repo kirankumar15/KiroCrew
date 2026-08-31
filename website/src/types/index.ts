@@ -1150,6 +1150,10 @@ export interface PublishProviderDescriptor {
   /** False => tooling not installed yet; installs automatically on first publish.
    *  Optional: older gateways omit it (treat as available). */
   available?: boolean
+  /** The provider's own remedy text for `available: false` -- which action makes it
+   *  available. Optional: older gateways omit it, and a row with no hint simply shows
+   *  none rather than inventing one. */
+  install_hint?: string
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean

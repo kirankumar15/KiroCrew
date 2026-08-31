@@ -6505,6 +6505,7 @@
       "cancel": "Abbrechen",
       "do_not_publish_anything": "Veröffentliche nichts, was du nicht ins offene Internet stellen würdest.",
       "exposure_window_persistent": "Dieser Link bleibt öffentlich, bis du das Deployment zurückziehst oder löschst.",
+      "exposure_window_persistent_withdrawable": "Dieser Link bleibt öffentlich, bis du ihn auf privat stellst oder die Veröffentlichung zurückziehst.",
       "exposure_window_ttl_one": "Dieser Link bleibt {{count}} Stunde öffentlich und wird dann automatisch gelöscht.",
       "exposure_window_ttl_other": "Dieser Link bleibt {{count}} Stunden öffentlich und wird dann automatisch gelöscht.",
       "publishing": "Veröffentlichen…",

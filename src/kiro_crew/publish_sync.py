@@ -477,7 +477,7 @@ async def publish(
         version_map={str(art.version): res.version_number},
         published_at=_now_iso(),
         published_by=res.owner,
-        last_error="",
+        last_error=res.notice,
     )
     if pub.collab_mode == "live":
         # Establish the drift baseline from the read-back remote body (a live CRDT provider
@@ -614,6 +614,35 @@ async def push_version_by_slug(slug: str, *, force: bool = False) -> None:
         await push_version(art, force=force)
 
 
+def _sharing_fields(
+    art: Artifact, provider: PublishProvider, visibility: str, shared_with: list[str]
+) -> dict[str, object]:
+    """The publication patch for a visibility change, including a late-derived link.
+
+    A destination whose link is DERIVED rather than returned can only produce a usable
+    one once the artifact is publicly served, so publishing privately stores no url --
+    correct at the time, since a link into the served prefix would 404 while the object
+    sits in the unserved one. Nothing else ever revisits the field, so without this a
+    later flip to public leaves the artifact public with NO link at all, and no way to
+    obtain one short of re-publishing it.
+
+    Additive only: the url is filled when it is missing, never replaced and never
+    cleared. A destination that returned its own url at publish time keeps exactly that
+    url, so this cannot corrupt a link it did not create.
+    """
+    fields: dict[str, object] = {
+        "visibility": visibility,
+        "shared_with": shared_with,
+        "last_error": "",
+    }
+    pub = art.publication
+    if pub is not None and not pub.view_url and (visibility or "").strip().lower() == "public":
+        derived = provider.view_url_for(pub.artifact_id)
+        if derived:
+            fields["view_url"] = derived
+    return fields
+
+
 async def update_sharing(
     slug: str, *, visibility: str, shared_with: list[str] | None = None
 ) -> dict[str, object]:
@@ -634,7 +663,7 @@ async def update_sharing(
     )
     updated = await asyncio.to_thread(
         lambda: store.update_publication(
-            slug, visibility=visibility, shared_with=shared_with, last_error=""
+            slug, **_sharing_fields(art, provider, visibility, shared_with)
         )
     )
     assert updated.publication is not None  # just set above
@@ -647,22 +676,42 @@ async def unshare(slug: str) -> dict[str, object]:
 
 
 async def unpublish(slug: str) -> None:
-    """Delete from the destination and clear the local publication block.
+    """Delete from the destination, then clear the local publication block.
 
-    Best-effort on the destination delete (logs on failure) but always clears
-    the local publication. Raises ``NotPublishedError`` only when the artifact
-    isn't published.
+    The destination delete is deliberately NOT best-effort. The publication block is
+    the only handle to content that may still be served, so clearing it after a failed
+    removal strands that content: nothing local records where it is, and no retry can
+    reach it. A failure therefore keeps the block and raises, leaving the withdrawal
+    retryable. Deleting the ARTIFACT is the other way out of a kept publication, and it
+    does attempt the destination withdrawal first (see ``delete_for_artifact``) -- but
+    best-effort there, because the local delete is the user's request and must not be held
+    hostage to a remote system. So a destination failure on that path leaves the copy where
+    it is with only a log line, which is why this path raises instead. Raises
+    ``NotPublishedError`` only when the artifact isn't published.
     """
     store = get_default_store()
     art = await asyncio.to_thread(store.get, slug)
     if art.publication is None:
         raise NotPublishedError(f"artifact {slug} is not published")
     provider = _resolve_provider(art.publication.provider)
-    if provider.available():
-        try:
-            await provider.unpublish(external_id=art.publication.artifact_id)
-        except Exception as exc:  # pragma: no cover — best-effort
-            logger.warning("unpublish: destination delete failed for %s: %s", slug, exc)
+    if not provider.available():
+        raise PublishUnavailableError(
+            "This artifact's destination is not reachable right now, so it is still "
+            "marked published: the copy out there may still be served, and discarding "
+            "the record here would leave nothing able to withdraw it. Restore access "
+            "to the destination and try again, or delete the artifact to drop the "
+            "record along with it."
+        )
+    try:
+        await provider.unpublish(external_id=art.publication.artifact_id)
+    except Exception as exc:
+        # The exception text is for the log, not the user: it carries provider and SDK
+        # internals, and this string is rendered verbatim in the dashboard.
+        logger.warning("unpublish: destination delete failed for %s: %s", slug, exc)
+        raise PublishError(
+            "The destination did not confirm the removal, so this artifact is still "
+            "marked published and the withdrawal can be retried."
+        ) from exc
     await asyncio.to_thread(store.clear_publication, slug)
     logger.info("artifact unpublished: slug=%s", slug)
 
@@ -762,20 +811,30 @@ async def refresh_publication(slug: str) -> Artifact:
 
 
 async def delete_for_artifact(art: Artifact) -> None:
-    """Best-effort destination delete before a local artifact delete.
+    """Best-effort destination delete for an artifact being deleted locally.
 
     Unlike ``unpublish`` this does NOT touch the local store (the artifact is
-    about to be deleted entirely) and never raises.
+    already gone, or about to be) and NEVER raises: the local delete is the
+    user's request and it has already succeeded, so nothing here may turn it
+    into an error. The whole body is inside the guard, including provider
+    resolution and the availability probe -- an unknown provider name and an
+    availability check that reaches the network can both raise, and a caller
+    that already committed the delete has no way to act on the exception.
     """
     if art.publication is None:
         return
-    provider = _resolve_provider(art.publication.provider)
-    if not provider.available():
-        return
     try:
+        provider = _resolve_provider(art.publication.provider)
+        if not provider.available():
+            return
         await provider.unpublish(external_id=art.publication.artifact_id)
-    except Exception as exc:  # pragma: no cover — best-effort
-        logger.warning("delete_for_artifact failed for %s: %s", art.slug, exc)
+    except Exception as exc:
+        logger.warning(
+            "delete_for_artifact: destination copy may remain for %s (provider=%s): %s",
+            art.slug,
+            art.publication.provider,
+            exc,
+        )
 
 
 # ── Bidirectional sync: pull + clone ─────────────────────────────────────────

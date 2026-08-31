@@ -2035,6 +2035,7 @@
       "cancel": "Cancel",
       "do_not_publish_anything": "Do not publish anything you would not put on the open internet.",
       "exposure_window_persistent": "This link stays public until you recall or destroy the deployment.",
+      "exposure_window_persistent_withdrawable": "This link stays public until you make it private or unpublish it.",
       "exposure_window_ttl_one": "This link stays public for {{count}} hour, then it is deleted automatically.",
       "exposure_window_ttl_other": "This link stays public for {{count}} hours, then it is deleted automatically.",
       "publishing": "Publishing…",

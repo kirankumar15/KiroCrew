@@ -6405,6 +6405,7 @@
       "cancel": "キャンセル",
       "do_not_publish_anything": "公開インターネットに置きたくないものは公開しないでください。",
       "exposure_window_persistent": "このリンクは、デプロイを取り下げるか削除するまで公開されたままになります。",
+      "exposure_window_persistent_withdrawable": "このリンクは、プライベートに変更するか公開を取り消すまで公開されたままになります。",
       "exposure_window_ttl_other": "このリンクは{{count}}時間公開され、その後自動的に削除されます。",
       "publishing": "公開中…",
       "title": "一般公開されるウェブサイトが作成されます"

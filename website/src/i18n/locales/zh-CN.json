@@ -6405,6 +6405,7 @@
       "cancel": "取消",
       "do_not_publish_anything": "不要发布任何你不愿放到公开互联网上的内容。",
       "exposure_window_persistent": "除非你撤回或销毁部署，此链接会一直公开。",
+      "exposure_window_persistent_withdrawable": "除非你将其设为私有或撤回发布，此链接会一直公开。",
       "exposure_window_ttl_other": "此链接会公开 {{count}} 小时，之后自动删除。",
       "publishing": "正在发布…",
       "title": "即将创建一个可公开访问的网站"

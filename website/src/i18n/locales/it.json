@@ -6605,6 +6605,7 @@
       "cancel": "Annulla",
       "do_not_publish_anything": "Non pubblicare nulla che non metteresti su internet aperto.",
       "exposure_window_persistent": "Questo link resterà pubblico finché non richiami o distruggi il deployment.",
+      "exposure_window_persistent_withdrawable": "Questo link resterà pubblico finché non lo rendi privato o ne annulli la pubblicazione.",
       "exposure_window_ttl_many": "Questo link resterà pubblico per {{count}} ore, poi verrà eliminato automaticamente.",
       "exposure_window_ttl_one": "Questo link resterà pubblico per {{count}} ora, poi verrà eliminato automaticamente.",
       "exposure_window_ttl_other": "Questo link resterà pubblico per {{count}} ore, poi verrà eliminato automaticamente.",
