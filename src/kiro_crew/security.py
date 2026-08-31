@@ -7182,6 +7182,14 @@ def is_sensitive_bash_command(command: str) -> str | None:
     if native_result:
         return native_result
 
+    # ── Pass 4: a traversal that DELIVERS a fenced match ──
+    # The passes above all judge a TOKEN. `find` factors the path across two
+    # arguments and produces it at runtime, so no token names it -- see the block
+    # comment on `_check_find_traversal_reaches_fence`.
+    find_result = _check_find_traversal_reaches_fence(command)
+    if find_result:
+        return find_result
+
     # IMDS access via any IP encoding (decimal, hex, octal, IPv6-mapped)
     imds_result = _check_imds_access(command)
     if imds_result:
@@ -7953,6 +7961,673 @@ def _path_candidates(token: str) -> list[str]:
             cand = stripped
         out.append(cand)
     return out
+
+
+#: ── ``find``: a traversal that DELIVERS a match names the path it produces ──
+#:
+#: Every other pass in this module asks one question of every token: does this
+#: token resolve to a fenced path? ``find`` defeats that question by
+#: CONSTRUCTION, because it factors the path in two -- the directory is one
+#: argument, the leaf another, and the path itself is computed at runtime and
+#: never appears in the command text at all::
+#:
+#:     find ~/.kiro/crew -name '.env' -exec cat {} +
+#:     find ~ -name credentials | xargs cat
+#:
+#: Re-joining the two halves is what makes the traversal visible again (#7034).
+#: Two bounds decide where that join is denied.
+#:
+#: **Delivery.** A ``find`` that only LISTS is left alone, which is what keeps the
+#: newly-denied set small: an ordinary ``find ~ -name '*.md'`` is untouched, and
+#: only a traversal that hands a match to a command is judged -- an action
+#: primary, a pipe, a redirect, or a substitution that captures its output. The
+#: inert primaries are an ALLOW-list and anything else denies, the
+#: same polarity ``_TRUST_ROOT_READ_LISTERS`` documents: enumerating the
+#: delivering primaries would fail OPEN, so a primary nobody thought of would be
+#: a silent bypass. Note that none of this needs to know the CHILD command --
+#: ``cat``, ``base64``, a script, ``xargs`` with any of its flag grammars -- because
+#: the gate denies NAMING a fenced path whatever is then done with it. That is
+#: why no executor list appears here, the direction this module's own comments
+#: call fragile.
+#:
+#: Delivery is read from the invocation's OWN token span, not from the command
+#: line. Reading the whole line denied a listing because an UNRELATED later
+#: command carried a pipe (``find ~/.kiro/crew -type f; cat notes | less``).
+#:
+#: **Cost.** A filter is agent-supplied text, and this gate is synchronous and
+#: in-process, so evaluating one is a denial-of-service surface before it is a
+#: correctness question -- CPython's ``re`` has no timeout, and the module already
+#: records a watchdog-crossing hang from admitting a run into a pattern. Two rules
+#: keep the work bounded, and both fail CLOSED by widening the traversal rather
+#: than dropping the filter:
+#:
+#: * a ``-regex``/``-iregex`` pattern is NEVER compiled and NEVER run. Screening for
+#:   catastrophic shapes was rejected: against a hostile author that enumeration
+#:   does not terminate, which is the argument this module already makes about
+#:   enumerating dangerous punctuation. The cost is an over-block on a rare flag.
+#: * a glob becomes a regex through `_glob_to_regex`, so it is bounded instead:
+#:   adjacent ``.*`` runs are collapsed, which is semantics-preserving, and what
+#:   remains is capped. ``-name '{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}b'``
+#:   compiled to fourteen adjacent ``.*`` and hung the gate outright -- measured as
+#:   still running after 12 seconds.
+#:
+#: The SUBJECTS are never agent input, which is what makes the cap sufficient: they
+#: are fence basenames and credential-store entry names, all short.
+#:
+#: **Certainty.** The join is denied where the FENCE supplies the missing half,
+#: and left alone where the traversal merely might wander into one:
+#:
+#: * the root is a fenced path, or a directory whose secrets live in its leaves
+#:   (``~/.kiro/crew``) -- the command names the credential directory outright and
+#:   the leaf is the runtime wildcard, which is exactly the ``~/.kiro/crew/$F``
+#:   shape `_sensitive_under_unresolved_var` already denies;
+#: * a name pattern matches the BASENAME of a fence entry lying under the root,
+#:   so the fence itself declares the name the traversal asks for (``-name .env``
+#:   under ``~``, and the unfiltered ``find ~/.kiro/crew -type f``, whose pattern
+#:   is effectively ``*``);
+#: * a filter matches a file that is REALLY THERE in a top-level credential store
+#:   under the root (``~/.aws/credentials``, ``~/.ssh/id_rsa``). Everything inside
+#:   those stores is fenced, so the traversal is resolving a path rather than
+#:   searching. Asking the STORE what it holds -- `_find_store_holds_match` -- is
+#:   what makes this an answer rather than a guess, and it treats every filter
+#:   spelling it EVALUATES alike: an earlier version tested only a LITERAL name,
+#:   which denied ``-name id_rsa`` while allowing ``-name 'id_*'`` for the identical
+#:   read (found in review). It is also the whole difference
+#:   between denying ``find ~ -name credentials -exec cat {} +`` and leaving
+#:   ``find ~ -type d -name __pycache__ -exec rm -rf {} +`` alone: no such file is
+#:   in a store, so the store says no. The gate already depends on the filesystem
+#:   this way (`_candidate_forms` resolves symlinks), and the answer is not
+#:   attacker-steerable -- moving or copying the file to change it is itself a
+#:   fenced write or a fenced read. A host with no such store has nothing there to
+#:   deliver, and gains the denial the day the store appears.
+#:
+#: What this cannot see is unchanged and known. Inside a traversal: a root or a
+#: pattern held in a variable, and a shell loop over a substitution. Outside it:
+#: any OTHER program that factors a root and a name the same way -- ``fd`` /
+#: ``fdfind`` (``-x`` / ``-X``), ``locate`` / ``plocate`` piped into a reader,
+#: ``rg --files``, ``du -a`` -- each of which needs its own grammar, and
+#: ``grep -r <dir>``, which needs no second command at all. This pass closes the
+#: deterministic ``find`` form, NOT the traversal class; it must not be read as the
+#: latter.
+_FIND_PROGRAM_NAMES: frozenset[str] = frozenset({"find", "gfind"})
+
+#: Options that precede the roots. A closed set on purpose: skipping EVERY
+#: leading ``-`` token would read ``find -name x`` as a traversal of ``x``.
+#: ``-O<level>`` is glued, ``-D`` takes the next token.
+_FIND_GLOBAL_OPTS: frozenset[str] = frozenset({"-H", "-L", "-P", "--"})
+
+#: Primaries that neither run a command nor write a file, so a traversal built
+#: only from these can do nothing with a match but print it. Everything else
+#: beginning with ``-`` is treated as delivery -- see the polarity note above.
+#: ``-newerXY`` is matched by prefix, since the suffix pairs are combinatorial.
+_FIND_INERT_PRIMARIES: frozenset[str] = frozenset(
+    {
+        # tests
+        "-name",
+        "-iname",
+        "-path",
+        "-ipath",
+        "-wholename",
+        "-iwholename",
+        "-lname",
+        "-ilname",
+        "-regex",
+        "-iregex",
+        "-type",
+        "-xtype",
+        "-size",
+        "-empty",
+        "-perm",
+        "-links",
+        "-inum",
+        "-samefile",
+        "-user",
+        "-uid",
+        "-group",
+        "-gid",
+        "-nouser",
+        "-nogroup",
+        "-fstype",
+        "-context",
+        "-readable",
+        "-writable",
+        "-executable",
+        "-true",
+        "-false",
+        "-mtime",
+        "-atime",
+        "-ctime",
+        "-mmin",
+        "-amin",
+        "-cmin",
+        "-used",
+        "-anewer",
+        "-cnewer",
+        # positional/global options that may appear among the primaries
+        "-maxdepth",
+        "-mindepth",
+        "-depth",
+        "-d",
+        "-mount",
+        "-xdev",
+        "-follow",
+        "-noleaf",
+        "-warn",
+        "-nowarn",
+        "-ignore_readdir_race",
+        "-noignore_readdir_race",
+        "-help",
+        "--help",
+        "-version",
+        "--version",
+        # operators
+        "-not",
+        "-a",
+        "-and",
+        "-o",
+        "-or",
+        # actions that only print or stop
+        "-print",
+        "-print0",
+        "-printf",
+        "-ls",
+        "-quit",
+        "-prune",
+    }
+)
+
+#: Filters whose pattern is matched against the whole path rather than the
+#: basename, and the two spellings whose pattern is a regex instead of a glob.
+_FIND_NAME_TESTS: frozenset[str] = frozenset({"-name", "-iname"})
+_FIND_PATH_TESTS: frozenset[str] = frozenset(
+    {"-path", "-ipath", "-wholename", "-iwholename", "-lname", "-ilname"}
+)
+_FIND_REGEX_TESTS: frozenset[str] = frozenset({"-regex", "-iregex"})
+
+#: The traversal's own output being CAPTURED rather than printed: a command
+#: substitution in either spelling, or a process substitution. Deliberately NOT a
+#: bare ``(`` -- a subshell still prints to the terminal -- and NOT a control
+#: operator, which says nothing about where the output goes. Scanning the whole
+#: command line for a pipe instead was a false positive: a listing was denied
+#: because an UNRELATED later command on the same line contained one.
+_FIND_CAPTURED_PROGRAM_RE = re.compile(r"\$\(|`|<\(")
+
+#: Glob metacharacters, for telling "resolve this exact name" from "search".
+_FIND_GLOB_META = frozenset("*?[")
+
+#: The characters a shell removes while tokenizing, so a program name spliced with
+#: them (``fi''nd``, ``f'i'nd``, ``fi\nd``, ``"find"``) still reads as itself. Used
+#: only by the bail-out below, never for path shaping.
+_QUOTE_ESCAPE_CHARS_RE = re.compile(r"""['"\\]""")
+
+
+#: Operators that must not arrive GLUED to a neighbouring word. ``shlex`` splits on
+#: whitespace only, so ``-name .env|xargs`` reaches the parser as ONE token and the
+#: pipe is consumed as pattern text -- delivery is never seen, and the command reads
+#: a fenced secret that its whitespace-separated twin denies (found in review). The
+#: same glue hides a redirect: ``-type f>/tmp/leak`` yields the token ``f>/tmp/leak``.
+#:
+#: ``<`` is deliberately ABSENT. Spacing it would split ``<(find …)`` into ``<`` and
+#: ``(find``, and `_FIND_CAPTURED_PROGRAM_RE` reads the ``<(`` off the program token
+#: to know the traversal's output is captured -- separating them loses that.
+_FIND_GLUED_OPERATORS = frozenset("|;&>")
+
+
+def _find_space_unquoted_operators(command: str) -> str:
+    """Surround unquoted, unescaped control/redirect operators with spaces.
+
+    Splitting the TOKENS instead was rejected for the reason `_split_glued_operators`
+    documents: ``shlex`` has already removed the quotes by then, so a quoted
+    ``-name 'a|b'`` is indistinguishable from a real pipe and would be split too.
+    Working on the RAW string keeps quote state, so a quoted operator is left alone
+    and only a real one becomes its own token.
+
+    A run is kept together (``>>``, ``&&``, ``2>&1``) so a two-character operator is
+    not split into two. A backslash escapes the next character exactly as a shell
+    reads it, which is what keeps ``-exec cat {} \\;`` intact.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                out.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(command[i + 1])
+            i += 2
+            continue
+        if ch in _FIND_GLUED_OPERATORS:
+            start = i
+            while i < n and command[i] in _FIND_GLUED_OPERATORS:
+                i += 1
+            out.append(" ")
+            out.append(command[start:i])
+            out.append(" ")
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _find_credential_store_dirs() -> list[str]:
+    """Every fence entry, as a real path, for "does this directory hold a match".
+
+    EVERY entry in :data:`_SENSITIVE_HOME_DIRS` fences its whole subtree -- that is
+    the ``startswith(target + os.sep)`` rule in `_path_in_home_dirs` -- so any name
+    found inside one is fenced whatever the name is. An earlier version kept only
+    SINGLE-segment entries, which silently dropped the nested whole-directory stores:
+    ``.config/gcloud`` was never probed, so ``find ~ -name credentials.db -exec cat
+    {} +`` read its credential database (found in review).
+
+    What must NOT be scanned is a crew leaf-PARENT such as ``~/.kiro/crew``, which
+    holds readable files (``config.json``, ``sessions.db``) beside its fenced leaves.
+    Those directories are not fence entries at all -- only their leaves are -- so
+    taking the list as-is excludes them by construction. That is the property the
+    single-segment filter was reaching for, and it gets it right.
+
+    Returned UN-casefolded, unlike ``_home_dir_targets``: the caller stats these
+    paths, and on a case-sensitive filesystem a casefolded home
+    (``/Users/Alice`` -> ``/users/alice``) does not exist.
+
+    Anchored on the real home only, so a crew home relocated by ``KIROCREW_HOME`` is
+    not scanned here. Nothing is lost: this clause exists for stores whose leaf names
+    the fence does NOT declare (``~/.aws/credentials``), and those are home-anchored
+    by nature, while every crew leaf is matched by NAME through the re-anchored
+    ``_home_dir_targets`` in the clause above.
+    """
+    home = os.path.expanduser("~")
+    return [os.path.join(home, entry) for entry in _SENSITIVE_HOME_DIRS]
+
+
+def _find_store_holds_match(store: str, literal_names: list[str]) -> str | None:
+    """Does *store* actually hold a file this traversal names outright?
+
+    Asking the STORE rather than reasoning about the pattern is what makes the clause
+    an answer: ``-name credentials`` under ``~`` reaches ``~/.aws/credentials`` and
+    ``-name credentials.db`` reaches ``~/.config/gcloud/credentials.db``, while
+    ``-name package.json`` reaches nothing and stays allowed. Testing only the fence
+    LIST could not do this -- neither leaf name is declared anywhere.
+
+    LITERAL names only, and deliberately so. An earlier version also matched a GLOB
+    against the store's real entries, which measured three false positives on an
+    ordinary developer home: ``~/.kirocrew/run`` holds transient sandbox ``*.py``
+    wrappers, ``~/.local/share/kiro-cli`` holds ``tui.js``, and four fenced
+    directories hold a ``*.json``. So ``find ~ -name '*.py' -exec grep -l foo {} +``
+    was refused on account of a temp file. The security that buys is marginal --
+    an attacker who knows the filename writes it literally, which IS denied -- so the
+    trade went the other way. A glob is still denied when it matches a name the fence
+    DECLARES (``*.key`` covers ``token_signing.key``); what it misses is an
+    undeclared store leaf reached by wildcard (``-name 'id_*'``), which is recorded
+    as a residual rather than paid for with that false positive.
+
+    Only fence entries are scanned, never a crew leaf-PARENT such as ``~/.kiro/crew``:
+    that directory holds readable files beside its fenced leaves, and it is not an
+    entry, so taking the list as-is excludes it by construction.
+    """
+    for name in literal_names:
+        probe = os.path.join(store, name)
+        if os.path.exists(probe):
+            return probe
+    return None
+
+
+def _find_pattern_operand(token: str) -> str:
+    """A filter's pattern, with a captured substitution's closing punctuation removed.
+
+    ``cat $(find ~ -regex '.*/id_rsa$')`` reaches ``shlex`` with the closing paren
+    glued to the pattern, so the token is ``.*/id_rsa$)``. Applied HERE, where the
+    pattern is read, rather than at the call site: the strip was originally written
+    per-list at the call site, ``-regex`` was the one list that did not get it, and
+    an uncompilable pattern then dropped its matcher and allowed a read that the
+    ``-name`` spelling of the same read denied (found in review). One place means no
+    family can be forgotten again.
+
+    Stripping only ever WIDENS what the pattern matches, so a genuine trailing
+    ``)`` or backtick in a filename costs a denial, never a permit.
+    """
+    return token.rstrip("`)")
+
+
+#: Ceiling on the "any run" wildcards a filter glob may carry before the pass stops
+#: building a matcher for it and treats it as opaque instead.
+#:
+#: `_glob_to_regex` maps ``*`` and a brace group to ``.*``, so an agent-supplied
+#: pattern becomes an agent-supplied REGEX that this synchronous gate then runs.
+#: ``-name '{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}b'`` compiles to fourteen
+#: adjacent ``.*`` and hangs the gate outright -- measured as still running after
+#: 12s, which is the watchdog-crossing hang `_separator_collapsed_variants`
+#: documents. Two bounds together, because either alone leaves the other open:
+#: adjacent ``.*`` runs are collapsed (``.*.*`` names exactly what ``.*`` names, so
+#: this is semantics-preserving), and what remains is capped. Eight is far above
+#: any real filename filter and keeps the work polynomial in a SHORT subject --
+#: the subjects here are fence basenames and store entry names, never agent input.
+_FIND_GLOB_WILDCARD_LIMIT = 8
+
+#: A generated ``.*`` run, for the collapse above. Matches the two-character
+#: sequence a wildcard produces; a LITERAL ``.`` or ``*`` in the glob arrives
+#: escaped (``\.``, ``\*``), so this cannot collapse a literal.
+_FIND_GENERATED_ANY_RUN_RE = re.compile(r"(?:\.\*)+")
+
+
+def _find_glob_matcher(pattern: str) -> "re.Pattern[str] | None":
+    """Compile a find ``-name``/``-path`` glob into a matcher, or None if it cannot.
+
+    Returning None makes the caller treat the filter as opaque, which WIDENS the
+    traversal rather than dropping it -- see `_find_traversal_reaches_fence`. That
+    is the fail-closed answer for a pattern this function refuses to run as well as
+    for one that will not compile.
+
+    Case-insensitive for every spelling, not just ``-iname``: the fence itself
+    casefolds both sides (see :func:`_path_in_home_dirs`), because on a
+    case-insensitive filesystem the two spellings open the same file.
+    """
+    generated = _FIND_GENERATED_ANY_RUN_RE.sub(".*", _glob_to_regex(pattern))
+    if generated.count(".*") > _FIND_GLOB_WILDCARD_LIMIT:
+        return None
+    try:
+        return re.compile(generated, re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def _find_literal_path_probe(pattern: str, root: str) -> str | None:
+    """Reduce a ``-path`` pattern to the path its non-wildcard segments name.
+
+    ``-path`` matches the whole path, so the pattern carries the fenced segments
+    itself. Dropping the segments that are wildcards leaves something the
+    ordinary path gate can answer: ``*/.aws/credentials`` reduces to
+    ``.aws/credentials``, which is fenced under the root, while
+    ``*/node_modules/*`` reduces to ``node_modules``, which is not.
+    """
+    normalized = pattern.replace("\\", "/")
+    literal = [seg for seg in normalized.split("/") if seg and not (_FIND_GLOB_META & set(seg))]
+    if not literal:
+        return None
+    joined = "/".join(literal)
+    if normalized.startswith("/"):
+        return "/" + joined
+    return os.path.join(root, joined)
+
+
+def _parse_find_invocation(
+    tokens: list[str], start: int
+) -> tuple[list[str], list[str], list[str], list[str], bool]:
+    """Read one ``find`` invocation starting at the token AFTER the program word.
+
+    Returns its roots, its ``-name``-family patterns, its ``-path``-family
+    patterns, its ``-regex``-family patterns, and whether it DELIVERS matches.
+    A traversal with no root operand walks the working directory, which is what
+    find itself does.
+    """
+    i = start
+    n = len(tokens)
+    # Global options first: a closed set, so an unrecognized flag ends the run
+    # rather than being skipped past the roots.
+    while i < n:
+        token = tokens[i]
+        if token in _FIND_GLOBAL_OPTS:
+            i += 1
+            continue
+        if token == "-D" and i + 1 < n:
+            i += 2
+            continue
+        if token.startswith("-O") and len(token) > 2 and token[2:].isdigit():
+            i += 1
+            continue
+        break
+    roots: list[str] = []
+    while i < n:
+        token = tokens[i]
+        if not token or token.startswith("-") or token in ("(", ")", "!", ","):
+            break
+        if _CONTROL_OPERATOR_RE.search(token):
+            break
+        roots.append(token)
+        i += 1
+    name_pats: list[str] = []
+    path_pats: list[str] = []
+    regex_pats: list[str] = []
+    delivers = False
+    while i < n:
+        token = tokens[i]
+        # A filter's PATTERN is consumed with its flag, before any operator test
+        # below can look at it -- so a quoted `-name 'a|b'` cannot be mistaken for
+        # a pipe.
+        if token in _FIND_NAME_TESTS and i + 1 < n:
+            name_pats.append(_find_pattern_operand(tokens[i + 1]))
+            i += 2
+            continue
+        if token in _FIND_PATH_TESTS and i + 1 < n:
+            path_pats.append(_find_pattern_operand(tokens[i + 1]))
+            i += 2
+            continue
+        if token in _FIND_REGEX_TESTS and i + 1 < n:
+            regex_pats.append(_find_pattern_operand(tokens[i + 1]))
+            i += 2
+            continue
+        # END of this invocation. `shlex` splits on whitespace only, so an operator
+        # glued to its neighbour (`-type f|xargs`) arrives inside a token -- which is
+        # also why the span, not the whole command line, is what decides delivery. A
+        # `|` among the operators IS a delivery: the matches flow into the next
+        # stage. `;`, `&&` and `&` are not -- they only sequence, and reading them as
+        # delivery denied a listing because an UNRELATED later command in the same
+        # line happened to contain a pipe (found in review).
+        if _CONTROL_OPERATOR_RE.search(token):
+            if "|" in token:
+                delivers = True
+            break
+        # A redirect writes the listing to a file, the same disclosure as `-fprint`.
+        if _OUTPUT_REDIRECT_RE.match(token):
+            delivers = True
+            i += 1
+            continue
+        if token.startswith("-"):
+            if not (token in _FIND_INERT_PRIMARIES or token.startswith("-newer")):
+                delivers = True
+        i += 1
+    return roots, name_pats, path_pats, regex_pats, delivers
+
+
+def _find_root_readings(roots: list[str]) -> list[str]:
+    """Every reading of the traversal roots, including the unresolved-home readings.
+
+    A root carrying an expansion this command never assigned cannot be resolved from
+    the text. Rather than deny every such traversal -- ``find $BUILD -name '*.o'
+    -delete`` is ordinary -- two fail-closed readings are ADDED alongside the literal
+    one and the FILTER is left to decide: the literal tail joined onto a home anchor
+    (`_unresolved_home_hypothesis`), and the home directory itself. So
+    ``find $D -name .env -exec cat {} +`` is denied on the fence-declared name, while
+    a build glob under the same unknown root is not.
+
+    Additive only, so a reading that turns out to be wrong can produce a denial but
+    never withdraw one.
+    """
+    out = list(roots)
+    for root in roots:
+        if _mark_unresolved(root) == root:
+            continue
+        # The literal tail joined onto a home anchor, which is what catches
+        # `cd "$(printf %s ~)/.kiro/crew"`-shaped roots.
+        hypothesis = _unresolved_home_hypothesis(root)
+        if hypothesis is not None:
+            expanded = os.path.expanduser(hypothesis)
+            if expanded not in out:
+                out.append(expanded)
+        # And the home directory ITSELF, because an unknowable root could simply BE
+        # it. Without this, `find ${D}/crew -name token_signing.key | xargs cat`
+        # resolved to `~/crew`, which holds no fence, and the keystone read went
+        # through. The filter still decides, so an ordinary build search under an
+        # unknown root is not denied by this reading alone.
+        home = os.path.expanduser("~")
+        if home not in out:
+            out.append(home)
+    return out
+
+
+def _find_traversal_reaches_fence(
+    roots: list[str],
+    name_pats: list[str],
+    path_pats: list[str],
+    regex_pats: list[str],
+) -> str | None:
+    """Does a traversal of *roots* filtered by these patterns name a fenced path?
+
+    Returns the fenced path (or the fenced directory) it names, or None. See the
+    block comment above for why each of the three answers counts as the fence
+    supplying the missing half of the join, rather than as a guess about where
+    the traversal might wander.
+    """
+    targets = _home_dir_targets(_SENSITIVE_HOME_DIRS)
+    stores = _find_credential_store_dirs()
+    # A pattern that will not compile must WIDEN, not vanish. Collecting the
+    # matchers with a filter dropped the uncompilable ones, and because
+    # `unfiltered` was computed from the raw pattern lists the clause then had
+    # neither a matcher nor the no-filter reading -- so `-regex '('` and every
+    # other malformed pattern silently allowed the traversal (found in review).
+    # Treating it as opaque is the module's documented stance: a *maybe* answers
+    # yes, since the gate may over-trigger but must never under-trigger.
+    name_matchers: "list[re.Pattern[str]]" = []
+    path_matchers: "list[re.Pattern[str]]" = []
+    opaque = False
+    all_pats = name_pats + path_pats + regex_pats
+    for pattern in name_pats:
+        matcher = _find_glob_matcher(pattern)
+        if matcher is None:
+            opaque = True
+        else:
+            name_matchers.append(matcher)
+    for pattern in path_pats:
+        matcher = _find_glob_matcher(pattern)
+        if matcher is None:
+            opaque = True
+        else:
+            path_matchers.append(matcher)
+    # A ``-regex``/``-iregex`` pattern is NEVER compiled and NEVER run. It is an
+    # agent-supplied regex, this gate is synchronous and in-process, and CPython's
+    # ``re`` has no timeout -- so a catastrophic-backtracking pattern would wedge the
+    # gate for every session rather than merely mis-answer. Screening for the
+    # dangerous shapes was rejected: against a hostile author that enumeration does
+    # not terminate, which is the argument this module already makes about
+    # enumerating dangerous punctuation. Treating the filter as opaque costs an
+    # over-block on a rare flag and removes the whole class.
+    if regex_pats:
+        opaque = True
+    # A filter carrying an expansion this command never assigned is unknowable from
+    # the text, so it is opaque too. `normalize_shell_command` expands only `$HOME`,
+    # so `P=.env; find ~ -name $P -exec cat {} +` otherwise matched the literal `$P`
+    # against the fence, matched nothing, and read the secret (found in review).
+    if any(_is_shell_variable_reference(p) or _mark_unresolved(p) != p for p in all_pats):
+        opaque = True
+    # No filter at all means every visited file matches, so the effective pattern
+    # is `*`. A filter this pass will not evaluate is read the same way.
+    unfiltered = opaque or not all_pats
+    literal_names = [p for p in name_pats if not (_FIND_GLOB_META & set(p))]
+    # Each store is scanned at most ONCE per command. The loops below run per root
+    # and per candidate FORM of that root, so a command with two roots re-scanned
+    # the same store four times -- the directory listing cannot change while one
+    # command is being judged, so the repeat was pure cost.
+    scanned: dict[str, str | None] = {}
+    for root in _find_root_readings(roots):
+        if is_sensitive_path(root) or _dir_holds_sensitive_leaf(root):
+            return root
+        for form in _candidate_forms(root):
+            form_cf = form.casefold().rstrip(os.sep)
+            prefix = form_cf + os.sep
+            for target in targets:
+                if not (target == form_cf or target.startswith(prefix)):
+                    continue
+                if unfiltered:
+                    return target
+                base = os.path.basename(target)
+                if any(m.fullmatch(base) for m in name_matchers):
+                    return target
+                if any(m.fullmatch(target) for m in path_matchers):
+                    return target
+            for pattern in path_pats:
+                probe = _find_literal_path_probe(pattern, form)
+                if probe and is_sensitive_path(probe):
+                    return probe
+            if not (literal_names or name_matchers):
+                continue
+            for store in stores:
+                # STRICTLY under the root: a root that IS the store already
+                # returned above, through the fenced-path test.
+                if not any(form.casefold().startswith(prefix) for form in _candidate_forms(store)):
+                    continue
+                if store not in scanned:
+                    scanned[store] = _find_store_holds_match(store, literal_names)
+                held = scanned[store]
+                if held and is_sensitive_path(held):
+                    return held
+    return None
+
+
+def _check_find_traversal_reaches_fence(command: str) -> str | None:
+    """Deny a ``find`` whose delivered matches include a fenced path.
+
+    Returns a denial reason string, or None if clean.
+    """
+    # The cheap bail has to survive the same splicing the normalizer undoes, or it
+    # becomes the bypass: `fi''nd` and `fi\nd` both reach shlex as `find`, so a
+    # substring test on the RAW text skipped the whole pass. Stripping the quote and
+    # escape characters costs one pass over the string -- much less than the
+    # tokenization it still avoids for every command that names no traversal -- and
+    # can only ever cost an extra tokenization, never a verdict.
+    if "find" not in _QUOTE_ESCAPE_CHARS_RE.sub("", command).lower():
+        return None
+    try:
+        tokens = normalize_shell_command(_find_space_unquoted_operators(command))
+    except Exception:
+        return None
+    for index, token in enumerate(tokens):
+        # Three things can sit between the start of a token and the program word,
+        # and each was a live bypass on its own:
+        #
+        #   `<(find ...)`   a process substitution's redirect -- `_REDIR_PREFIX_RE`
+        #   `$(find ...)`   a substitution's opener -- `_strip_grouping`
+        #   `ls|find ...`   a control operator glued to the previous command, which
+        #                   `shlex` does not split on, so the whole thing arrived as
+        #                   ONE token whose basename matched nothing (found in review)
+        #
+        # The operator split takes the LAST piece, because that is the position a
+        # program word occupies: `ls|find` runs `find`.
+        program = _strip_grouping(_REDIR_PREFIX_RE.sub("", token))
+        program = _CONTROL_OPERATOR_RE.split(program)[-1]
+        if os.path.basename(program).lower() not in _FIND_PROGRAM_NAMES:
+            continue
+        roots, name_pats, path_pats, regex_pats, delivers = _parse_find_invocation(
+            tokens, index + 1
+        )
+        # The traversal's own output is CAPTURED when the program word sits inside a
+        # substitution: `cat $(find ...)`. A bare `(` is not enough -- a subshell's
+        # output still goes to the terminal -- and a control operator before the
+        # program word says nothing about where the OUTPUT goes.
+        if not (delivers or _FIND_CAPTURED_PROGRAM_RE.search(token)):
+            continue
+        # A traversal with no root operand walks the working directory.
+        named = _find_traversal_reaches_fence(roots or ["."], name_pats, path_pats, regex_pats)
+        if named:
+            return (
+                "Blocked: command traverses a sensitive credential path and "
+                f"delivers the match to a command (resolved via find: {named[:80]})"
+            )
+    return None
 
 
 def _check_sensitive_via_normalizer(command: str) -> str | None:

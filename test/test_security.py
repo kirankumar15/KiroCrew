@@ -8037,3 +8037,682 @@ class TestModelWeightsAreWriteProtected:
     def test_an_unrelated_path_named_models_is_not_fenced(self) -> None:
         """Scoped to the crew home, so an ordinary project directory is unaffected."""
         assert security.is_sensitive_write_path("~/code/myproject/models/weights.bin") is False
+
+
+class TestFindTraversalReachesFence:
+    """``find`` factors a path into a root and a name pattern, so neither token names it.
+
+    Every other pass in this module answers "does a TOKEN resolve to a fenced
+    path". ``find ~/.kiro/crew -name .env -exec cat {} +`` has no such token: the
+    directory is in one argument, the leaf in another, and the path itself is
+    produced at runtime. Re-joining the two is what makes the traversal visible
+    (#7034).
+
+    The delivery requirement is what keeps this narrow: a bare ``find`` that only
+    LISTS is unaffected, so the newly-denied set is exactly the traversals that
+    hand a match to a command.
+    """
+
+    # ── the forms measured on the issue ──
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "find ~/.kiro/crew -name '.env' -exec cat {} +",
+            "find ~/.kiro/crew -name 'token_signing.key' -exec cat {} +",
+            "find ~/.kiro/crew -name 'computer_use.json' -exec cat {} +",
+            "find ~/.kiro/crew -name '*.lock' | xargs cat",
+        ),
+    )
+    def test_issue_bypasses(self, command: str) -> None:
+        """Four of the five commands reported on #7034 -- each reads a permanent
+        secret. The fifth reaches ``~/.aws/credentials`` and so needs a store on
+        disk; it is covered in the fake home below."""
+        assert security.is_sensitive_bash_command(command), command
+
+    def test_the_fifth_issue_bypass(self, monkeypatch, tmp_path) -> None:
+        """``find ~ -name credentials -exec cat {} +`` -- the traversal starts
+        OUTSIDE the fence and reaches ``.aws`` by descent, which is why the root
+        names nothing the earlier passes could see."""
+        home = self._fake_home_with_stores(monkeypatch, tmp_path)
+        assert security.is_sensitive_bash_command(
+            f"find {home} -name 'credentials' -exec cat {{}} +"
+        )
+        security._home_targets_cache.clear()
+
+    # ── the carrier grammar: every way find hands a match to a command ──
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "find ~/.kiro/crew -name '.env' -exec cat {} +",
+            "find ~/.kiro/crew -name '.env' -exec cat {} ;",
+            "find ~/.kiro/crew -name '.env' -execdir cat {} +",
+            "find ~/.kiro/crew -name '.env' -ok cat {} ;",
+            "find ~/.kiro/crew -name '.env' -okdir cat {} ;",
+            "find ~/.kiro/crew -name '.env' -delete",
+            "find ~/.kiro/crew -name '.env' -fprint /tmp/leak",
+            "find ~/.kiro/crew -name '.env' -fls /tmp/leak",
+            "find ~/.kiro/crew -name '.env' -fprintf /tmp/leak '%p'",
+            "find ~/.kiro/crew -name '.env' -exec sh -c 'cat \"$1\"' _ {} ;",
+            # the pipe is the delivery, so xargs' own flag grammar never matters
+            "find ~/.kiro/crew -name '.env' | xargs cat",
+            "find ~/.kiro/crew -name '.env' -print0 | xargs -0 cat",
+            "find ~/.kiro/crew -name '.env' | xargs -I{} cat {}",
+            "find ~/.kiro/crew -name '.env' | xargs -n1 -P4 head -c 100",
+            "find ~/.kiro/crew -name '.env' | while read f; do cat $f; done",
+            "cat $(find ~/.kiro/crew -name '.env')",
+            "cat `find ~/.kiro/crew -name '.env'`",
+            "cat < <(find ~/.kiro/crew -name '.env')",
+            "find ~/.kiro/crew -name '.env' > /tmp/leak",
+        ),
+    )
+    def test_every_delivery_form_is_denied(self, command: str) -> None:
+        assert security.is_sensitive_bash_command(command), command
+
+    def test_an_unknown_primary_is_treated_as_delivery(self) -> None:
+        """Fail closed: the inert set is the allow-list, so a primary nobody
+        enumerated denies rather than permits. That polarity is the module's own
+        (`_TRUST_ROOT_READ_LISTERS`): naming the writers fails OPEN."""
+        assert security.is_sensitive_bash_command(
+            "find ~/.kiro/crew -name '.env' -exceedingly-new-primary cat {} +"
+        )
+
+    # ── the three ways a traversal can name a fenced path ──
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            # the root IS the directory whose secrets live in its leaves, and the
+            # leaf is the runtime wildcard -- the `~/.kiro/crew/$F` shape
+            "find ~/.kiro/crew -type f -exec cat {} +",
+            "find ~/.kiro/crew -name '*' -exec cat {} +",
+            "find ~/.kiro/crew -name 'tmp*.tmp' -exec cat {} +",
+            "find ~/.kirocrew -name '.env' -exec cat {} +",
+            "find ~/.kiro/crew/workspace/md-notebook -type f -exec cat {} +",
+            # the root IS a fenced directory
+            "find ~/.aws -type f -exec cat {} +",
+            "find ~/.ssh -type f -exec cat {} +",
+        ),
+    )
+    def test_root_names_the_credential_directory(self, command: str) -> None:
+        assert security.is_sensitive_bash_command(command), command
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            # the pattern matches a name the fence itself declares
+            "find ~ -name '.env' -exec cat {} +",
+            "find ~ -name 'token_signing.key' -exec cat {} +",
+            "find ~ -name 'security_policy.json' -exec cat {} +",
+            "find ~ -name '.local_secret' -exec cat {} +",
+            "find ~ -name '*.key' -exec cat {} +",
+            "find ~ -name '.npmrc' -exec cat {} +",
+            "find / -name 'token_signing.key' -exec cat {} +",
+            # -iname folds, and so does the fence
+            "find ~ -iname '.ENV' -exec cat {} +",
+            "find ~ -iname 'TOKEN_SIGNING.KEY' -exec cat {} +",
+        ),
+    )
+    def test_pattern_names_a_declared_fence_name(self, command: str) -> None:
+        assert security.is_sensitive_bash_command(command), command
+
+    @staticmethod
+    def _fake_home_with_stores(monkeypatch, tmp_path) -> str:
+        """A home holding real credential stores, so the stat has something to find.
+
+        ``Path.home()`` reads HOME on POSIX and USERPROFILE on Windows and the
+        fence anchors on it, so both are set -- the pattern the keystone tests
+        already use. The target cache is keyed on the resolved roots, so it is
+        cleared to keep this test independent of call order.
+        """
+        home = tmp_path / "home"
+        (home / ".aws").mkdir(parents=True)
+        (home / ".aws" / "credentials").write_text("[default]\n")
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_rsa").write_text("-----BEGIN-----\n")
+        (home / ".ssh" / "known_hosts").write_text("host ssh-rsa AAAA\n")
+        (home / "Repos" / "app").mkdir(parents=True)
+        (home / "Repos" / "app" / "package.json").write_text("{}\n")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        security._home_targets_cache.clear()
+        return str(home)
+
+    @pytest.mark.parametrize(
+        "filter_and_sink",
+        (
+            "-name 'credentials' -exec cat {} +",
+            "-name 'id_rsa' -exec cat {} +",
+            "-name 'known_hosts' | xargs cat",
+            "-name 'credentials' -delete",
+            "-type f -name 'id_rsa' -exec base64 {} ;",
+        ),
+    )
+    def test_literal_name_resolved_inside_a_credential_store(
+        self, monkeypatch, tmp_path, filter_and_sink: str
+    ) -> None:
+        """A literal ``-name`` is the traversal being used to RESOLVE a path.
+
+        Every file inside ``.aws``/``.ssh`` is fenced, so a request for one exact
+        filename that IS there names a fenced path as surely as spelling it out.
+        """
+        home = self._fake_home_with_stores(monkeypatch, tmp_path)
+        assert security.is_sensitive_bash_command(f"find {home} {filter_and_sink}")
+        security._home_targets_cache.clear()
+
+    @pytest.mark.parametrize(
+        "filter_and_sink",
+        (
+            # a name that is not in any store -- the stat is what says so
+            "-name 'package.json' -exec wc -l {} +",
+            "-type d -name '__pycache__' -exec rm -rf {} +",
+            "-name 'tsconfig.json' | xargs cat",
+            # a glob is a search, not a request for one fenced name
+            "-name '*.py' -exec grep -l foo {} +",
+            "-name '*.md' | xargs wc -l",
+            # listing, so nothing receives the match
+            "-name 'credentials'",
+            "-name 'id_rsa' -print",
+        ),
+    )
+    def test_a_home_rooted_traversal_that_names_no_store_file_is_allowed(
+        self, monkeypatch, tmp_path, filter_and_sink: str
+    ) -> None:
+        """The boundary of the clause above, pinned in the same fake home.
+
+        Without the existence probe every one of these would be refused, because
+        the home directory holds ``.aws`` and ``.ssh`` whatever the pattern asks
+        for. This is the over-block the issue warns about, so it is a test.
+        """
+        home = self._fake_home_with_stores(monkeypatch, tmp_path)
+        assert security.is_sensitive_bash_command(f"find {home} {filter_and_sink}") is None
+        security._home_targets_cache.clear()
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "find ~ -path '*/.aws/credentials' -exec cat {} +",
+            "find ~ -path '*/.ssh/*' -exec cat {} +",
+            "find ~ -wholename '*/.kiro/crew/.env' -exec cat {} +",
+            "find ~ -ipath '*/.KIRO/CREW/.ENV' -exec cat {} +",
+        ),
+    )
+    def test_path_family_patterns(self, command: str) -> None:
+        """``-path`` matches the whole path, so the pattern carries the fenced
+        segments itself -- dropping its wildcard segments leaves a path to test."""
+        assert security.is_sensitive_bash_command(command), command
+
+    # ── spellings of the traversal itself ──
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "find -L ~/.kiro/crew -name '.env' -exec cat {} +",
+            "find -H -P ~/.kiro/crew -name '.env' -exec cat {} +",
+            "find -D tree ~/.kiro/crew -name '.env' -exec cat {} +",
+            "find -O3 ~/.kiro/crew -name '.env' -exec cat {} +",
+            "find /tmp ~/.kiro/crew -name '.env' -exec cat {} +",
+            "/usr/bin/find ~/.kiro/crew -name '.env' -exec cat {} +",
+            "fi''nd ~/.kiro/crew -name '.env' -exec cat {} +",
+            "find $HOME/.kiro/crew -name '.env' -exec cat {} +",
+            "find ${HOME}/.kiro/crew -name '.env' -exec cat {} +",
+            "find ~/.kiro/crew -mindepth 1 -maxdepth 2 -type f -name '.env' -exec cat {} +",
+            "find ~/.kiro/crew '(' -name '.env' -o -name '*.key' ')' -exec cat {} +",
+            "ls /tmp && find ~/.kiro/crew -name '.env' -exec cat {} +",
+        ),
+    )
+    def test_traversal_spellings(self, command: str) -> None:
+        assert security.is_sensitive_bash_command(command), command
+
+    # ── zero false positives: the benign uses that must stay allowed ──
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            # a project-rooted traversal reaches no fence at all
+            "find . -name '*.py' -exec grep -l foo {} +",
+            "find . -name '.env' -exec cat {} +",
+            "find . -name '*.lock' -exec cat {} +",
+            "find src -name '*.ts' | xargs wc -l",
+            "find /var/log -name '*.log' -delete",
+            "find /opt/app -name 'build.tmp' -exec cat {} +",
+            "find ~/Downloads -name '*.zip' -exec unzip -l {} +",
+            "find ~/Repos/app -name 'package.json' -exec wc -l {} +",
+            "find ~/Repos -name 'yarn.lock' | xargs cat",
+            "find . -type d -name node_modules -prune -o -name '*.js' -print",
+            # a home-rooted SEARCH -- a glob is not a request for a fenced name
+            "find ~ -name '*.py' -exec grep -l foo {} +",
+            "find ~ -name '*.md' | xargs wc -l",
+            "find ~ -name '*.orig' -delete",
+            # the crew home's own non-secret subtrees, which agents read routinely
+            "find ~/.kiro/crew/workspace -name '*.md' -exec cat {} +",
+            "find ~/.kiro/crew/workspace/memory -name 'projects.md' -exec cat {} +",
+            "find ~/.kiro/crew/skills -name 'SKILL.md' | xargs head -5",
+            # listing only: no command receives a match
+            "find ~ -name '.env'",
+            "find ~ -name 'credentials' -print",
+            "find ~/.kiro/crew -type f -name '*.lock' -printf '%p\\n'",
+            "find ~/.kiro/crew -name '.env' -ls",
+            # not a traversal at all
+            "xargs cat < files.txt",
+            "grep -rn TODO src",
+            "echo find",
+        ),
+    )
+    def test_benign_traversals_stay_allowed(self, command: str) -> None:
+        assert security.is_sensitive_bash_command(command) is None, command
+
+    def test_a_bare_listing_of_a_fenced_root_is_unchanged(self) -> None:
+        """``find ~/.ssh`` names a fenced path directly, so the pre-existing path
+        matcher denies it whether or not it delivers -- this pass changes nothing
+        there, and the assertion pins that it is not this pass doing the work."""
+        assert security.is_sensitive_bash_command("find ~/.ssh -type f")
+        assert security._check_find_traversal_reaches_fence("find ~/.ssh -type f") is None
+
+    def test_the_delivery_requirement_is_what_bounds_the_change(self) -> None:
+        """The same traversal, listed and delivered. Only the second is new."""
+        listed = "find ~/.kiro/crew -type f -name '*.lock'"
+        delivered = listed + " -exec cat {} +"
+        assert security._check_find_traversal_reaches_fence(listed) is None
+        assert security._check_find_traversal_reaches_fence(delivered)
+
+    def test_the_gate_is_not_verb_aware(self) -> None:
+        """A traversal that names a fenced path is denied whatever the child is --
+        the module's stated posture, and the reason no executor list is kept."""
+        for child in ("cat", "head", "python3", "base64", "cp", "rm", "totally-unknown"):
+            command = f"find ~/.kiro/crew -name '.env' -exec {child} {{}} +"
+            assert security.is_sensitive_bash_command(command), command
+
+    def test_a_glob_that_covers_a_declared_name_is_denied_on_purpose(self) -> None:
+        """The one deliberate over-trigger, recorded rather than left to be found.
+
+        ``*.json`` matches ``security_policy.json`` and ``config.json``, which the
+        fence declares by name, so a traversal delivering every JSON file in the
+        home directory really does read them. The glob carve-out is about names the
+        fence does NOT declare (``*.py``), not about widening a name it does.
+        """
+        assert security.is_sensitive_bash_command("find ~ -name '*.json' -exec cat {} +")
+        assert security.is_sensitive_bash_command("find ~ -name '*.key' | xargs cat")
+        assert security.is_sensitive_bash_command("find ~ -name '*.py' -exec cat {} +") is None
+
+    def test_the_pass_only_ever_adds_denials(self) -> None:
+        """It is a new pass returning a reason or None, so it cannot un-deny.
+
+        Pinned on the commands whose denial belongs to an EARLIER pass: this one
+        answers None for them, which is the evidence that the verdicts they
+        already had are still theirs.
+        """
+        for command in (
+            "cat ~/.aws/credentials",
+            "cat ~/.kiro/crew/token_signing.key",
+            "cd ~/.kiro/crew && cat .env",
+            "find ~/.ssh -type f",
+        ):
+            assert security.is_sensitive_bash_command(command), command
+            assert security._check_find_traversal_reaches_fence(command) is None, command
+
+    # ── the three findings from the Opus review round ──
+
+    @pytest.mark.parametrize(
+        "filter_and_sink",
+        (
+            # the literal spelling, which is what the store can answer exactly
+            "-name id_rsa -exec cat {} +",
+            "-name credentials -exec cat {} +",
+            "-name known_hosts | xargs cat",
+            "-name id_rsa -delete",
+            "-type f -name id_rsa -exec base64 {} ;",
+            # a glob matching a name the FENCE declares is denied by the list, with
+            # no store scan involved
+            "-name '*.key' -exec cat {} +",
+            "-name '.env' -exec cat {} +",
+        ),
+    )
+    def test_a_named_store_file_and_a_declared_name_both_deny(
+        self, monkeypatch, tmp_path, filter_and_sink: str
+    ) -> None:
+        """Two independent routes to the same verdict.
+
+        A LITERAL name is answered exactly by the store (``~/.aws/credentials`` is
+        there, so the traversal names it); a GLOB is answered by the fence list when
+        it covers a declared basename. Neither route scans a store's contents against
+        a wildcard -- see `_find_store_holds_match` for the false positives that cost.
+        """
+        home = self._fake_home_with_stores(monkeypatch, tmp_path)
+        assert security.is_sensitive_bash_command(f"find {home} {filter_and_sink}")
+        security._home_targets_cache.clear()
+
+    @pytest.mark.parametrize(
+        "filter_and_sink",
+        (
+            "-regex '.*/[.]py$' -exec grep -l foo {} +",
+            "-regex '.*/package[.]json' -exec wc -l {} +",
+            "-iregex '.*[.]MD' | xargs wc -l",
+        ),
+    )
+    def test_a_regex_filter_is_never_evaluated_so_it_widens(
+        self, monkeypatch, tmp_path, filter_and_sink: str
+    ) -> None:
+        """A ``-regex`` pattern is agent-supplied, so this pass will not RUN it.
+
+        The gate is synchronous and in-process and CPython's ``re`` has no timeout,
+        so a catastrophic-backtracking pattern would wedge it for every session
+        rather than merely mis-answer. The filter is therefore read as opaque, which
+        means a DELIVERING ``-regex`` traversal over a root that contains a fence is
+        refused whatever the pattern says. That over-block is the price of never
+        running the pattern, and it is deliberate.
+        """
+        home = self._fake_home_with_stores(monkeypatch, tmp_path)
+        assert security.is_sensitive_bash_command(f"find {home} {filter_and_sink}")
+        security._home_targets_cache.clear()
+
+    def test_the_regex_over_block_is_bounded_by_the_root(self, tmp_path) -> None:
+        """The bound on the clause above: a root holding no fence is untouched.
+
+        The root comes from ``tmp_path`` rather than a hardcoded ``/tmp``. The suite
+        relocates ``KIROCREW_HOME`` under the pytest base temp dir, which on CI lives
+        in ``/tmp`` -- so ``/tmp`` genuinely DOES contain the fence there and an
+        opaque filter correctly denies a traversal of it. The gate was right and the
+        assertion was wrong; ``tmp_path`` is a sibling of the relocated home, never an
+        ancestor of it.
+        """
+        project = tmp_path / "proj"
+        project.mkdir()
+        for command in (
+            f"find {project} -regex '.*/package[.]json' -exec wc -l {{}} +",
+            f"find {project} -regex '.*[.]py$' | xargs wc -l",
+            f"find {project} -regex '.*[.]log' -delete",
+            # and a listing is unaffected wherever it is rooted
+            "find ~ -regex '.*[.]py$'",
+        ):
+            assert security.is_sensitive_bash_command(command) is None, command
+
+    @pytest.mark.parametrize(
+        "pattern",
+        (
+            "{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}b",
+            "*" * 40 + "b",
+            "{a}*{a}*{a}*{a}*{a}*{a}*{a}*{a}*{a}*{a}b",
+        ),
+    )
+    def test_adjacent_any_run_wildcards_are_collapsed(self, pattern: str) -> None:
+        """``_glob_to_regex`` turns an agent glob into an agent REGEX.
+
+        A brace group becomes ``.*``, so ``-name '{a}{a}...b'`` compiled to fourteen
+        ADJACENT ``.*`` and hung the gate outright -- measured as still running after
+        12 seconds, the watchdog-crossing hang this module documents. ``.*.*`` names
+        exactly what ``.*`` names, so collapsing the run is semantics-preserving and
+        turns the pathological case into a linear one rather than refusing it.
+        """
+        matcher = security._find_glob_matcher(pattern)
+        assert matcher is not None, pattern
+        assert matcher.pattern.count(".*") == 1, matcher.pattern
+
+    @pytest.mark.parametrize(
+        "pattern",
+        (
+            "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b",
+            "*.*.*.*.*.*.*.*.*.*.*.*.*.*.*z",
+            "?a*b*c*d*e*f*g*h*i*j*k*l*m*n*o",
+        ),
+    )
+    def test_too_many_separated_wildcards_are_refused_not_run(self, pattern: str) -> None:
+        """Runs separated by literals cannot be collapsed, so they are capped.
+
+        Refusing returns None, which the caller reads as opaque -- it WIDENS the
+        traversal rather than dropping the filter, so the bound cannot become a
+        bypass.
+        """
+        assert security._find_glob_matcher(pattern) is None, pattern
+
+    def test_an_ordinary_glob_still_compiles(self) -> None:
+        """The bound: a real filename filter is unaffected by either mechanism."""
+        for pattern in ("*.py", ".env", "id_*", "*.tar.gz", "test_*_spec.?s", "[abc]*.md"):
+            assert security._find_glob_matcher(pattern) is not None, pattern
+
+    def test_an_adversarial_pattern_answers_quickly(self) -> None:
+        """The direct evidence: these used to hang, so a wall clock is the assertion.
+
+        The margin is enormous on purpose -- the measured cost is ~30ms and the
+        failure being guarded is unbounded, so this cannot flake on a loaded box
+        while still catching a return to super-polynomial matching.
+        """
+        commands = (
+            "find ~ -name '{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}{a}b' -exec cat {} +",
+            "find ~ -regex '(.*)*z' -exec cat {} +",
+            "find ~ -regex '(a+)+$' -exec cat {} +",
+            "find ~ -path '*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b' -exec cat {} +",
+        )
+        start = time.monotonic()
+        for command in commands:
+            security.is_sensitive_bash_command(command)
+        assert time.monotonic() - start < 10.0
+
+    # ── the findings from the round-4 review ──
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            # an operator GLUED to a filter operand was swallowed as pattern text,
+            # so delivery was never seen and the read went through
+            "find ~/.kiro/crew -name .env|xargs cat",
+            "find ~/.kiro/crew -name .env|head -1",
+            "find ~/.kiro/crew -type f|xargs cat",
+            "find ~/.kiro/crew -type f>/tmp/leak",
+            "find ~/.kiro/crew -type f>>/tmp/leak",
+            "find ~/.kiro/crew -name .env -exec cat {} ;",
+            # the whitespace-separated twin, which was already denied
+            "find ~/.kiro/crew -name .env | xargs cat",
+        ),
+    )
+    def test_an_operator_glued_to_a_filter_operand(self, command: str) -> None:
+        """``shlex`` splits on whitespace only, so ``-name .env|xargs`` arrived as ONE
+        token and the pipe was consumed as the search pattern -- the gate defeated by
+        deleting one space, while the spaced twin denied."""
+        assert security.is_sensitive_bash_command(command), command
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "find ./src -name 'a|b' -print",
+            "find ./src -name 'a|b' -exec cat {} +",
+            "find ./src -name 'a;b' -exec cat {} +",
+            "find ./src -name 'a>b' | xargs wc -l",
+        ),
+    )
+    def test_a_quoted_operator_is_not_split(self, command: str) -> None:
+        """The reason the spacing works on the RAW string and not on the tokens.
+
+        ``shlex`` has already removed the quotes by token time, so splitting there
+        could not tell a quoted ``|`` in a filename from a real pipe -- the hazard
+        `_split_glued_operators` documents. Quote state survives on the raw string,
+        so the pattern is left intact and no spurious delivery is invented.
+        """
+        assert security.is_sensitive_bash_command(command) is None, command
+
+    def test_the_spacer_keeps_the_shapes_the_pass_depends_on(self) -> None:
+        """Three spellings the spacing must not disturb, each load-bearing."""
+        spaced = security._find_space_unquoted_operators
+        # a process substitution keeps `<(` glued, which is how capture is detected
+        assert spaced("cat < <(find ~ -name .env)") == "cat < <(find ~ -name .env)"
+        # a command substitution keeps `$(`
+        assert spaced("cat $(find ~ -name .env)") == "cat $(find ~ -name .env)"
+        # a backslash-escaped `;` is find's own exec terminator, not a separator
+        assert "\\;" in spaced("find ~ -name .env -exec cat {} \\;")
+        # a two-character operator stays together
+        assert ">>" in spaced("find ~ -type f>>out")
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "P=.env; find ~ -name $P -exec cat {} +",
+            "find ~ -name ${P} -exec cat {} +",
+            "find ~ -path $P -exec cat {} +",
+            "find ~ -name %NAME% -exec cat {} +",
+            # an unresolved ROOT plus a fence-declared name
+            "find $D -name .env -exec cat {} +",
+            "find ${D}/crew -name token_signing.key | xargs cat",
+        ),
+    )
+    def test_an_unresolved_expansion_widens(self, command: str) -> None:
+        """``normalize_shell_command`` expands only ``$HOME``, so a filter carrying a
+        variable this command never assigned matched the LITERAL ``$P`` against the
+        fence, matched nothing, and read the secret. An unknowable filter is now read
+        as ``*``, and an unknowable ROOT adds the home hypothesis the segment walk
+        already uses."""
+        assert security.is_sensitive_bash_command(command), command
+
+    def test_an_unresolved_root_does_not_deny_an_ordinary_search(self) -> None:
+        """The bound: adding the home hypothesis lets the FILTER still decide."""
+        for command in (
+            "find $BUILD -name '*.o' -delete",
+            "find $OUT -name '*.map' -exec rm {} +",
+            "find ${DIST} -name '*.js' | xargs wc -l",
+        ):
+            assert security.is_sensitive_bash_command(command) is None, command
+
+    def test_a_nested_whole_directory_store_is_probed(self, monkeypatch, tmp_path) -> None:
+        """Keeping only SINGLE-segment fence entries dropped the nested stores.
+
+        ``.config/gcloud`` fences its whole subtree exactly as ``.aws`` does, so its
+        credential database was readable through a literal ``-name``. Every entry
+        fences its subtree, so the list is now taken as-is -- which also keeps
+        ``~/.kiro/crew`` out, since that directory is a leaf PARENT and not an entry.
+        """
+        home = tmp_path / "home"
+        (home / ".config" / "gcloud").mkdir(parents=True)
+        (home / ".config" / "gcloud" / "credentials.db").write_text("db\n")
+        (home / ".config" / "starship.toml").write_text("ok\n")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        security._home_targets_cache.clear()
+        assert security.is_sensitive_bash_command(
+            f"find {home} -name credentials.db -exec cat {{}} +"
+        )
+        # the general-purpose parent is NOT a store, so its own files stay readable
+        assert (
+            security.is_sensitive_bash_command(f"find {home} -name starship.toml -exec cat {{}} +")
+            is None
+        )
+        security._home_targets_cache.clear()
+
+    def test_each_store_is_probed_at_most_once_per_command(self, monkeypatch, tmp_path) -> None:
+        """The loops run per root and per candidate FORM, so a multi-root command
+        probed the same store several times. The filesystem cannot change while one
+        command is judged, so the repeat was pure cost on a synchronous gate."""
+        home = self._fake_home_with_stores(monkeypatch, tmp_path)
+        calls: list[str] = []
+        real = security._find_store_holds_match
+
+        def counting(store, literal_names):
+            calls.append(store)
+            return real(store, literal_names)
+
+        monkeypatch.setattr(security, "_find_store_holds_match", counting)
+        security.is_sensitive_bash_command(f"find {home} {home} -name id_rsa -exec cat {{}} +")
+        assert calls, "the store probe never ran, so this asserts nothing"
+        assert len(calls) == len(set(calls)), calls
+        security._home_targets_cache.clear()
+
+    @pytest.mark.parametrize("prefix", ("ls|", "true;", "true&&", "true&", "echo hi|"))
+    def test_an_operator_glued_to_the_program_word(self, prefix: str) -> None:
+        """``shlex`` splits on whitespace only, so ``ls|find`` arrived as ONE token.
+
+        ``os.path.basename('ls|find')`` is ``'ls|find'``, which matched no program
+        name, so the pass never ran -- the whole gate bypassed by removing one space.
+        """
+        command = f"{prefix}find ~/.kiro/crew -name '.env' -exec cat {{}} +"
+        assert security.is_sensitive_bash_command(command), command
+
+    def test_a_glued_pipe_after_the_traversal_is_still_delivery(self) -> None:
+        """The operator arrives glued to the last operand (``-type f|xargs``)."""
+        assert security.is_sensitive_bash_command("find ~/.kiro/crew -type f|xargs cat")
+        assert security.is_sensitive_bash_command("find ~/.kiro/crew -name '.env'|head -1")
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "find ~/.kiro/crew -type f; cat notes | less",
+            "find ~/.kiro/crew -type f && echo done | tee log",
+            "find ~/.kiro/crew -name '*.lock' ; echo $(date) > /tmp/stamp",
+            "find ~/.kiro/crew -type f & wait",
+        ),
+    )
+    def test_a_sibling_command_s_pipe_does_not_make_a_listing_a_delivery(
+        self, command: str
+    ) -> None:
+        """Delivery is read from the invocation's own span, not the command line.
+
+        Scanning the whole line denied these listings because a LATER, unrelated
+        command carried a pipe or a redirect. ``;``, ``&&`` and ``&`` only sequence.
+        """
+        assert security.is_sensitive_bash_command(command) is None, command
+
+    def test_the_same_traversal_with_its_own_pipe_is_denied(self) -> None:
+        """The control for the case above: the pipe belongs to the traversal."""
+        assert security.is_sensitive_bash_command("find ~/.kiro/crew -type f | less")
+        assert security.is_sensitive_bash_command("find ~/.kiro/crew -type f > /tmp/leak")
+
+    # ── the finding from the Opus round on the rebased head ──
+
+    @pytest.mark.parametrize(
+        "command_template",
+        (
+            "cat $(find {home} -regex '.*/id_rsa$')",
+            "cat `find {home} -regex '.*/id_rsa$'`",
+            "head -c 80 $(find {home} -iregex '.*/CREDENTIALS')",
+            # the two families that already stripped, as the parity controls
+            "cat $(find {home} -name id_rsa)",
+            "cat $(find {home} -path '*/.ssh/id_rsa')",
+        ),
+    )
+    def test_a_captured_substitution_does_not_corrupt_the_pattern(
+        self, monkeypatch, tmp_path, command_template: str
+    ) -> None:
+        """``shlex`` glues the substitution's closing paren onto the pattern token.
+
+        The strip was written per-list at the call site and ``-regex`` was the list
+        that did not get it, so ``.*/id_rsa$)`` failed to compile, its matcher was
+        dropped, and the read was allowed -- while the ``-name`` spelling of the very
+        same read was denied. It is now stripped where the pattern is READ, so no
+        family can be missed.
+        """
+        home = self._fake_home_with_stores(monkeypatch, tmp_path)
+        command = command_template.format(home=home)
+        assert security.is_sensitive_bash_command(command), command
+        security._home_targets_cache.clear()
+
+    @pytest.mark.parametrize(
+        "pattern_flag",
+        (
+            "-regex '('",
+            "-regex '*/id_rsa'",
+            "-regex 'a{2,1}'",
+            "-regex '[z-a]'",
+            "-iregex '(?P<'",
+        ),
+    )
+    def test_a_pattern_that_will_not_compile_fails_closed(self, pattern_flag: str) -> None:
+        """A matcher that cannot be built must WIDEN the traversal, not vanish.
+
+        Dropping it left the clause with neither a matcher nor the no-filter
+        reading, so every malformed pattern silently allowed the traversal. An
+        opaque pattern is now read as ``*`` -- the module's stated stance that a
+        *maybe* answers yes.
+        """
+        command = f"find ~/.kiro/crew {pattern_flag} -exec cat {{}} +"
+        assert security.is_sensitive_bash_command(command), command
+
+    def test_a_compilable_regex_matching_nothing_fenced_is_still_allowed(self) -> None:
+        """A regex filter is not evaluated, so the ROOT is what bounds the answer."""
+        assert (
+            security.is_sensitive_bash_command(
+                "find ~/Repos -regex '.*/package[.]json' -exec wc -l {} +"
+            )
+            is None
+        )
+        assert (
+            security.is_sensitive_bash_command("find ~/Repos -regex '.*[.]py$' | xargs wc -l")
+            is None
+        )
