@@ -986,11 +986,14 @@ def test_every_turn_outcome_label_is_classified_fault_or_excluded():
 
     # Non-faults, each with its exclusion reason pinned by the tests above:
     # "ok" succeeded; "tool_stall"/"stale_recover" are recovered-in-place stalls
-    # tracked under kirocrew.watchdog.recovery.outcome; "unclassified" is a turn
-    # whose surface had no stop reason to give, so calling it a fault would
-    # invent one for every clean background turn. Add a new label here or
-    # to _TERMINAL_FAULT_OUTCOMES — never leave it unclassified.
-    excluded = {"ok", "tool_stall", "stale_recover", "unclassified"}
+    # tracked under kirocrew.watchdog.recovery.outcome; "cancelled" is the
+    # operator pressing Stop, so counting it would report a deliberate user
+    # action as the system failing (it used to fold into "error" and did exactly
+    # that); "unclassified" is a turn whose surface had no stop reason to give,
+    # so calling it a fault would invent one for every clean background turn. Add
+    # a new label here or to _TERMINAL_FAULT_OUTCOMES — never leave it
+    # unclassified.
+    excluded = {"ok", "tool_stall", "stale_recover", "cancelled", "unclassified"}
     unclassified = labels - _TERMINAL_FAULT_OUTCOMES - excluded
     assert not unclassified, (
         f"_turn_outcome label(s) {sorted(unclassified)} are neither terminal "

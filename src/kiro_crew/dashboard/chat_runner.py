@@ -200,7 +200,7 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.renderer import chunk_for_transport
 from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
-from kiro_crew.metrics.turns import emit_turn_duration, turn_outcome
+from kiro_crew.metrics.turns import emit_turn_duration, emit_turn_usage, turn_outcome
 from kiro_crew.monitoring.completion import (
     MonitorCompletionHook,
     disposition_for_stop_reason,
@@ -380,12 +380,16 @@ def _emit_turn_metric(
     *,
     elapsed_ms: int | float | None = None,
     exhausted: bool = False,
+    usage: object = None,
+    model: str = "",
+    provider: str = "",
 ) -> None:
-    """Emit kirocrew.turn.duration (best-effort).
+    """Emit this turn's OTEL samples (best-effort).
 
-    Thin delegate to :func:`kiro_crew.metrics.turns.emit_turn_duration`. The
-    metric is emitted for EVERY dispatch surface, and by two owners that between
-    them sample each turn exactly once — see :mod:`kiro_crew.metrics.turns`.
+    Thin delegate to :func:`kiro_crew.metrics.turns.emit_turn_duration` and
+    :func:`~kiro_crew.metrics.turns.emit_turn_usage`. The family is emitted for
+    EVERY dispatch surface, and by two owners that between them sample each turn
+    exactly once — see :mod:`kiro_crew.metrics.turns`.
 
     ``_run_chat`` DOES call this, and is the only production caller. Its persist
     call passes ``emit_metric=False`` so the shared boundary does not also sample
@@ -395,6 +399,13 @@ def _emit_turn_metric(
     here are the EFFECTIVE session key and the spent-recovery-budget
     ``exhausted`` flag available.
 
+    ``usage`` is therefore read HERE rather than left to the boundary: with
+    ``emit_metric=False`` the boundary emits nothing at all, so a usage emit that
+    lived only there would leave the dashboard — the surface carrying most of the
+    traffic — contributing no token or spend samples whatsoever. Fields are read
+    defensively because a turn can complete without one (an errored turn's
+    ``usage`` may be absent), and ``emit_turn_usage`` drops non-positive values.
+
     Every other surface is sampled by ``persist_token_record_async`` itself,
     which is what ended this metric being a dashboard-only reading.
     """
@@ -403,6 +414,16 @@ def _emit_turn_metric(
         session_key=slot_key,
         outcome=turn_outcome(stop_reason, exhausted=exhausted),
         elapsed_ms=elapsed_ms,
+        model=model,
+        provider=provider,
+    )
+    emit_turn_usage(
+        input_tokens=getattr(usage, "input_tokens", 0),
+        output_tokens=getattr(usage, "output_tokens", 0),
+        credits=getattr(usage, "credits", 0.0),
+        cost_usd=getattr(usage, "cost_usd", 0.0),
+        model=model,
+        provider=provider,
     )
 
 
@@ -8018,16 +8039,52 @@ async def _run_chat(
                     _turn_exhausted = _prompt_depth > 0 or slot._tool_stall_retries >= 3
                 else:
                     _turn_exhausted = False
+                # Model + provider for the row AND the metric attributes, resolved
+                # ABOVE the billing gate for exactly the reason _turn_exhausted
+                # is: the unconditional emit below reads them, and a zero-billing
+                # turn (a timeout, a cancel) reaches only that path — reading names
+                # bound inside the gate would raise NameError on the one
+                # population whose latency matters most. Both reads are cheap and
+                # side-effect-free; the CC late-backfill that WRITES slot.model
+                # stays behind the gate below.
+                #
+                # The provider is the SERVED backend, read off the live client,
+                # NOT `cfg.agent.provider`: that field is declared `enum=["acp"]`
+                # and `validate_config_data` deletes an out-of-enum value, so it is
+                # a constant naming no backend at all. Reading it labelled every
+                # dashboard turn "acp" — a claude_code turn included — which makes
+                # a provider split answer nothing.
+                #
+                # Resolved with `is_claude_backend`, which this module ALREADY
+                # imports, rather than `providers.acp.provider_label`. Not a
+                # preference: `scripts/check_agent_sdk_boundary.py` rejects an
+                # ACP-layer import on any line a change touches, baselined file or
+                # not ("the baseline covers only pre-existing lines"), so adding
+                # `provider_label` — even onto the existing import line — is a hard
+                # gate failure. This expression is also exactly what
+                # `subagent_manager/run.py` already writes for the same question,
+                # so the two surfaces agree by construction.
+                #
+                # Known residue: this cannot name the KAS backend, which only
+                # `provider_label`'s ACP constants distinguish, so a KAS turn still
+                # labels "acp". That is the same limit `subagent_manager` has today,
+                # and closing it means exposing the label through
+                # `kiro_crew.agent_sdk` — the boundary's sanctioned surface, and an
+                # RFC-governed addition rather than a telemetry change.
+                #
+                # A fallback model serving the turn blanks the ROW's model for the
+                # reason it always has — billing a model that never executed is
+                # wrong, and model_source records what actually ran. The metric
+                # prefers the SERVED id instead (see the emit below): billing and
+                # attribution are different questions.
+                _provider_name = "claude_code" if is_claude_backend(client) else "acp"
+                _record_model = "" if slot._active_fallback_model else slot.model
                 # One shared predicate across every persist gate (#6758): a
                 # claude-seam turn ending via a synthetic EVENT_COMPLETE
                 # (timeout, tool-stall, cancel-unacked) can carry cost or cache
                 # tokens with zero fresh tokens and zero credits, and the
                 # footer above already reads _u.cost_usd for the same event.
                 if usage_has_billing(_u):
-                    try:
-                        _provider_name = cfg.agent.provider  # type: ignore[possibly-undefined]
-                    except (NameError, AttributeError):
-                        _provider_name = ""
                     # Late backfill: CC reports model only via the `init`
                     # system event which arrives after the run starts, so
                     # slot.model may still be empty here even though the
@@ -8037,17 +8094,16 @@ async def _run_chat(
                     # fallback is active (same guard as the pre-turn site):
                     # the provider reports the FALLBACK, and writing it into
                     # slot.model would make the temporary swap a permanent pin.
-                    _record_model = slot.model
+                    #
+                    # _record_model / _provider_name are already resolved above
+                    # the gate; this only refines the model, and only here
+                    # because the slot.model WRITE must not run for a turn that
+                    # billed nothing.
                     if not _record_model and not slot._active_fallback_model:
                         _canonical = _backfill_canonical_model(client, _provider_name)
                         if _canonical:
                             slot.model = _canonical
                             _record_model = _canonical
-                    if slot._active_fallback_model:
-                        # Blank while a fallback serves the turn: the pin would
-                        # bill the fallback's spend to a model that never
-                        # executed; model_source reports what actually ran.
-                        _record_model = ""
                     # Read context-window occupancy off the same `client`
                     # used above (mirrors _context_usage_payload's accessor
                     # pattern); read_context_tokens never raises.
@@ -8109,6 +8165,19 @@ async def _run_chat(
                     session_key,
                     elapsed_ms=_turn_elapsed_ms,
                     exhausted=_turn_exhausted,
+                    # The same usage object the persist call above is given, so
+                    # the row store and the instruments describe one turn's
+                    # NUMBERS identically.
+                    usage=event.usage,
+                    # Attribution, not billing: `_turn_model` is the id the
+                    # backend actually served (read_turn_model), so a turn a
+                    # fallback model served is attributed to the model that ran
+                    # rather than dropped from the split. The row deliberately
+                    # blanks that case instead, because billing a model that never
+                    # executed is a different kind of wrong. `_record_model` is the
+                    # fallback for a backend that reported no id.
+                    model=_turn_model or _record_model,
+                    provider=_provider_name,
                 )
                 if "timeout" in (event.stop_reason or ""):
                     # Hang-resilience series: attribute the CAUSE of a turn

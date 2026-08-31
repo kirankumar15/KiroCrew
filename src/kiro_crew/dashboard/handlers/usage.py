@@ -23,7 +23,12 @@ from kiro_crew.context_blocks import USER_LABEL
 from kiro_crew.hooks import validate_file_path
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import telemetry_channel_of
-from kiro_crew.metrics.turns import OUTCOME_UNCLASSIFIED, emit_turn_duration, turn_outcome
+from kiro_crew.metrics.turns import (
+    OUTCOME_UNCLASSIFIED,
+    emit_turn_duration,
+    emit_turn_usage,
+    turn_outcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1453,23 +1458,27 @@ async def persist_token_record_async(
     ``context_used`` / ``context_window`` / ``elapsed_ms`` / ``model_source``
     fields.
 
-    ALSO emits ``kirocrew.turn.duration``, and this is the only place that does.
-    Being the one call every dispatch surface already makes once per turn is
-    exactly why: the emit used to live in ``chat_runner`` beside the dashboard
-    turn loop, so cron, heartbeat, memory consolidation, subagents, task-runner
-    steps, workflow stages and every messaging channel were absent from turn
-    latency and fault rate entirely — and absent does not read as absent, it
-    reads as healthy. See :mod:`kiro_crew.metrics.turns`.
+    ALSO emits the per-turn OTEL family — ``kirocrew.turn.duration`` plus the
+    turn's usage (``kirocrew.turn.tokens`` and whichever of
+    ``kirocrew.turn.credits`` / ``kirocrew.turn.cost_usd`` the backend billed in)
+    — and this is the only place that does. Being the one call every dispatch
+    surface already makes once per turn is exactly why: the emit used to live in
+    ``chat_runner`` beside the dashboard turn loop, so cron, heartbeat, memory
+    consolidation, subagents, task-runner steps, workflow stages and every
+    messaging channel were absent from turn latency and fault rate entirely — and
+    absent does not read as absent, it reads as healthy. See
+    :mod:`kiro_crew.metrics.turns`.
 
-    The sample reuses the BUILT record's own ``duration_ms``, so the row store
-    and the histogram cannot disagree about one turn — the property the record
-    builder's docstring already claims and now enforces by construction rather
-    than by two call sites being handed the same variable.
+    Every sample reuses the BUILT record's own fields — ``duration_ms``, the
+    token counts, ``credits``/``cost``, and the RESOLVED ``model``/``provider`` —
+    so the row store and the metrics cannot disagree about one turn, the property
+    the record builder's docstring already claims and now enforces by
+    construction rather than by two call sites being handed the same variables.
 
-    ``emit_metric=False`` says the CALLER owns this turn's histogram sample. The
+    ``emit_metric=False`` says the CALLER owns this turn's samples. The
     dashboard passes it because its persist call sits behind a
     ``usage_has_billing`` gate: a turn that timed out having billed nothing
-    writes no row, and letting the row's absence swallow the sample would drop
+    writes no row, and letting the row's absence swallow the samples would drop
     exactly the faults ``fault_rate`` exists to count. It emits unconditionally
     itself instead, which is also how its ``stall_exhausted`` refinement reaches
     the histogram. Do NOT set this without emitting — the turn then goes
@@ -1507,15 +1516,22 @@ def _emit_turn_histogram(
     slot_key: str,
     event: object,
 ) -> None:
-    """Emit this turn's ``kirocrew.turn.duration`` sample from a built record.
+    """Emit this turn's OTEL samples from a built record.
 
-    Split out so the emit is one statement in the persist path and can be
-    asserted directly by a test without writing a row.
+    ``kirocrew.turn.duration`` plus the turn's usage family
+    (``kirocrew.turn.tokens`` and whichever of ``kirocrew.turn.credits`` /
+    ``kirocrew.turn.cost_usd`` the backend billed in). Split out so the emit is
+    one statement in the persist path and can be asserted directly by a test
+    without writing a row.
 
-    Reads the duration off the RECORD rather than recomputing it from
+    Reads every value off the RECORD rather than recomputing from
     ``event``/``elapsed_ms``: the builder already applies the
-    provider-reported-wins-else-wall-clock rule, and duplicating that logic here
-    is how the two would drift.
+    provider-reported-wins-else-wall-clock rule for the duration and already
+    coerces the usage fields, so duplicating either here is how the row store and
+    the metrics would come to disagree about one turn. ``model`` and ``provider``
+    come from the same place for the same reason — the record's ``model`` is the
+    RESOLVED one (``_resolve_model``), so the attribute names the model that ran
+    rather than the alias the caller asked for.
 
     An ABSENT ``stop_reason`` attribute and a ``None``/empty one mean different
     things and must not collapse. A bare ``TurnUsage`` has no such attribute and
@@ -1531,10 +1547,22 @@ def _emit_turn_histogram(
     _MISSING = object()
     stop = getattr(event, "stop_reason", _MISSING)
     outcome = OUTCOME_UNCLASSIFIED if stop is _MISSING else turn_outcome(stop)  # type: ignore[arg-type]  # noqa: E501
+    model = str(record.get("model") or "")
+    provider = str(record.get("provider") or "")
     emit_turn_duration(
         record.get("duration_ms"),
         session_key=slot_key,
         outcome=outcome,
+        model=model,
+        provider=provider,
+    )
+    emit_turn_usage(
+        input_tokens=record.get("input"),
+        output_tokens=record.get("output"),
+        credits=record.get("credits"),
+        cost_usd=record.get("cost"),
+        model=model,
+        provider=provider,
     )
 
 

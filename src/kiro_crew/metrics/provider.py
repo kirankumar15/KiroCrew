@@ -215,7 +215,9 @@ _WATCHDOG_IDLE_BUCKETS_MS: list[float] = [
 # fails when a histogram metric name in the source has no entry here — add the
 # instrument to this map when you add the metric. All values are ms — the
 # dashboard's generic aggregation reports every histogram under *_ms keys, so
-# a non-ms instrument would surface 1000x off there.
+# a non-ms instrument would surface 1000x off there. A histogram that is NOT a
+# duration therefore belongs in `_HISTOGRAM_BUCKETS_BY_UNIT` below, whose
+# instruments the dashboard reads under unit-neutral keys instead.
 _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.gateway.request.duration": _FAST_BUCKETS_MS,
     "kirocrew.db.query.duration": _FAST_BUCKETS_MS,
@@ -241,7 +243,75 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.gateway.boot.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.turn.duration": _TURN_BUCKETS_MS,
     "kirocrew.watchdog.idle.duration": _WATCHDOG_IDLE_BUCKETS_MS,
+    # Embedding queue wait + inference time. Both are ms and both predate this
+    # map; neither name ends in `.duration`, which is precisely why the guard
+    # test's old name-suffix scan could not see them and they have been running
+    # on OTEL's default 0..10000 boundaries. The guard now finds histograms by
+    # reading their emit calls, so they are registered here. _FAST_BUCKETS_MS
+    # because they behave like the other sub-ms-to-seconds work: a warm local
+    # embed is single-digit ms, a cold model load or a long batch reaches
+    # seconds.
+    "kirocrew.embed.queue_wait": _FAST_BUCKETS_MS,
+    "kirocrew.embed.inference": _FAST_BUCKETS_MS,
 }
+
+# Per-turn billed amount. Calibrated against 17,240 real per-turn credit rows
+# from a kiro-backend install: min 0.03, p10 0.076, p50 6.8, p90 53, p99 155,
+# max 658 — four and a half decades, so the array is one-bound-per-half-decade
+# rather than dense anywhere. The bottom bound sits BELOW the observed minimum
+# and the top two decades above the observed maximum, because a sample outside
+# the explicit range has its percentile floored at the nearest bound (the
+# overflow artifact `_HISTOGRAM_BUCKETS_MS` documents), and credit pricing is not
+# ours to hold still.
+_CREDIT_BUCKETS: list[float] = [
+    0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+    10, 25, 50, 100, 250, 500, 1000, 2500,
+]
+
+# The same shape in dollars, one decade lower: a claude_code turn bills
+# fractions of a cent at the low end and tens of dollars for a long tool-heavy
+# turn. This is the one array here with NO local calibration — the host these
+# bounds were sized on runs the kiro backend, so every `cost_usd` row it has is
+# zero (the two are mutually exclusive by the "whichever is non-zero" contract).
+# Sized from published per-token pricing against the observed token range
+# instead, and worth re-checking against real rows once a claude_code host
+# reports.
+_USD_BUCKETS: list[float] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+    0.5, 1, 2.5, 5, 10, 25, 50, 100,
+]
+
+# Non-duration histograms: instrument name -> boundaries, in the instrument's
+# OWN unit. A SEPARATE map from _HISTOGRAM_BUCKETS_MS on purpose — that map's
+# contract is "all values are ms", which the dashboard's generic aggregation
+# relies on when it reports every histogram under `*_ms` keys, and adding a
+# credit or a dollar amount to it would make both the contract and the reported
+# key a lie. `test_provider_bucket_views.py` guards the split in both
+# directions off the emitted `unit=`, NOT off the name suffix: nothing here is a
+# millisecond instrument, nothing there is anything else, and every histogram
+# instrument in the source must appear in exactly one of them. The suffix would
+# be the wrong test — `kirocrew.embed.queue_wait` and `.inference` above are ms
+# and do not carry it, which is the whole reason the guard reads units.
+#
+# The dashboard reads these two under unit-neutral keys (see
+# `handlers/telemetry.py`'s turn block), which is what keeps them out of the
+# `*_ms` surface.
+_HISTOGRAM_BUCKETS_BY_UNIT: dict[str, list[float]] = {
+    "kirocrew.turn.credits": _CREDIT_BUCKETS,
+    "kirocrew.turn.cost_usd": _USD_BUCKETS,
+}
+
+
+def histogram_bounds() -> dict[str, list[float]]:
+    """Every kirocrew histogram's explicit boundaries, ms and non-ms alike.
+
+    One mapping so the View list below has a single source, and so the guard test
+    can assert completeness over the whole instrument set rather than over the
+    duration family alone. The two maps are disjoint (asserted), so merge order
+    cannot hide an entry.
+    """
+    return {**_HISTOGRAM_BUCKETS_MS, **_HISTOGRAM_BUCKETS_BY_UNIT}
+
 
 _lock = threading.Lock()
 _recorder: Optional[MetricsRecorder] = None
@@ -415,19 +485,20 @@ def _build_recorder() -> _Build:
         provider = MeterProvider(
             metric_readers=started_readers,
             resource=Resource.create({"service.name": _SERVICE_NAME}),
-            # One View per instrument, from _HISTOGRAM_BUCKETS_MS. Deliberately
-            # NOT a catch-all `instrument_type=Histogram` View: the OTEL SDK
-            # applies every matching View, so a catch-all alongside these would
-            # publish each named instrument twice under one metric name with
-            # different bounds, and the telemetry aggregator merges same-length
-            # bucket arrays without comparing bounds — it would silently double
-            # the counts. See the completeness guard test.
+            # One View per instrument, from histogram_bounds() (the ms families
+            # plus the non-ms ones). Deliberately NOT a catch-all
+            # `instrument_type=Histogram` View: the OTEL SDK applies every
+            # matching View, so a catch-all alongside these would publish each
+            # named instrument twice under one metric name with different
+            # bounds, and the telemetry aggregator merges same-length bucket
+            # arrays without comparing bounds — it would silently double the
+            # counts. See the completeness guard test.
             views=[
                 View(
                     instrument_name=name,
                     aggregation=ExplicitBucketHistogramAggregation(bounds),
                 )
-                for name, bounds in _HISTOGRAM_BUCKETS_MS.items()
+                for name, bounds in histogram_bounds().items()
             ],
         )
         logger.info(
