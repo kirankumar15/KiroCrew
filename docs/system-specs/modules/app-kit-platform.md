@@ -702,6 +702,22 @@ flagged, selection falls back to a
 deterministic order (hero art, then verified publishers, then name), so the
 surface is never empty and never arbitrary.
 
+`stargazersCount` follows the same precedent, because it is a trust cue: only
+the official catalog's publish step may mint it (baked at publish for
+git-source entries from the GitHub API, bounded to the JS safe-integer range),
+and `_apply_trust_fields` strips it entirely from external rows — an external
+index self-reporting a count would render identically to a publisher-verified
+one, and a false trust cue is worse than none. Client-side the count enters
+through `official_catalog.inventory()` **alone**: the one projection where a
+row's identity (repository) and its count come from the same catalog entry.
+`annotate()` matches rows by name — a same-name seed row can pin a different
+repository, so it never overlays the count — and the cache-served
+`list_catalog_rows()` never carries it (the cache is agent-writable). The
+count is **frozen at publish time**: it refreshes only when the catalog
+republishes (each publish re-fetches; the content-digest revision changes
+with it), so it is a trust-scale indicator, not a live metric. Absence means
+"unknown" and renders nothing — never zero.
+
 Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
 `_DEFAULT_ON_BACKFILL`, `register_builtin_apps`, `backfill_default_on_builtins`),
 `agent.py::run_first_run_setup`, `apps/discovery.py::discover_builtin_apps`,
