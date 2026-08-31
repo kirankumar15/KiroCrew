@@ -69,6 +69,7 @@ import { useScrollManager } from './chat/useScrollManager'
 import { shouldPaginateOlder, canForkAtWindow, searchScopeIsLimited } from './chat/pagination'
 import EarlierMessagesBar from './chat/EarlierMessagesBar'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
+import { useBubbleVanishProbe } from '../hooks/useBubbleVanishProbe'
 import { addPendingFile, parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, hasExactRelMention, normalizeWindowsPath, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
 import { classifyDrop } from '../utils/dropClassify'
 import { makeRelative } from '../components/FilePickerMenu'
@@ -5878,6 +5879,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // option's doc and useVirtualChat.spacerLurch.test.tsx).
     streamingIndex: isStreaming && displayItems.length > 0 ? displayItems.length - 1 : undefined,
     onTopReached: handleTopReached,
+  })
+
+  // Opt-in diagnostic for the "recent bubbles briefly vanish" symptom (#7045):
+  // set localStorage.kirocrew_debug_bubble_probe = '1' and reload. Zero cost
+  // when off (no observer constructed). Placed right after the virtualizer so
+  // hook-call order stays stable and scrollerRef/messages/displayItems are all
+  // in scope.
+  useBubbleVanishProbe({
+    scrollerRef,
+    storeMessages: messages.length,
+    displayItems: displayItems.length,
   })
 
   // Single scroll controller wiring: expose the virtualizer's follow API to
