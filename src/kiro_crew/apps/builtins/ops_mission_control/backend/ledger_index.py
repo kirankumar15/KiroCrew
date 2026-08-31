@@ -173,7 +173,12 @@ def import_pending(store: Any, *, limit: int = MAX_PER_IMPORT) -> dict[str, int]
 
     if result["written"]:
         try:
-            result["embedded"] = int(store.backfill_missing_embeddings() or 0)
+            # pace=False: a caller AWAITS this (the ledger-hygiene route and its
+            # cron both block on the index step), so the bulk duty cycle would
+            # stretch a bounded few-hundred-row batch — plus any global backlog
+            # the sweep finds — across the whole response. Pacing exists for the
+            # unattended boot sweep, not for a request someone is holding open.
+            result["embedded"] = int(store.backfill_missing_embeddings(pace=False) or 0)
         except Exception:  # noqa: BLE001 — rows stay keyword-searchable if this fails
             logger.exception("ops-mission-control: embedding backfill failed")
         sel().log_api_access(
