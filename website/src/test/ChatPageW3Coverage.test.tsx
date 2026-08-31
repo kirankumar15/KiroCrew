@@ -235,7 +235,8 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 })
 
-import ChatPage, { renderUserContent, virtualKeyFor, messageRowKey } from '../pages/ChatPage'
+import ChatPage from '../pages/ChatPage'
+import { renderUserContent, virtualKeyFor, messageRowKey } from '../pages/chat/ChatPageMessageContent'
 
 // --- Fixtures ---------------------------------------------------------------
 
