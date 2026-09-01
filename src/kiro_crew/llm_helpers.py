@@ -30,6 +30,7 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_CALL,
     LLMEvent,
     LLMProvider,
+    resolve_billing_stats,
 )
 from kiro_crew.security import (
     is_denied,
@@ -1109,14 +1110,28 @@ def _billing_stats(provider: Any) -> Any:
     Returned as the object rather than a value so callers can compare identity:
     the runner installs a FRESH stats object as it begins a turn, which is what
     tells a completed turn apart from one that never started.
+
+    Each holder is read through :func:`resolve_billing_stats`, the one spelling
+    the wrappers use too: a provider's declared
+    :meth:`LLMProvider.billing_stats` wins, and the ``last_prompt_stats``
+    fallback keeps every holder that was found before the capability existed --
+    the raw ``AcpClient``, and the doubles that stand in for a runner. One
+    holder's broken read is skipped rather than abandoning the walk, so a faulty
+    wrapper cannot lose a turn whose billing a later node still carries.
     """
     try:
-        for node in _billing_stat_holders(provider):
-            stats = getattr(node, "last_prompt_stats", None)
-            if stats is not None:
-                return stats
+        holders = _billing_stat_holders(provider)
     except Exception:
-        logger.debug("billing stats lookup failed", exc_info=True)
+        logger.debug("billing stats holder walk failed", exc_info=True)
+        return None
+    for node in holders:
+        try:
+            stats = resolve_billing_stats(node)
+        except Exception:
+            logger.debug("billing stats read failed for one holder", exc_info=True)
+            continue
+        if stats is not None:
+            return stats
     return None
 
 
@@ -1257,13 +1272,18 @@ def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> 
 def _billing_stat_holders(provider: Any) -> "list[Any]":
     """Objects that may carry ``last_prompt_stats``, nearest wrapper first.
 
-    The turn-runner sits behind a different attribute per seam: the acp provider
-    keeps it on ``_client``, the session provider on ``_handle``, and the shared
-    background session hands non-kiro callers a thin adapter whose only link to
-    the runner is ``_sess.provider``. Walking all of them keeps a background turn
-    on the claude_code / bedrock seam from reporting 0 credits for a turn that
-    was billed. Bounded and identity-deduped so a self-referential wrapper chain
-    cannot loop.
+    The compatibility path behind :func:`_billing_stats`, and the lookup
+    :func:`_provider_label` still needs: the turn-runner sits behind a different
+    attribute per seam: the acp provider keeps it on ``_client``, the session
+    provider on ``_handle``, and the shared background session hands non-kiro
+    callers a thin adapter whose only link to the runner is ``_sess.provider``.
+    Walking all of them keeps a background turn on the claude_code / bedrock seam
+    from reporting 0 credits for a turn that was billed. Bounded and
+    identity-deduped so a self-referential wrapper chain cannot loop.
+
+    A name absent from this tuple is exactly how a new seam's spend went
+    unreported, which is why the billing read now prefers the provider's declared
+    :meth:`LLMProvider.billing_stats` and only falls back here.
     """
     out: list[Any] = []
     seen: set[int] = set()

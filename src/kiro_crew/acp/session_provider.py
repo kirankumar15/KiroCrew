@@ -370,6 +370,17 @@ class AcpSessionProvider(LLMProvider):
         """Return tokens used in the current context."""
         return self._handle.last_prompt_stats.context_used_tokens
 
+    def billing_stats(self) -> object | None:
+        """Live per-turn billing stats (public — see LLMProvider).
+
+        The same object ``last_prompt_stats`` exposes and the context accessors
+        above read; declaring it here is what makes the accounting path's read a
+        stated capability instead of a search for that attribute name. The handle
+        installs a fresh object as each turn begins, which is the identity the
+        accounting path compares against.
+        """
+        return self._handle.last_prompt_stats
+
     @property
     def session_id(self) -> str:
         """The ACP session ID."""

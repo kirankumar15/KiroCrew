@@ -33,6 +33,31 @@ from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
 
+def resolve_billing_stats(holder: object | None) -> object | None:
+    """The billing stats *holder* declares, else the ``last_prompt_stats`` it carries.
+
+    The single spelling of "read a turn's billing off this object", shared by the
+    accounting path and by every wrapper that forwards it, so a wrapper cannot
+    resolve the capability differently from the reader it feeds.
+
+    The declaration is resolved off the TYPE, not the instance: a class that
+    defines :meth:`LLMProvider.billing_stats` is stating the capability, whereas
+    an object that merely answers an attribute of that name may be a mock whose
+    auto-created child would masquerade as a stats object and shadow the real
+    billing. A holder that declares nothing -- or leaves the ABC default, which
+    answers ``None`` -- falls back to the ``last_prompt_stats`` the ACP runner
+    carries, so a holder found before the capability existed is still read.
+    """
+    if holder is None:
+        return None
+    seam = getattr(type(holder), "billing_stats", None)
+    if callable(seam):
+        declared = seam(holder)
+        if declared is not None:
+            return declared
+    return getattr(holder, "last_prompt_stats", None)
+
+
 class LLMProvider(ABC):
     """Abstract LLM backend."""
 
@@ -205,6 +230,36 @@ class LLMProvider(ABC):
         real values. Base returns (None, None) which disables abort push.
         """
         return (None, None)
+
+    def billing_stats(self) -> object | None:
+        """The live per-turn billing stats object, or None when unmetered.
+
+        Declared here so what a turn COST is a stated provider capability, like
+        the context accessors above, instead of an attribute name the accounting
+        path has to guess. Surfaces that dispatch without an ``EVENT_COMPLETE``
+        in hand -- cron, heartbeat, autonudge, workflows, the task runner --
+        recover the turn's spend through ``llm_helpers.provider_last_turn_usage``,
+        which otherwise finds it only by walking the private attributes
+        ``_client`` / ``_handle`` / ``_sess`` / ``provider`` for a
+        ``last_prompt_stats``. A provider that links to its turn-runner under any
+        other name is not found by that walk: the read yields empty usage, the
+        ``usage_has_billing`` gate reads that as "nothing to record", and the
+        spend never reaches the usage store -- absent from the dashboard while
+        the account balance moves, with no error raised anywhere.
+
+        Return the stats OBJECT, not a value. The accounting path compares
+        identity to tell a turn that ran from one whose dispatch failed while a
+        previous, already-recorded turn's stats were still installed, so a
+        provider must install a fresh object as each turn begins (as the ACP
+        runner does) for that comparison to hold.
+
+        The object need only carry the billing: ``to_turn_usage()`` is preferred
+        when it offers one -- that is the single source of truth for every
+        dimension a seam bills on -- and a ``credits`` attribute is read
+        otherwise. Default None means "this backend reports no per-turn
+        billing", so an unmetered provider needs no override.
+        """
+        return None
 
     # ── Turn-control and capability surface (harness-parity H14) ──
     # The session, shutdown-drain, steer, and dashboard layers read these off a

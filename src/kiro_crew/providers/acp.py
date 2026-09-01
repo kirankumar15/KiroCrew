@@ -51,6 +51,7 @@ from kiro_crew.providers.base import (
     CancelOutcome,
     LLMEvent,
     LLMProvider,
+    resolve_billing_stats,
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 
@@ -1284,6 +1285,21 @@ class AcpProvider(LLMProvider):
 
     def context_used_tokens(self) -> int:
         return self._client.last_prompt_stats.context_used_tokens
+
+    def billing_stats(self) -> object | None:
+        """Live per-turn billing stats (public — see LLMProvider).
+
+        Forwards the inner client's own DECLARATION rather than reading an
+        attribute off it: this provider wraps whichever client the backend
+        installs (a raw ``AcpClient`` for claude / pre-startup, an
+        ``AcpSessionProvider`` after kiro startup replaces the placeholder), and
+        forwarding the capability is what keeps the wrapper from re-introducing
+        the attribute-name dependency the accounting path just shed. Resolved
+        through the shared helper so this forward cannot diverge from the reader
+        it feeds, and per call because the placeholder client is replaced at
+        runtime startup.
+        """
+        return resolve_billing_stats(getattr(self, "_client", None))
 
     async def compact(self, context: str = "") -> None:
         """Trigger native /compact with optional context-preserving prompt."""
