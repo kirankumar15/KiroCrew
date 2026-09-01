@@ -64,6 +64,12 @@ gates the PR; if this skill and CI disagree, CI wins. What this rule adds is
 the worktree-specific gotchas (parallelism, mypy CI-parity, dist ordering),
 not a replacement gate list.
 
+This rule covers **running** the gate and reading its verdict. **Writing** the tests
+it runs — isolation, the five determinism classes, cross-platform traps, residue
+diagnosis, suite speed — is the **writing-tests** skill. Load that one when a test is
+yours to fix; this one stays out of it rather than carrying a second, shorter copy
+that would drift.
+
 Run from the worktree root:
 
 ```bash
@@ -106,14 +112,16 @@ than fixed; if it only fails on your branch, it's yours. Never label a failure
 "known flaky" without that main-vs-branch comparison.
 
 **A confirmed flake is a bug with a root cause, not noise to retry.** Do NOT add a
-rerun, lengthen a `sleep`, or relax an assertion. Read
-`docs/system-specs/common/testing-conventions.md` § Determinism for the five classes
-and the one correct fix for each: seed nondeterministic input, poll instead of
-sleeping, `MagicMock` for sync methods, `await` after `cancel()`, and assert a
-complexity property structurally (identical invocation trace at `n` and `2n`) rather
-than by a timed duration or a tight timed ratio. To find what is
-actually flaky rather than guessing, mine CI instead of the local suite (a real flake
-often will not reproduce on macOS at all):
+rerun, lengthen a `sleep`, or relax an assertion. Once a failure is yours, FIXING it
+is the **writing-tests** skill's concern, not this one — it carries the decision order
+over `docs/system-specs/common/testing-conventions.md` § Determinism, and four of the
+five classes have a fix that looks like the obvious one and is not. Do not act on a
+one-line summary of that list, here or anywhere: pick the class from the symptom
+first.
+
+What this rule keeps is the step before that — deciding whether a red is yours at
+all. To find what is actually flaky rather than guessing, mine CI instead of the
+local suite (a real flake often will not reproduce on macOS at all):
 
 ```bash
 gh run list --workflow=ci.yml --limit 250 --json databaseId,conclusion \
@@ -128,16 +136,12 @@ a ratchet/contract test failing on feature branches is a TRUE POSITIVE, not a fl
 The Windows shards fail far more than Linux, so expect timer-granularity and
 process-semantics causes there.
 
-**Suite speed: profile, don't guess.** At ~56.5k tests, per-test setup cost dominates
-any single slow test. Time one file with `pytest test/test_x.py -n0 -q --no-cov
---durations=10` and compare a candidate fix **back to back** on the same machine
-(`git stash`, run, pop, run), because a loaded host makes an absolute number
-meaningless.
-The recurring wins are an autouse fixture requesting an unused `tmp_path`, a real
-`git` repo rebuilt per test instead of `copytree`d from a session template, and a
-production poll the test never asserts on. After any speedup, mutate the covered
-production code and confirm the test still fails. Full method and measured numbers:
-`docs/system-specs/common/testing-conventions.md` § Keeping the suite fast.
+**Suite speed is not this rule's concern.** If a gate run is slow enough to be the
+problem, the method — profile rather than guess, compare candidates back to back on
+the same host, which fixture shapes actually pay off, and the mutation check that
+proves a faster test still tests — is **writing-tests** § Keep the parallel suite
+fast, over `docs/system-specs/common/testing-conventions.md` § Keeping the suite
+fast. This rule only tells you to run the gate and how to read its verdict.
 
 **mypy must reproduce CI, not just "run".** CI installs `-e ".[voice]" --group
 dev` (mypy pinned in `pyproject.toml` `[dependency-groups] dev`) and does NOT
