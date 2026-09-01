@@ -189,17 +189,24 @@ class TestSpawnListUsesTheSameFilter:
     def test_the_reserved_pair_has_one_definition(self) -> None:
         """Two rosters hid the same pair by respelling the literal. A behavioral test
         cannot see a re-duplication (both spellings behave alike), so this is a
-        source ratchet: the pair is spelled once, where the constant lives."""
+        source ratchet: the pair is spelled once, where the constant lives.
+
+        The spawn tools no longer name the set at all -- they inherit it as
+        ``visible_agent_names``' default -- so the ratchet also pins that default,
+        which is what makes the omission safe rather than accidental.
+        """
+        import inspect
         import pathlib
 
         assert sa.UNADVERTISED_AGENTS == frozenset({"kirocrew", "kirocrew-conductor"})
-        assert spawn_tools.UNADVERTISED_AGENTS is sa.UNADVERTISED_AGENTS
+        default = inspect.signature(sa.visible_agent_names).parameters["exclude"].default
+        assert default is sa.UNADVERTISED_AGENTS
         for module in (sa, spawn_tools):
             src = pathlib.Path(module.__file__).read_text(encoding="utf-8")
             expected = 1 if module is sa else 0
             assert src.count("kirocrew-conductor") == expected, (
-                f"{module.__name__} respells the reserved pair; import "
-                "subagent.UNADVERTISED_AGENTS instead"
+                f"{module.__name__} respells the reserved pair; call "
+                "subagent.visible_agent_names instead"
             )
 
 

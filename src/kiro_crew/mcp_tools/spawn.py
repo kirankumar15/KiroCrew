@@ -30,10 +30,9 @@ from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.subagent import UNADVERTISED_AGENTS, resolve_max_subagents
+from kiro_crew.subagent import resolve_max_subagents, visible_agent_names
 from kiro_crew.subagent_persistence import agent_dir_for_display
 from kiro_crew.validation import (
-    _AGENT_NAME_RE,
     MAX_MEDIUM_STRING,
     MAX_SHORT_STRING,
     SPAWN_CONTINUE_SCHEMA,
@@ -65,12 +64,15 @@ def _agent_roster_hint() -> str:
     this reading would reject an agent kiro-cli can load.
 
     Every name is matched against ``_AGENT_NAME_RE`` before it is rendered, then
-    redacted. The grammar is what makes this safe to put in front of a model: an
-    agent spec's ``name`` field is taken verbatim by discovery with no validation,
-    so a spec can declare a newline plus instruction-shaped text -- pure ASCII, and
-    an isascii check would pass it straight into every session's tool list. The
-    same grammar already gates the ``agent`` parameter in ``SPAWN_RUN_SCHEMA``, so
-    a name that fails it is one no caller could pass here anyway.
+    redacted, then the list is bounded -- all of it in
+    ``subagent.visible_agent_names``, shared with the refusal roster and
+    ``spawn_list`` so the filter cannot drift between them. The grammar is what
+    makes this safe to put in front of a model: an agent spec's ``name`` field is
+    taken verbatim by discovery with no validation, so a spec can declare a
+    newline plus instruction-shaped text -- pure ASCII, and an isascii check would
+    pass it straight into every session's tool list. The same grammar already
+    gates the ``agent`` parameter in ``SPAWN_RUN_SCHEMA``, so a name that fails it
+    is one no caller could pass here anyway.
 
     Skipped entirely when an event loop is running, because then this is NOT the
     stdio server: ``mcp_discovery._managed_tools_in_process`` imports this package
@@ -88,19 +90,20 @@ def _agent_roster_hint() -> str:
     else:
         return ""
     try:
-        names = [
-            redact(a.name)
-            for a in mcp_core.list_agents()
-            if a.name and _AGENT_NAME_RE.fullmatch(a.name) and a.name not in UNADVERTISED_AGENTS
-        ]
+        # Sorted by DECLARED name, before redaction, so the order matches the
+        # refusal roster's and a credential-shaped name is rewritten in place
+        # rather than re-sorted into a different slot.
+        shown, withheld = visible_agent_names(
+            sorted(a.name for a in mcp_core.list_agents() if a.name),
+            limit=_MAX_ROSTER_NAMES,
+        )
     except Exception:
         return ""  # never let a directory read break the tool advertisement
-    if not names:
+    if not shown:
         return ""
-    shown = sorted(names)[:_MAX_ROSTER_NAMES]
     hint = f" Valid names right now: {', '.join(shown)}"
-    if len(names) > len(shown):
-        hint += f" (+{len(names) - len(shown)} more)"
+    if withheld:
+        hint += f" (+{withheld} more)"
     return hint + "."
 
 
@@ -847,15 +850,19 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
             lines.append(
                 f"{a['id']}  [{status}]{err}{progress}{scope}  {_redact(a['task'])[:60]}"
             )
-    # Always append available agents (fresh read from disk). Same grammar filter as
-    # the two rosters above: this output is a tool RESULT, so it lands in the same
-    # model context, and a spec's ``name`` field arrives unvalidated.
+    # Always append available agents (fresh read from disk). Same grammar filter and
+    # redaction as the two rosters above, via the shared helper: this output is a
+    # tool RESULT, so it lands in the same model context, and a spec's ``name``
+    # field arrives unvalidated.
+    #
+    # Unbounded and ``exclude=()`` on purpose, and this is the one surface where
+    # that is right: both bounded rosters cap themselves and point the caller HERE
+    # ("call spawn_list", "which lists them all"), so withholding names from this
+    # listing would falsify what they promise. The reserved pair is not suggested
+    # elsewhere because it is reached by omitting ``agent`` -- but it is still a
+    # name the gateway accepts, so a full listing shows it.
     try:
-        names = [
-            _redact(a.name)
-            for a in mcp_core.list_agents()
-            if _AGENT_NAME_RE.fullmatch(a.name or "")
-        ]
+        names, _ = visible_agent_names((a.name or "" for a in mcp_core.list_agents()), exclude=())
         if names:
             lines.append(f"\nAvailable agents: {', '.join(names)}")
     except Exception:
