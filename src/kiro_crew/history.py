@@ -32,6 +32,7 @@ from kiro_crew.frontmatter import (  # noqa: F401 - facade re-exports
     frontmatter_value,
 )
 from kiro_crew.history_cache import (
+    _METADATA_CACHE_MAX,
     _TRANSCRIPT_CACHE_MAX,
     HistoryCacheCoordinator,
     _FileChangeCacheEntry,
@@ -1139,7 +1140,15 @@ class ConversationLog:
         #: invalidation generation and a warm hit requires both fields to
         #: match, so a preserved-mtime metadata edit through another
         #: instance (whose pops cannot reach this cache) still unhits.
-        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(cache_max)
+        #:
+        #: Sized by ``_METADATA_CACHE_MAX``, NOT ``cache_max``: this memo holds one
+        #: parsed first line per session rather than a transcript window, and
+        #: ``list_sessions`` reads it in a whole-directory cyclic scan that an LRU
+        #: smaller than the corpus cannot hit. Same reasoning the search budgets
+        #: already use to decline that knob. Deliberately not overridable: a test
+        #: that needs a small bound assigns ``_meta_cache`` directly rather than
+        #: adding a constructor parameter no product caller uses.
+        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(_METADATA_CACHE_MAX)
         #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session

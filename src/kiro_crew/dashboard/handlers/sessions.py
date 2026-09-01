@@ -1261,7 +1261,13 @@ async def api_session_detail(request: web.Request) -> web.Response:
     key = request.match_info["key"]
     if not state.conversation_log:
         return web.json_response([])
-    return web.json_response(state.conversation_log.read_messages(key))
+    # read_messages() opens and parses the transcript on a cache miss, which for
+    # the multi-MB sessions a long-lived store accumulates is 100-300 ms of
+    # blocking file IO — on the event loop, stalling every other request. Off the
+    # loop, like every other conversation_log read in this module (list_sessions,
+    # get_metadata, session_mtime, search_sessions, delete_session).
+    messages = await asyncio.to_thread(state.conversation_log.read_messages, key)
+    return web.json_response(messages)
 
 
 async def api_session_delete(request: web.Request) -> web.Response:
