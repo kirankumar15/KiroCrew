@@ -61,7 +61,7 @@ from kiro_crew.project_scope import (
     project_scope_satisfied,
     scope_is_admissible,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact_and_truncate
 from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES, normalize_lesson_category
 
 # Consolidation caps live in vector_memory_constants (a light module with no
@@ -1818,8 +1818,7 @@ class VectorMemoryStore:
             # is surfaced verbatim on the dashboard (/api/memory/events -> get_events).
             # Scrub exfiltration URLs + credentials before persisting the audit
             # snippet so poisoned text can't smuggle secrets onto that surface.
-            safe_snippet, _ = redact_exfiltration_urls(text[:200])
-            safe_snippet, _ = redact_credentials(safe_snippet)
+            safe_snippet = redact_and_truncate(text, 200)
             self._log_event(
                 SemanticRejectCode.INJECTION.value,
                 "episodic",

@@ -229,6 +229,7 @@ from kiro_crew.security import (
     StreamRedactor,
     is_sensitive_path,
     oauth_url_contains_credential,
+    redact_and_truncate,
     redact_credentials,
     redact_exfiltration_urls,
 )
@@ -1853,10 +1854,9 @@ def _native_subagent_sync(state, slot, subagents, tracker, card_output=None) -> 
         if sid not in tracker:
             agent, _ = redact_exfiltration_urls(str(sub.get("role") or sub.get("agentName") or ""))
             agent, _ = redact_credentials(agent)
-            task, _ = redact_exfiltration_urls(
-                str(sub.get("initialQuery") or sub.get("sessionName") or "")[:2000]
+            task = redact_and_truncate(
+                str(sub.get("initialQuery") or sub.get("sessionName") or ""), 2000
             )
-            task, _ = redact_credentials(task)
             # Skip cards with empty task entirely — kiro-cli sometimes emits
             # list_update notifications where initialQuery/sessionName are both
             # empty. Showing an Activity card with no meaningful input is
@@ -2614,18 +2614,20 @@ async def _deliver_cross_surface_user_message(
 def _prepare_mirror_msg(raw_user_message: str) -> str:
     """Prepare a user message for the cross-surface / Slack mirror echo.
 
-    Truncates first, then redacts through the canonical ``redact_via_context``
-    egress shim so a loaded companion's extra credential/token regexes apply.
-    The shim's standalone fallback is the OSS baseline ``security.redact``, so a
-    standalone host keeps the previous redaction behaviour.
+    Redacts through the canonical ``redact_via_context`` egress shim over the
+    FULL text, then truncates — bounding first can cut a credential at the
+    boundary into fragments no redaction regex matches, so it would escape into
+    the mirrored echo. The shim's standalone fallback is the OSS baseline
+    ``security.redact``, so a standalone host keeps the previous redaction
+    behaviour.
 
     Scanned in DISPLAY form as well, like the assistant leg above and the Slack
     chokepoint: this echo goes to a channel without passing a renderer, and a
     credential the user typed with markdown between its halves is whole once the
     client renders the markup away.
     """
-    safe, _ = redact_for_display((raw_user_message or "")[:500], redact_via_context)
-    return safe
+    safe, _ = redact_for_display(raw_user_message or "", redact_via_context)
+    return safe[:500]
 
 
 def _flush_segment(
@@ -6633,22 +6635,31 @@ async def _run_chat(
                 _nat_card_r = (
                     _native_tc_card.get(event.tool_call_id) if event.tool_call_id else None
                 )
+                # Redact the FULL output once, then bound each consumer's copy
+                # (the native card's 4000 and the PostToolUse hook's 2000):
+                # bounding first can cut a credential at the boundary into
+                # fragments no redaction regex matches, and sharing the pass
+                # keeps the full-text cost single.
+                _redacted_out, _ = redact_exfiltration_urls(_out)
+                _redacted_out, _ = redact_credentials(_redacted_out)
                 if (
                     _nat_card_r
                     and event.tool_output
                     and event.tool_call_id not in _native_result_seen
                 ):
                     _native_result_seen.add(event.tool_call_id)
-                    _nout, _ = redact_exfiltration_urls(_out)
-                    _nout, _ = redact_credentials(_nout)
                     _native_card_output_len[_nat_card_r] = _append_native_output(
                         _native_card_output.setdefault(_nat_card_r, []),
-                        f"{_nout[:4000]}\n",
+                        f"{_redacted_out[:4000]}\n",
                         _native_card_output_len.get(_nat_card_r, 0),
                     )
                     state.broadcast_ws(
                         "subagent_chunk",
-                        {"id": _nat_card_r, "slot": slot.key, "text": f"{_nout[:4000]}\n"},
+                        {
+                            "id": _nat_card_r,
+                            "slot": slot.key,
+                            "text": f"{_redacted_out[:4000]}\n",
+                        },
                     )
                 # Mark the matching tool message as done so completion state
                 # survives page reload (persisted in message meta, replayed via SSE).
@@ -6669,12 +6680,11 @@ async def _run_chat(
                 # Fire PostToolUse hooks
                 _tool_name = _pending_tools.pop(event.tool_call_id, "")
                 try:
-                    _redacted_out, _ = redact_credentials(_out[:2000])
-                    _redacted_out, _ = redact_exfiltration_urls(_redacted_out)
+                    _redacted_out_bounded = _redacted_out[:2000]
                     await _fire(
                         HOOK_EVENT_POST_TOOL_USE,
                         tool_name=_tool_name,
-                        tool_response={"output": _redacted_out},
+                        tool_response={"output": _redacted_out_bounded},
                     )
                 except Exception:
                     logger.debug("PostToolUse hook error", exc_info=True)
@@ -7128,11 +7138,7 @@ async def _run_chat(
                             meta=(
                                 {
                                     "tool_call_id": event.tool_call_id,
-                                    "purpose": redact_credentials(
-                                        redact_exfiltration_urls((event.tool_purpose or "")[:200])[
-                                            0
-                                        ]
-                                    )[0],
+                                    "purpose": redact_and_truncate(event.tool_purpose or "", 200),
                                 }
                                 if event.tool_call_id
                                 else None
@@ -8454,8 +8460,7 @@ async def _run_chat(
             # on turn 1 with zero tool calls and no visible output usually points
             # at what we PREPENDED (persona / injected context / replay), not the
             # user's text; log the redacted prompt head + turn shape at WARNING.
-            _refusal_head, _ = redact_exfiltration_urls(full_message[:600])
-            _refusal_head, _ = redact_credentials(_refusal_head)
+            _refusal_head = redact_and_truncate(full_message, 600)
             logger.warning(
                 "Model refusal for slot %s — not retrying "
                 "[is_new=%s resumed=%s tool_calls=%d visible_output=%s "

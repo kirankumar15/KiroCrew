@@ -238,7 +238,12 @@ from kiro_crew.platform.update_governance import (
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import flush_breadcrumb_writes, safety_override
 from kiro_crew.sandbox import ensure_agents_slice_limits, warm_backend
-from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    redact,
+    redact_and_truncate,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel
 from kiro_crew.service.common import restart_command_hint
 from kiro_crew.session import HEARTBEAT_KEY, SessionManager
@@ -5276,10 +5281,12 @@ class GatewayOrchestrator:
             # Only notify when task is complete — suppress delivery for
             # incomplete tasks (HEARTBEAT_KEEP) to avoid spamming every cycle.
             if is_keep_response(result_safe):
-                logger.info("Heartbeat task incomplete, suppressing delivery: %s", task_text[:80])
+                logger.info(
+                    "Heartbeat task incomplete, suppressing delivery: %s",
+                    redact_and_truncate(task_text, 80),
+                )
             else:
-                task_safe, _ = redact_exfiltration_urls(task_text[:100])
-                task_safe, _ = redact_credentials(task_safe)
+                task_safe = redact_and_truncate(task_text, 100)
                 await self._deliver_result(
                     "💓 Heartbeat",
                     task_safe,
@@ -7669,8 +7676,7 @@ class GatewayOrchestrator:
                 # Show error in UI + queue for LLM context on next turn.
                 slot = self.dashboard_state.get_slot(slot_name)
                 if slot:
-                    task_preview, _ = redact_exfiltration_urls((info.task or "")[:100])
-                    task_preview, _ = redact_credentials(task_preview)
+                    task_preview = redact_and_truncate(info.task or "", 100)
                     error_text, _ = redact_exfiltration_urls(extra.get("error", "timed out"))
                     error_text, _ = redact_credentials(error_text)
                     # The visible transcript card must state the run's real

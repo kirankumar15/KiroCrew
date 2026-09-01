@@ -1003,6 +1003,15 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
     tool_use_id = update.get("toolCallId", "")
     if not tool_use_id:
         return None
+    # Parts are collected RAW and redaction runs once over their JOIN, before
+    # the single 8000-char bound. Both orderings matter: bounding first can
+    # split a credential at a cut into fragments no redaction regex matches,
+    # and redacting per part would blind the multi-line PEM pattern
+    # (``BEGIN ... [\s\S]*? END``) to a key whose header and footer arrive in
+    # DIFFERENT parts — only the combined text shows such a secret whole. The
+    # former per-part 4000 cut is deliberately gone: applied before redaction
+    # it IS this defect class, and it cannot be reconstructed afterwards, so
+    # the final head cut is the one bound.
     output_parts: list[str] = []
     # Path 1: content blocks (mid-stream).
     content = update.get("content")
@@ -1014,7 +1023,7 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
             if isinstance(inner, dict) and inner.get("type") == "text":
                 text = inner.get("text", "")
                 if text:
-                    output_parts.append(str(text)[:4000])
+                    output_parts.append(str(text))
     # Path 2: rawOutput (status=completed) fallback.
     if not output_parts:
         raw_output = update.get("rawOutput")
@@ -1025,22 +1034,22 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
                     if not isinstance(item, dict):
                         continue
                     if "Text" in item and item.get("Text"):
-                        output_parts.append(str(item["Text"])[:4000])
+                        output_parts.append(str(item["Text"]))
                         continue
                     j = item.get("Json")
                     if isinstance(j, dict):
                         if "stdout" in j and j.get("stdout"):
-                            output_parts.append(str(j["stdout"])[:4000])
+                            output_parts.append(str(j["stdout"]))
                         else:
                             _mcp_text = _mcp_content_text(j)
                             if _mcp_text is not None:
-                                output_parts.append(_mcp_text[:4000])
+                                output_parts.append(_mcp_text)
                             else:
-                                output_parts.append(json.dumps(j, default=str)[:4000])
+                                output_parts.append(json.dumps(j, default=str))
     if not output_parts:
         return None
     joined = "\n".join(output_parts)
-    final_output = _redact(joined[:8000])
+    final_output = _redact(joined)[:8000]
     # An MCP App render marker lives at offset 0 of its own text part, but the
     # 8000-char join cut is applied to the CONCATENATION of all parts: when the
     # marker part is preceded by other (up to 4000-char) parts, its offset in

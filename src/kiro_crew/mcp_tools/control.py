@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 from kiro_crew import mcp_core, platform_compat, session_directive
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact_and_truncate, redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.validation import (
     ASK_QUESTION_SCHEMA,
@@ -538,8 +538,14 @@ def task_run(name: str, args: dict[str, Any]) -> str:
     if d.get("error"):
         return f"Error: {d['error']}"
 
-    safe_label, _ = redact_exfiltration_urls(task_name or spec[:80])
-    safe_label, _ = redact_credentials(safe_label)
+    # ``task_name`` is used whole; only the ``spec`` fallback is bounded, so
+    # only that branch needs the redact-then-bound composition — bounding first
+    # can cut a credential into fragments no redaction regex matches.
+    if task_name:
+        safe_label, _ = redact_exfiltration_urls(task_name)
+        safe_label, _ = redact_credentials(safe_label)
+    else:
+        safe_label = redact_and_truncate(spec, 80)
     return f"Task runner started: {safe_label}"
 
 

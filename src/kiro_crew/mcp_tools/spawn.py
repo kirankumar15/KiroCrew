@@ -960,13 +960,13 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             sa_body["cwd"] = cwd
         d = mcp_core._post("/api/spawn", sa_body)
         if d.get("error"):
-            sa_errors.append(f"{_redact_sa(prompt[:60])}: {_redact_sa(d['error'])}")
+            sa_errors.append(f"{_redact_sa(prompt)[:60]}: {_redact_sa(d['error'])}")
         else:
             aid = d.get("id", "")
             if aid:
                 sa_ids.append(aid)
             else:
-                sa_errors.append(f"{_redact_sa(prompt[:60])}: spawn returned no agent id")
+                sa_errors.append(f"{_redact_sa(prompt)[:60]}: spawn returned no agent id")
 
     if not sa_ids and sa_errors:
         return "Error spawning sub-agents:\n" + "\n".join(f"  - {e}" for e in sa_errors)

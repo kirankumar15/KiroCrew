@@ -344,16 +344,19 @@ def build_inline_keyboard(options: list[str]) -> dict | None:
     A label is MODEL-authored text that Telegram renders, so it is a display sink
     like the answer body: the driver's byte-level scan can see a credential as
     broken that the rendered button shows whole. Scanned HERE because this is the
-    one place both callers pass through. Bounded work by construction -- at most
-    ``max_buttons`` labels of at most 64 chars -- so it stays on the loop.
+    one place both callers pass through. Each label is redacted WHOLE and bounded
+    to 64 chars only after the scan — cutting first can split a credential at the
+    boundary into fragments no redaction regex matches. Bounded work by
+    construction — at most ``max_buttons`` single-line labels — so it stays on
+    the loop.
     """
     if not options:
         return None
     buttons: list[list[dict]] = []
     row: list[dict] = []
     for i, opt in enumerate(options):
-        safe, _ = redact_for_display(opt[:64], _default_redactor)
-        row.append({"text": safe, "callback_data": f"opt:{i}"})
+        safe, _ = redact_for_display(opt, _default_redactor)
+        row.append({"text": safe[:64], "callback_data": f"opt:{i}"})
         if len(row) == 2:
             buttons.append(row)
             row = []

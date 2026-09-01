@@ -632,13 +632,18 @@ async def api_skills_discover_preview(request: web.Request) -> web.Response:
     # still installed intact regardless of this display cap.
     max_preview = 64 * 1024
     # Provider-sourced fields (including the full SKILL.md body) are
-    # attacker-controllable -- redact before returning to the dashboard.
+    # attacker-controllable -- redact before returning to the dashboard. The
+    # body is size-uncapped provider input, so its full-text redaction runs
+    # off-loop (no-blocking-call-on-event-loop); the display cap is applied to
+    # the REDACTED text, because capping first can cut a credential at the
+    # boundary into fragments no redaction regex matches.
+    safe_content = await asyncio.to_thread(_redact_external, content)
     return web.json_response({
         "description": _redact_external(meta.get("description", "")),
         "name": _redact_external(meta.get("name", "")),
         "license": _redact_external(meta.get("license", "")),
         "author": _redact_external(meta.get("author", "")),
-        "content": _redact_external(content[:max_preview]),
+        "content": safe_content[:max_preview],
         "files": [_redact_external(f) for f in files[:200]],
         "file_count": len(files),
     })

@@ -3240,8 +3240,11 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     # The Knowledge Library is an external surface (RAG/search), so even the
     # source name metadata must be redacted before ingestion — matching the
     # treatment _handle_to_artifact applies to its artifact name.
+    # Redact the question WHOLE, then bound: cutting first can split a
+    # credential at the 60-char boundary into fragments no redaction regex
+    # matches, leaking it into the Knowledge Library source name.
     name = (
-        f"Research: {_redact_finding({'v': row['question'][:60]})['v']}"
+        f"Research: {_redact_finding({'v': row['question']})['v'][:60]}"
         if row
         else f"Research: {cid}"
     )
