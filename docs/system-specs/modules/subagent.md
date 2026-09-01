@@ -624,6 +624,30 @@ Request: `{"task": "..."}`
 Response: `{"id": "abc123", "task": "...", "status": "spawned"}`
 Errors: 400 (missing task), 429 (capacity reached), 503 (subagents not available)
 
+**Typed rejections.** A rejection raised INSIDE `spawn()` answers 400 with a
+machine-readable `code` beside the advisory `error` prose (plus `counted: true` —
+see Wave liveness above): `agent_not_found` for a named-but-unknown agent,
+`spawn_rejected` for every other kind (empty task, low memory, cwd refusal,
+governance). `code` is the contract and `error` is advisory (RFC 9457 3.1.3),
+which is what lets the refusal sentence be reworded without breaking a client.
+The identifier is minted AT the decision — `subagent.AGENT_NOT_FOUND_CODE`,
+returned by `_validate_agent` — carried on `SubagentInfo.error_code`, and
+forwarded by the handler without being respelled there, so the value has exactly
+one spelling in the tree.
+
+`spawn_run` switches on that code for the wave short-circuit (#4842): once the
+gateway has refused an agent name, the remaining members of a wave sharing it are
+not re-posted. Fail-soft in both version directions — an old client still
+text-matches the unchanged prose, and a new client against a gateway that sends
+no `code` loses only the short-circuit (every member is dispatched and refused
+individually) and never refuses a name the gateway would have accepted. That
+asymmetry is why a missing code is safe here, and why a code is never used to
+REJECT a spawn.
+
+The request-validation errors (bad JSON, missing task, bad `approval_mode` /
+`batch_id`), the 429 capacity answer and the 503 are prose-only today; converting
+them is Track B work tracked by `error-code-baseline.json`.
+
 ### Handler keywords (instant, no LLM)
 
 User-typed `spawn <task>`, `bg <task>`, `spawn list`, `spawn status` are intercepted by the handler for instant execution.
