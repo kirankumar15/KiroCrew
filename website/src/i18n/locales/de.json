@@ -1022,7 +1022,11 @@
         "command": "Befehl",
         "setting": "Einstellung",
         "view": "Ansicht"
-      }
+      },
+      "placeholder_argument": "Wert eingeben…",
+      "argument_invalid": "Dieser Befehl akzeptiert diesen Wert nicht.",
+      "argument_withdrawn": "Dieser Befehl ist nicht mehr verfügbar.",
+      "will_send": "Wird gesendet"
     },
     "crewCompanion": {
       "accessory": {

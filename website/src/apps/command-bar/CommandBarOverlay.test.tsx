@@ -759,3 +759,312 @@ describe('CommandBarOverlay rows', () => {
     expect(src).toMatch(/px-3 py-2 cursor-pointer text-\[13px\]/)
   })
 })
+
+
+/**
+ * Commands contributed by an installed app — the seam that lets a launcher row live
+ * outside this repository.
+ *
+ * What is worth pinning here is not that a row renders. It is that the host stays in
+ * charge of a declaration it did not write: a malformed contribution is skipped
+ * rather than taking the Cmd+K gesture down for every app, an argument is checked
+ * against the app's own pattern BEFORE a session exists, and a command that sends
+ * its prompt shows the reader that prompt first.
+ */
+describe('CommandBarOverlay contributed commands', () => {
+  beforeEach(() => {
+    dispatch.mockReset()
+    navigate.mockReset()
+    sessionSearch.mockReset()
+    sessionSearch.mockResolvedValue([])
+    recentsSearch.mockReset()
+    recentsSearch.mockResolvedValue([])
+    enterInsertOrNewSession.mockReset()
+    newSessionWithToken.mockReset()
+    cycleTheme.mockReset()
+    storeState.dashboard = { slots: [], unreadSlots: [] }
+    storeState.chat = { slotStatusDetail: {}, activeSlot: null }
+    window.localStorage.clear()
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const LINK = 'https://github.com/kirodotdev/KiroCrew/pulls?q=is%3Aopen'
+
+  /** A well-formed argument-taking command, as an app would declare it. */
+  const APPROVE_ALL = {
+    id: 'approve-all',
+    title: 'Approve all PRs',
+    subtitle: 'Approve every pull request behind a link',
+    icon: 'Check',
+    keywords: ['pr', 'lgtm'],
+    prompt: 'Approve every pull request behind {argument}. Skip any I authored.',
+    autoSend: true,
+    argument: {
+      placeholder: 'Paste a GitHub link…',
+      hint: 'A PR search, a label, or a single pull request.',
+      kind: 'url',
+      hosts: ['github.com'],
+      patternError: 'Not a GitHub link.',
+    },
+  }
+
+  /** A command that needs nothing: activating it IS the action. */
+  const STANDUP = {
+    id: 'standup',
+    title: 'Write my standup',
+    prompt: 'Summarise what I did yesterday.',
+  }
+
+  const appWith = (commands: unknown, over: Record<string, unknown> = {}) => ({
+    name: 'pr-bulk-ops',
+    displayName: 'PR Bulk Ops',
+    enabled: true,
+    origin: 'registry',
+    manifest: { contributes: { commands } },
+    ...over,
+  })
+
+  /** Mount with the shared `['apps']` cache seeded, which is how the bar reads apps. */
+  function mountWithApps(apps: unknown[], onClose = vi.fn()) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], apps)
+    render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    return onClose
+  }
+
+  const optionByTitle = (re: RegExp) =>
+    screen.getAllByRole('option').find(el => re.test(el.textContent ?? '')) as HTMLElement
+
+  function enterCommand(title: RegExp) {
+    fireEvent.mouseDown(optionByTitle(title))
+    return screen.getByRole('combobox') as HTMLInputElement
+  }
+
+  it('renders a command an installed app contributed', () => {
+    mountWithApps([appWith([APPROVE_ALL])])
+    const row = optionByTitle(/Approve all PRs/)
+    expect(row).toBeTruthy()
+    // The app's own subtitle, so the row says which app put it there.
+    expect(row.textContent).toContain('Approve every pull request behind a link')
+  })
+
+  it('contributes nothing while the app is disabled', () => {
+    // The enable switch is the reader's control over the whole app; a row that still
+    // ran from a disabled app would make that switch a lie.
+    mountWithApps([appWith([APPROVE_ALL], { enabled: false })])
+    expect(optionByTitle(/Approve all PRs/)).toBeUndefined()
+  })
+
+  it('skips a malformed contribution without taking the launcher down', () => {
+    // A third party must not be able to break the Cmd+K gesture for every other app.
+    mountWithApps([
+      appWith([
+        { ...APPROVE_ALL, id: 'Approve_All' }, // id is not a kebab slug
+        { ...APPROVE_ALL, id: 'no-prompt', prompt: '' },
+        { ...APPROVE_ALL, id: 'bad-kind', argument: { ...APPROVE_ALL.argument, kind: 'regex' } },
+        { ...APPROVE_ALL, id: 'bad-hosts', argument: { kind: 'text', hosts: ['github.com'] } },
+        { ...APPROVE_ALL, id: 'orphan-token', argument: undefined },
+        STANDUP,
+      ]),
+    ])
+    // Every bad entry is gone; the good one in the same array still renders.
+    expect(optionByTitle(/Approve all PRs/)).toBeUndefined()
+    expect(optionByTitle(/Write my standup/)).toBeTruthy()
+    // And the builtin rows are untouched.
+    expect(optionByTitle(/New Session/)).toBeTruthy()
+  })
+
+  it('survives contributes.commands not being an array', () => {
+    mountWithApps([appWith({ approve: APPROVE_ALL })])
+    expect(optionByTitle(/New Session/)).toBeTruthy()
+  })
+
+  it('namespaces a contributed row so it cannot impersonate a builtin', () => {
+    // A contribution claiming the New Session id would otherwise inherit its
+    // frecency record and its place in the list.
+    mountWithApps([appWith([{ ...APPROVE_ALL, id: 'new-session' }])])
+    const rows = screen.getAllByRole('option').map(el => el.textContent ?? '')
+    expect(rows.filter(t => /New Session/.test(t))).toHaveLength(1)
+    expect(optionByTitle(/Approve all PRs/)).toBeTruthy()
+  })
+
+  it('does not lead the empty query with a command that needs an argument', () => {
+    // A launcher pre-highlights its first row, and a row that cannot act until it is
+    // given a value has nothing to offer a bar that just opened.
+    mountWithApps([appWith([APPROVE_ALL])])
+    expect(screen.getAllByRole('option')[0].textContent ?? '').not.toMatch(/Approve all PRs/)
+  })
+
+  it('the first Enter collects the argument instead of acting', () => {
+    resolvingDispatch()
+    mountWithApps([appWith([APPROVE_ALL])])
+    enterCommand(/Approve all PRs/)
+    expect(screen.queryAllByRole('option')).toHaveLength(0)
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('runs a command with no argument straight away', () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
+    mountWithApps([appWith([STANDUP])])
+    enterCommand(/Write my standup/)
+    expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+  })
+
+  it("refuses a value the app's own pattern rejects, creating nothing", async () => {
+    resolvingDispatch()
+    const onClose = mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: 'https://gitlab.com/g/p/-/merge_requests/1' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // The app supplies the message, because only the app knows what shape it wanted.
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Not a GitHub link.'))
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(onClose).not.toHaveBeenCalled()
+    expect(input.value).toBe('https://gitlab.com/g/p/-/merge_requests/1')
+  })
+
+  it('refuses to fire a command whose app was disabled while the field was open', async () => {
+    // The field stays open across an arbitrary pause -- the reader is pasting a link --
+    // and the app can be switched off from the Apps page in another tab meanwhile. The
+    // row disappears at once, but the command object captured when the field opened
+    // would not, so a snapshot-trusting submit would run the prompt of an app the
+    // reader had just disabled.
+    resolvingDispatch()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], [appWith([APPROVE_ALL])])
+    const onClose = vi.fn()
+    const view = render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+
+    // The app is disabled underneath the open argument field.
+    client.setQueryData(['apps'], [appWith([APPROVE_ALL], { enabled: false })])
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} />
+      </QueryClientProvider>,
+    )
+
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toContain('no longer available'),
+    )
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+  })
+
+  it('shows the resolved prompt before an auto-sending command fires', async () => {
+    // The consent mechanism for autoSend: app-authored text goes to an agent with
+    // tools as if the reader typed it, so the reader is shown the instruction with
+    // their own value already spliced in.
+    resolvingDispatch()
+    mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+    await waitFor(() => expect(screen.getByText(/Approve every pull request behind https/)).toBeTruthy())
+    expect(screen.getByText(/Skip any I authored/)).toBeTruthy()
+  })
+
+  it('withholds the preview until the value satisfies the pattern', () => {
+    // A half-built template would advertise text that is not what would be sent.
+    // Asserted on a phrase unique to the PROMPT: the subtitle shares its opening
+    // words, so a looser matcher is satisfied by copy that is always on screen.
+    resolvingDispatch()
+    mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: 'https://gitl' } })
+    expect(screen.queryByText(/Skip any I authored/)).toBeNull()
+  })
+
+  it('seeds the resolved prompt and sends it when the app asked to', async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
+    const onClose = mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-new' }))
+    const seeded = dispatch.mock.calls.map(c => c[0]).find(a => a?.type === 'setPendingInput')
+    expect(seeded.text).toBe(`Approve every pull request behind ${LINK}. Skip any I authored.`)
+    // `autoSend=1` and NOT `newSession=1`: the session already exists.
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/chat?autoSend=1'))
+    expect(onClose).toHaveBeenCalled()
+  })
+
+  it('leaves a non-auto-sending command in the composer', async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
+    mountWithApps([appWith([{ ...APPROVE_ALL, autoSend: false }])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/chat'))
+  })
+
+  it('Escape leaves the command before it closes the bar', () => {
+    resolvingDispatch()
+    const onClose = mountWithApps([appWith([APPROVE_ALL])])
+    enterCommand(/Approve all PRs/)
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
+    expect(onClose).toHaveBeenCalled()
+  })
+
+  it('Backspace on an empty field leaves the command too', () => {
+    resolvingDispatch()
+    const onClose = mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.keyDown(input, { key: 'Backspace' })
+    expect(onClose).not.toHaveBeenCalled()
+    expect(screen.getAllByRole('option').length).toBeGreaterThan(0)
+  })
+
+  it('refuses a second Enter while the first is still creating', () => {
+    let release: ((v: unknown) => void) | undefined
+    dispatch.mockReturnValue({ unwrap: () => new Promise(r => { release = r }) })
+    mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(dispatch.mock.calls.filter(c => c[0]?.type === 'createSlot')).toHaveLength(1)
+    release?.({ key: 'slot-new' })
+  })
+
+  it('seeds nothing when the bar is dismissed mid-create', async () => {
+    let release: ((v: unknown) => void) | undefined
+    dispatch.mockReturnValue({ unwrap: () => new Promise(r => { release = r }) })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], [appWith([APPROVE_ALL])])
+    const onClose = vi.fn()
+    const view = render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    fireEvent.mouseDown(optionByTitle(/Approve all PRs/))
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: LINK } })
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open={false} onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    release?.({ key: 'slot-new' })
+    await Promise.resolve()
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.anything() })
+    expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
+  })
+})

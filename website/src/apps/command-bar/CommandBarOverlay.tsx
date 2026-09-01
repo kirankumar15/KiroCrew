@@ -4,9 +4,11 @@ import { createPortal } from 'react-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowRight,
+  Check,
   Clock,
   Command,
   Cog,
+  GitMerge,
   Loader2,
   MessageSquare,
   MessageSquarePlus,
@@ -14,6 +16,7 @@ import {
   RotateCcw,
   Search,
   Send,
+  ScanEye,
   SunMoon,
   Terminal,
 } from 'lucide-react'
@@ -41,6 +44,12 @@ import { useLanguage } from '../../i18n/LanguageProvider'
 
 import { loadUsage, recordUse, type UsageMap } from './frecency'
 import { rankRootRows, type RankedRow, type RootGroup, type RootRow, type RootRowKind, type RowStatus } from './rootIndex'
+import {
+  argumentIsValid,
+  contributedCommands,
+  resolvePrompt,
+  type ContributedCommand,
+} from './contributedCommands'
 import { useImeGuard } from '../../hooks/useImeGuard'
 
 /**
@@ -199,6 +208,10 @@ function actionLabel(slot: Slot): string {
   switch (slot.tag) {
     case 'root':
       if (slot.row.kind === 'view') return i18nT('apps.commandBar.action_enter')
+      // A `prompt` row steps into a field rather than acting, so Enter is named for
+      // stepping in. Calling it "Run" would promise that this Enter approves or
+      // merges something, which is the one thing it must not be read as.
+      if (slot.row.kind === 'prompt') return i18nT('apps.commandBar.action_enter')
       if (slot.row.kind === 'navigate') return i18nT('apps.commandBar.action_open')
       return i18nT('apps.commandBar.action_run')
     case 'result':
@@ -268,6 +281,32 @@ const META_SEP = ' \u00B7 '
  */
 const ASK_SLOT_KEY = 'slot:ask'
 
+/**
+ * Glyphs a contributed command may name, and the fallback when it names none.
+ *
+ * An allowlist rather than a URL or inline SVG the app supplies, for two reasons
+ * that both matter more than the extra vocabulary: the root promises to issue no
+ * request, and a glyph that must be fetched breaks that promise on every open; and
+ * an app-supplied SVG is app-authored markup rendered inside the host's own
+ * surface. The set is small on purpose and grows by pull request, which is a cheap
+ * ask compared to either alternative.
+ */
+const CONTRIBUTED_ICONS: Record<string, ReactNode> = {
+  Check: <Check size={14} className="lucide-inline" />,
+  Command: <Command size={14} className="lucide-inline" />,
+  GitMerge: <GitMerge size={14} className="lucide-inline" />,
+  Package: <Package size={14} className="lucide-inline" />,
+  ScanEye: <ScanEye size={14} className="lucide-inline" />,
+  Search: <Search size={14} className="lucide-inline" />,
+  Send: <Send size={14} className="lucide-inline" />,
+  Terminal: <Terminal size={14} className="lucide-inline" />,
+}
+
+/** The named glyph, or the generic command one when the name is unknown. */
+function contributedIcon(name: string): ReactNode {
+  return CONTRIBUTED_ICONS[name] ?? <Terminal size={14} className="lucide-inline" />
+}
+
 export default function CommandBarOverlay({
   open,
   onClose,
@@ -282,6 +321,21 @@ export default function CommandBarOverlay({
   const [query, setQuery] = useState('')
   const [debounced, setDebounced] = useState('')
   const [scope, setScope] = useState<Scope>(null)
+  /**
+   * The contributed command whose ARGUMENT the field is currently collecting.
+   *
+   * A second navigation state beside `scope`, and deliberately not folded into it:
+   * a scope is a place to search, this is a question being asked, and the two
+   * differ in what Enter means. They share the rest of the contract — the chip
+   * naming where you are, Escape and Backspace stepping back out — so the sites
+   * below read `scope ?? argCommand` rather than growing a second copy of each.
+   *
+   * Holds the whole command rather than an id: it carries the placeholder, the
+   * pattern and the prompt template, and re-deriving those from the app list on
+   * every keystroke would let a mid-flight app disable change what the field the
+   * reader is typing into is about to run.
+   */
+  const [argCommand, setArgCommand] = useState<ContributedCommand | null>(null)
   const [selected, setSelected] = useState(0)
   const [usage, setUsage] = useState<UsageMap>(() => loadUsage())
   const [actionError, setActionError] = useState<string | null>(null)
@@ -350,6 +404,7 @@ export default function CommandBarOverlay({
     setQuery('')
     setDebounced('')
     setScope(null)
+    setArgCommand(null)
     setSelected(0)
     setUsage(loadUsage())
     setActionError(null)
@@ -384,6 +439,19 @@ export default function CommandBarOverlay({
   useEffect(() => {
     setActionError(null)
   }, [query])
+
+  /**
+   * Contributed commands by row id.
+   *
+   * The rows carry only what ranking needs; activation needs the prompt template,
+   * the argument spec and the autoSend flag, so it resolves the row back to its
+   * contribution here rather than the row model growing app-specific fields.
+   */
+  const commandById = useMemo(() => {
+    const map = new Map<string, ContributedCommand>()
+    for (const cmd of contributedCommands(apps ?? [])) map.set(cmd.id, cmd)
+    return map
+  }, [apps])
 
   const rootRows: RootRow[] = useMemo(() => {
     const rows: RootRow[] = []
@@ -462,6 +530,30 @@ export default function CommandBarOverlay({
         keywords: ['history', 'chat', 'conversation'],
       },
     )
+    // Commands contributed by installed apps. This is the seam that lets a row live
+    // outside this repository: the app declares the row and what it does, and the
+    // host renders and runs it. Nothing app-authored executes here.
+    for (const cmd of commandById.values()) {
+      rows.push({
+        id: cmd.id,
+        title: cmd.title,
+        // Falls back to the contributing app's name. A contributed row with no
+        // subtitle is otherwise indistinguishable from a builtin one, and "which
+        // app put this in my launcher" is the first thing a reader asks of a row
+        // they did not recognise.
+        subtitle: cmd.subtitle || cmd.appLabel,
+        group: 'commands',
+        kind: 'prompt',
+        prompt: cmd.id,
+        icon: contributedIcon(cmd.icon),
+        keywords: cmd.keywords,
+        // Derived, not declared: a command that needs an argument cannot act on an
+        // empty query, so it has nothing to offer a launcher that has just opened.
+        // Leaving this to the manifest would mean asking every app author to
+        // volunteer their row out of the first page, which none would.
+        idleDemote: cmd.argument !== null,
+      })
+    }
     for (const target of appNavTargets(apps ?? [])) {
       rows.push({
         id: `app:${target.name}`,
@@ -496,7 +588,7 @@ export default function CommandBarOverlay({
     // the tree without remounting it, which does not recompute a memo. Omitting it
     // would freeze these rows in whichever language the surface first resolved.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apps, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, unreadSlots])
+  }, [apps, commandById, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, unreadSlots])
 
   // The root ranks from the LIVE query, not the debounced one. Ranking is pure and
   // local, so there is nothing to throttle, and debouncing it would let a fast Enter
@@ -551,6 +643,81 @@ export default function CommandBarOverlay({
     inputRef.current?.focus()
   }, [])
 
+  /**
+   * Create a session, put `text` in it, and go there.
+   *
+   * ONE copy, shared by the ask row and the three bulk modes, because the ordering
+   * here is the whole correctness of the thing and a second copy would be a second
+   * place for it to rot: create without activating, take the claim, activate, seed,
+   * navigate — and re-check the claim after every await.
+   *
+   * A NEW session, never the active one's composer: `ChatPage` consumes
+   * `pendingInput` by REPLACING the slot's draft and persisting it, so seeding the
+   * current slot would destroy a half-written message. These rows also fire from
+   * anywhere in the dashboard, where the active session may be one the user last
+   * touched hours ago.
+   *
+   * `autoSend` is what separates a question from a command. The ask row hands over
+   * a sentence the user wrote and stops at a filled composer, so they can still
+   * edit it. A bulk mode's text is not theirs to edit — it is generated from a row
+   * they picked and a link they pasted, and the argument step was the deliberate
+   * act — so it sends.
+   *
+   * The steps are run here rather than through the shared `newSessionWithToken`
+   * because that helper is fire-and-forget: its failure path is a `console.error`,
+   * so a gateway that refuses the create would leave the bar closing on nothing and
+   * the user's text gone. Both callers carry something they cannot retype from
+   * memory, so the bar closes only once the session exists, and a rejection keeps
+   * it open with the field intact.
+   */
+  const seedNewSession = useCallback(
+    (pendingKey: string, text: string, failureLabel: string, autoSend: boolean) => {
+      const run = dialogRunRef.current
+      const owned = () => dialogRunRef.current === run
+      setPendingRow(pendingKey)
+      // `activate: false` is what makes the rest of this safe, and it exists for
+      // exactly this shape: the thunk creates the session WITHOUT stealing focus so a
+      // caller that must finish setting the slot up can do so before the user is able
+      // to type into it. Leaning on "create makes the new slot active" is only true at
+      // the instant it resolves -- and this callback can resolve long after the user
+      // has moved on, at which point the seed lands in whatever they moved to.
+      void dispatch(createSlot({ activate: false }))
+        .unwrap()
+        .then(
+          async slot => {
+            // The guard is released in `finally`, AFTER every await. Releasing it
+            // earlier leaves it open across the awaits, so a second Enter during a slow
+            // slot fetch starts a second create -- two sessions from one intent, which
+            // is the exact failure the guard exists to prevent.
+            try {
+              if (!owned()) return
+              // `switchSlot.pending` activates immediately, so the seed that follows
+              // lands in THIS slot; a failing detail fetch afterwards does not undo the
+              // activation, which is why its rejection is ignored rather than surfaced.
+              await dispatch(switchSlot(slot.key)).unwrap().catch(() => {})
+              // Re-checked: the switch is another await, and the bar is still
+              // dismissable across it.
+              if (!owned()) return
+              dispatch(setPendingInput(text))
+              // `autoSend=1` alone, never with `newSession=1`: the session already
+              // exists -- we just created and activated it -- and asking ChatPage to
+              // force a new one would land the text in a second, different session.
+              navigate(autoSend ? '/chat?autoSend=1' : '/chat')
+              onClose()
+            } finally {
+              setPendingRow(null)
+            }
+          },
+          () => {
+            setPendingRow(null)
+            if (!owned()) return
+            setActionError(i18nT('apps.commandBar.action_failed', { action: failureLabel }))
+          },
+        )
+    },
+    [dispatch, navigate, onClose],
+  )
+
   const activateRoot = useCallback(
     (row: RankedRow) => {
       // A second Enter while the first activation is still resolving would run the
@@ -562,6 +729,28 @@ export default function CommandBarOverlay({
         // Entering is the activation event: the engine's first query happens
         // here, not while the user was still typing in the root.
         enterScope((row.view as Scope) ?? null, '')
+        return
+      }
+      if (row.kind === 'prompt') {
+        const cmd = commandById.get(row.prompt ?? '')
+        // A row whose contribution is gone (the app was disabled while the bar was
+        // open) must do nothing rather than fall through to the `invoke` branch and
+        // silently close as if it had worked.
+        if (!cmd) return
+        if (!cmd.argument) {
+          // Nothing to collect, so this is the whole action: seed and go.
+          seedNewSession(cmd.id, cmd.prompt, cmd.title, cmd.autoSend)
+          return
+        }
+        // No work yet -- this row's operation is defined by a value the user has not
+        // given. The query is cleared because what they typed was the row's NAME, and
+        // leaving it in a field that now means "paste the link" would read as a value
+        // already supplied.
+        setArgCommand(cmd)
+        setQuery('')
+        setDebounced('')
+        setSelected(0)
+        inputRef.current?.focus()
         return
       }
       if (row.kind === 'navigate' && row.route) {
@@ -592,10 +781,15 @@ export default function CommandBarOverlay({
       }
       onClose()
     },
-    [enterScope, navigate, onClose, pendingRow, use],
+    [commandById, enterScope, navigate, onClose, pendingRow, seedNewSession, use],
   )
 
   const slots: Slot[] = useMemo(() => {
+    // The argument state lists nothing: there is one thing to do and the field is
+    // where it is done, so Enter belongs to the input rather than to a row. A
+    // zero-row state is already part of this surface's keyboard contract -- it is
+    // what moves the focus cue onto the field -- so this needs no new affordance.
+    if (argCommand) return []
     if (scope === 'sessions') {
       const engine = searchArmed ? scopedResults : recentRows
       const out: Slot[] = (engine ?? []).map(row => ({ key: row.id, tag: 'result' as const, row }))
@@ -626,7 +820,7 @@ export default function CommandBarOverlay({
       if (ranked.length === 0) out.push({ key: 'slot:recovery', tag: 'recovery' })
     }
     return out
-  }, [isError, isFetching, query, ranked, recentRows, scope, scopedResults, searchArmed])
+  }, [argCommand, isError, isFetching, query, ranked, recentRows, scope, scopedResults, searchArmed])
 
   const rowCount = slots.length
   /**
@@ -660,67 +854,15 @@ export default function CommandBarOverlay({
           enterScope('sessions', query)
           return
         case 'ask': {
-          // A NEW session, never the active one's composer: `ChatPage` consumes
-          // `pendingInput` by REPLACING the slot's draft and persisting it, so
-          // inserting here would destroy a half-written message the user had not sent.
-          // "Ask the agent" also fires from anywhere in the dashboard, where the
-          // active session may be one the user last touched hours ago.
-          //
-          // The three steps are run HERE rather than through the shared
-          // `newSessionWithToken` because that helper is fire-and-forget: its failure
-          // path is a `console.error`, so a gateway that refuses the create would
-          // leave the bar closing on nothing and the typed question gone. This row
-          // carries a whole sentence the user composed, so it closes only once the
-          // session exists, and a rejection keeps the bar open with the text still in
-          // the field -- the same contract the New Session row already honours.
+          // Stops at a FILLED composer rather than sending: the user wrote this
+          // sentence, so the last look at it is theirs.
           if (pendingRow) return
-          const text = query.trim()
-          const run = dialogRunRef.current
-          const owned = () => dialogRunRef.current === run
-          setPendingRow(ASK_SLOT_KEY)
-          // `activate: false` is what makes the rest of this safe, and it exists for
-          // exactly this shape: the thunk's own docs say it creates the session
-          // WITHOUT stealing focus so a caller that must finish setting the slot up
-          // can do so before the user is able to type into it. The previous form
-          // leaned on "create makes the new slot active", which is only true at the
-          // instant it resolves -- and this callback can resolve long after the user
-          // has moved on, at which point the seed lands in whatever they moved to.
-          // Nothing is activated until we have both the slot's key and our claim.
-          void dispatch(createSlot({ activate: false }))
-            .unwrap()
-            .then(
-              async slot => {
-                // The guard is released in `finally`, AFTER every await. Releasing it
-                // up here left it open across the switch, so a second Enter during a
-                // slow slot fetch started a second create -- two blank sessions from
-                // one intent, which is the exact failure the guard exists to prevent.
-                try {
-                  if (!owned()) return
-                  // `switchSlot.pending` activates immediately, so the seed that
-                  // follows lands in THIS slot; a failing detail fetch afterwards does
-                  // not undo the activation, which is why its rejection is ignored
-                  // rather than surfaced.
-                  await dispatch(switchSlot(slot.key)).unwrap().catch(() => {})
-                  // Re-checked: the switch is another await, and the bar is still
-                  // dismissable across it.
-                  if (!owned()) return
-                  dispatch(setPendingInput(text))
-                  navigate('/chat')
-                  onClose()
-                } finally {
-                  setPendingRow(null)
-                }
-              },
-              () => {
-                setPendingRow(null)
-                if (!owned()) return
-                setActionError(
-                  i18nT('apps.commandBar.action_failed', {
-                    action: i18nT('apps.commandBar.action_ask'),
-                  }),
-                )
-              },
-            )
+          seedNewSession(
+            ASK_SLOT_KEY,
+            query.trim(),
+            i18nT('apps.commandBar.action_ask'),
+            false,
+          )
           return
         }
         case 'recovery':
@@ -741,8 +883,42 @@ export default function CommandBarOverlay({
           return
       }
     },
-    [activateRoot, dispatch, enterScope, navigate, onClose, pendingRow, query, refetchSessions, slots],
+    [activateRoot, enterScope, navigate, onClose, pendingRow, query, refetchSessions, seedNewSession, slots],
   )
+
+  /**
+   * Enter in the argument state: check the value, then hand the command to a session.
+   *
+   * The check runs HERE, against the pattern the CONTRIBUTION declared, because the
+   * collected text is spliced into an instruction handed to an agent with tools. A
+   * command that writes somewhere must not be handed the last thing the reader
+   * happened to copy, and the field they are still looking at is the cheapest place
+   * in the system to refuse it. The app supplies the error message, since only the
+   * app knows what shape it wanted.
+   */
+  const submitArgument = useCallback(() => {
+    if (!argCommand || pendingRow) return
+    // Re-resolved from the CURRENT contributions rather than trusting the snapshot
+    // taken when the field opened. The field stays open across an arbitrary pause --
+    // the reader is pasting a link -- and `apps` can change underneath it: the app can
+    // be disabled or uninstalled from the Apps page in another tab, or by a gateway
+    // event. The row vanishes from the list immediately, but this captured object
+    // would not, so submitting would send the prompt of an app the reader had just
+    // switched off. Re-resolving also picks up an edited prompt or a narrowed matcher
+    // instead of acting on the version captured minutes ago.
+    const live = commandById.get(argCommand.id)
+    if (!live) {
+      setActionError(i18nT('apps.commandBar.argument_withdrawn'))
+      setArgCommand(null)
+      return
+    }
+    if (!argumentIsValid(live, query)) {
+      setActionError(live.argument?.patternError || i18nT('apps.commandBar.argument_invalid'))
+      return
+    }
+    setActionError(null)
+    seedNewSession(live.id, resolvePrompt(live, query), live.title, live.autoSend)
+  }, [argCommand, commandById, pendingRow, query, seedNewSession])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -755,21 +931,42 @@ export default function CommandBarOverlay({
       } else if (e.key === 'Enter') {
         // Only the Enter branch is claimed — arrow navigation stays untouched.
         if (!ime.claimEnter(e)) return
+        // In the argument state Enter belongs to the FIELD, not to a row: there are
+        // no rows, and what the user typed is the argument rather than a query.
+        if (argCommand) {
+          e.preventDefault()
+          submitArgument()
+          return
+        }
         activateIndex(selected)
-      } else if (e.key === 'Backspace' && query === '' && scope) {
+      } else if (e.key === 'Backspace' && query === '' && (scope || argCommand)) {
         // Leaving a scope is Backspace on an empty input — the same gesture that
-        // deletes a character, so it needs no separate key to learn.
+        // deletes a character, so it needs no separate key to learn. An argument
+        // state leaves the same way: it is a place the user stepped into, and
+        // abandoning the question must not also discard the whole bar.
         e.preventDefault()
         setScope(null)
+        setArgCommand(null)
+        setActionError(null)
         setSelected(0)
       }
     },
-    [activateIndex, onClose, query, rowCount, scope, selected],
+    [activateIndex, argCommand, ime, query, rowCount, scope, selected, submitArgument],
   )
 
   if (!open) return null
 
-  const scopeName = scope === 'sessions' ? i18nT('apps.commandBar.cmd_search_sessions') : ''
+  /**
+   * The chip naming where the user is: a scope, or the mode asking for a link.
+   *
+   * One label for both states so the breadcrumb, its Escape handler and its
+   * placeholder cannot disagree about which one is showing.
+   */
+  const navName = argCommand
+    ? argCommand.title
+    : scope === 'sessions'
+      ? i18nT('apps.commandBar.cmd_search_sessions')
+      : ''
   const listId = 'command-bar-list'
   const rowId = (i: number) => `command-bar-row-${i}`
 
@@ -820,7 +1017,7 @@ export default function CommandBarOverlay({
               )}
             </>
           ),
-          arrow: row.kind === 'view',
+          arrow: row.kind === 'view' || row.kind === 'prompt',
         }
       }
       case 'result': {
@@ -981,17 +1178,29 @@ export default function CommandBarOverlay({
             inputRef.current?.focus()
             return
           }
+          // Same for the argument state: the first Escape abandons the question, the
+          // second closes the bar. A mode entered by mistake must not cost the user
+          // the whole surface.
+          if (argCommand) {
+            setArgCommand(null)
+            setActionError(null)
+            setSelected(0)
+            inputRef.current?.focus()
+            return
+          }
           onClose()
         }}
       >
         <div className="flex items-center gap-2 px-3 py-2.5 border-b border-border">
           <Command size={15} className="lucide-inline text-muted shrink-0" />
-          {scope && (
+          {(scope || argCommand) && (
             <>
               <button
                 type="button"
                 onClick={() => {
                   setScope(null)
+                  setArgCommand(null)
+                  setActionError(null)
                   setSelected(0)
                   inputRef.current?.focus()
                 }}
@@ -1006,7 +1215,7 @@ export default function CommandBarOverlay({
                 // permanent box.
                 className="shrink-0 max-w-[40%] truncate text-[13px] text-text bg-transparent border-none p-0 cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-accent/40 rounded"
               >
-                {scopeName}
+                {navName}
               </button>
               <span aria-hidden className="shrink-0 text-muted select-none">
                 ›
@@ -1024,9 +1233,11 @@ export default function CommandBarOverlay({
             {...ime.bindComposition()}
             onKeyDown={onKeyDown}
             placeholder={
-              scope
-                ? i18nT('apps.commandBar.placeholder_sessions')
-                : i18nT('apps.commandBar.placeholder')
+              argCommand
+                ? argCommand.argument?.placeholder || i18nT('apps.commandBar.placeholder_argument')
+                : scope
+                  ? i18nT('apps.commandBar.placeholder_sessions')
+                  : i18nT('apps.commandBar.placeholder')
             }
             aria-label={i18nT('apps.commandBar.title')}
             // Selection stays on the input and is announced through
@@ -1089,6 +1300,33 @@ export default function CommandBarOverlay({
                   {i18nT('apps.commandBar.searching')}
                 </span>
               </>
+            ) : argCommand ? (
+              // The argument state's body. It has no rows by design, so this is not an
+              // empty state to apologise for -- it is the question, and the app's own
+              // hint says what answers it.
+              //
+              // The PROMPT PREVIEW is the consent mechanism for `autoSend`. A
+              // contributed command sends app-authored text to an agent with tools as
+              // if the reader had typed it; the reader picked the row and supplied the
+              // value, but had no way to see the instruction itself. Showing the
+              // resolved text — with the value already spliced in — is what makes the
+              // next Enter informed rather than merely deliberate. It appears only
+              // once the value satisfies the pattern, so it always shows what would
+              // actually be sent, never a half-built template.
+              <div role="status" className="px-3 py-4 text-[12px] text-muted space-y-2">
+                <p className="text-text">{argCommand.subtitle || argCommand.appLabel}</p>
+                {argCommand.argument?.hint && <p>{argCommand.argument.hint}</p>}
+                {argCommand.autoSend && argumentIsValid(argCommand, query) && query.trim() && (
+                  <div className="pt-1 space-y-1">
+                    <p className="text-[11px] uppercase tracking-wide">
+                      {i18nT('apps.commandBar.will_send')}
+                    </p>
+                    <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded border border-border bg-bg-hover/40 p-2 text-[11px] text-text">
+                      {resolvePrompt(argCommand, query)}
+                    </pre>
+                  </div>
+                )}
+              </div>
             ) : (
               // Every other state now carries rows of its own, so this is the one
               // case left: a corpus that is genuinely empty.
@@ -1135,6 +1373,26 @@ export default function CommandBarOverlay({
           <div className="flex items-center justify-end gap-2 px-3 py-1.5 border-t border-border text-[11px] text-muted">
             <span className="truncate">{actionLabel(slots[Math.min(selected, rowCount - 1)])}</span>
             <span className="shrink-0 px-1 rounded border border-border leading-4">{ENTER_KEY}</span>
+          </div>
+        )}
+        {/* The argument state has no row to name an action for, and it is the state
+            that most needs one: the verb here is "approve" or "merge", and it fires on
+            the next Enter. The spinner lives here for the same reason -- the work is
+            attached to the field rather than to a row, so there is nowhere else for it
+            to appear, and without it a slow create reads as a dead keypress. */}
+        {rowCount === 0 && argCommand && (
+          <div className="flex items-center justify-end gap-2 px-3 py-1.5 border-t border-border text-[11px] text-muted">
+            {pendingRow ? (
+              <>
+                <Loader2 size={12} className="lucide-inline animate-spin shrink-0" />
+                <span className="truncate">{i18nT('apps.commandBar.working')}</span>
+              </>
+            ) : (
+              <>
+                <span className="truncate">{argCommand.title}</span>
+                <span className="shrink-0 px-1 rounded border border-border leading-4">{ENTER_KEY}</span>
+              </>
+            )}
           </div>
         )}
       </div>

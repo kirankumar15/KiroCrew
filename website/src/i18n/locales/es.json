@@ -4733,7 +4733,11 @@
         "command": "Comando",
         "setting": "Ajuste",
         "view": "Vista"
-      }
+      },
+      "placeholder_argument": "Introduce un valor…",
+      "argument_invalid": "Este comando no acepta ese valor.",
+      "argument_withdrawn": "Ese comando ya no está disponible.",
+      "will_send": "Se enviará"
     },
     "awsControl": {
       "manifest": {

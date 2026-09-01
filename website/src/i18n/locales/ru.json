@@ -4811,7 +4811,11 @@
         "command": "Команда",
         "setting": "Настройка",
         "view": "Вид"
-      }
+      },
+      "placeholder_argument": "Введите значение…",
+      "argument_invalid": "Эта команда не принимает такое значение.",
+      "argument_withdrawn": "Эта команда больше недоступна.",
+      "will_send": "Будет отправлено"
     },
     "awsControl": {
       "manifest": {

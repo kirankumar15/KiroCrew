@@ -990,7 +990,11 @@
         "command": "コマンド",
         "setting": "設定",
         "view": "ビュー"
-      }
+      },
+      "placeholder_argument": "値を入力…",
+      "argument_invalid": "このコマンドはその値を受け付けません。",
+      "argument_withdrawn": "そのコマンドは利用できなくなりました。",
+      "will_send": "送信内容"
     },
     "crewCompanion": {
       "accessory": {

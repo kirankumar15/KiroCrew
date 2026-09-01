@@ -4577,7 +4577,11 @@
         "command": "命令",
         "setting": "设置",
         "view": "视图"
-      }
+      },
+      "placeholder_argument": "输入一个值…",
+      "argument_invalid": "这个命令不接受该值。",
+      "argument_withdrawn": "该命令已不可用。",
+      "will_send": "将发送"
     },
     "awsControl": {
       "manifest": {

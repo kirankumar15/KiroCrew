@@ -1106,6 +1106,321 @@ class NotificationsConfig:
         return errors
 
 
+# A contributed command's id keys the Command Bar row and its usage record, so the
+# grammar is the same narrow kebab slug the overlay registry uses -- no dots, no
+# path separators, no leading dash.
+_COMMAND_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+#: Longest accepted argument host allowlist. The list is scanned per keystroke, and
+#: one longer than this is a manifest bug rather than a real allowlist.
+_MAX_ARGUMENT_HOSTS = 20
+
+#: A literal hostname, optionally with a leading dot meaning "this domain or any
+#: subdomain of it". Fixed and host-owned: it is never built from manifest input.
+_HOST_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+#: Longest accepted row label, mirroring `MAX_TITLE` in `contributedCommands.ts`.
+_MAX_TITLE = 120
+
+#: Longest accepted prompt template. The prompt is sent to an agent as if the user
+#: typed it; a template past this length is a document, not a command.
+_MAX_PROMPT_TEMPLATE = 4000
+
+#: The placeholder a prompt template uses to interpolate the collected argument.
+ARGUMENT_TOKEN = "{argument}"  # noqa: S105 - a template placeholder, not a secret
+
+
+@dataclass
+class CommandArgument:
+    """The ONE value a contributed command collects before it can act.
+
+    Deliberately singular. Raycast-style multi-argument tokens are a real feature,
+    but every argument is another thing the reader must get right before a command
+    that writes somewhere fires, and one value covers the cases this contribution
+    point exists for (a link, a query, an identifier). A second argument is an
+    additive change to this class, not a rewrite of it.
+
+    The argument is checkable BEFORE the command runs -- the collected text is
+    spliced into an instruction handed to an agent with tools, so "anything the
+    reader pasted" is not an acceptable domain.
+
+    ``kind`` names one of a FIXED set of matchers the host implements. It is
+    deliberately not a regex, and that is the whole design of this field. An earlier
+    revision let the manifest ship its own ``pattern``; a regex is a small program,
+    and running a third party's program against the field on every keystroke, on the
+    thread that draws the launcher, is a hang the reader cannot escape -- ``^(a+)+$``
+    and ``^(a|aa)+$`` are both under ten characters and both exponential, and neither
+    Python nor JavaScript can interrupt a synchronous match. Fencing that off with
+    syntactic checks was attempted and abandoned: the checks can only ever recognize
+    shapes, so each one invites the next hostile pattern that it does not cover.
+
+    So the manifest DESCRIBES what it wants and the host decides how to check it.
+    ``url`` parses with the runtime's own URL parser (linear, no backtracking) and
+    then applies ``hosts``; ``text`` accepts any non-empty value. Both run in time
+    proportional to the input no matter what the manifest says. Adding a kind is a
+    change to this file -- which is exactly the point: the vocabulary is ours.
+
+    The cost is precision, and it is a real cost. A pattern could demand
+    ``/pull/<n>`` specifically; ``kind="url"`` with ``hosts=["github.com"]`` accepts
+    any URL on that host and leaves what the link DENOTES to the agent reading it.
+    That is the right split -- the host is the wrong place to encode another
+    product's URL taxonomy, and it cannot do so safely.
+    """
+
+    #: Matchers the host implements. Extending this is a deliberate host change.
+    KINDS = ("url", "text")
+
+    placeholder: str = ""
+    hint: str = ""
+    kind: str = "text"
+    hosts: list[str] = field(default_factory=list)
+    patternError: str = ""
+    #: Whether the source manifest carried the retired ``pattern`` key. Kept so
+    #: ``validate`` can refuse a stale-contract app loudly instead of silently
+    #: dropping an unknown key and running on the loosest matcher. Not serialized --
+    #: it describes the INPUT, not the contract.
+    saw_pattern: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        if self.placeholder:
+            d["placeholder"] = self.placeholder
+        if self.hint:
+            d["hint"] = self.hint
+        if self.kind:
+            d["kind"] = self.kind
+        if self.hosts:
+            d["hosts"] = list(self.hosts)
+        if self.patternError:
+            d["patternError"] = self.patternError
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CommandArgument:
+        hosts_raw = data.get("hosts", [])
+        return cls(
+            placeholder=str(data.get("placeholder", "")),
+            hint=str(data.get("hint", "")),
+            kind=str(data.get("kind", "text")),
+            hosts=[str(h).strip().lower() for h in hosts_raw if str(h).strip()]
+            if isinstance(hosts_raw, list)
+            else [],
+            patternError=str(data.get("patternError", "")),
+            saw_pattern="pattern" in data,
+        )
+
+
+@dataclass
+class CommandContribution:
+    """One command an app contributes to the host's Command Bar.
+
+    This is the seam that lets a command row live OUTSIDE this repository: the app
+    declares what the row says and what it does, and the host renders and runs it.
+    It is deliberately DECLARATIVE -- a title, an optional argument, and a prompt
+    template -- and carries no code. An app that could ship a function into the
+    launcher would be running third-party JavaScript inside the host's own
+    surface, on every keystroke, with the reader's session; declaring data the
+    host interprets is the same trade the overlay registry already makes by
+    resolving ``id`` against components compiled into the bundle rather than
+    loading one from the app.
+
+    ``prompt`` is the command's action: activating it opens a NEW session seeded
+    with this text. ``autoSend`` asks the host to send it immediately rather than
+    leaving it in the composer -- see the module spec for what the host shows the
+    reader before it does.
+
+    ``icon`` names a glyph from the host's own set. An arbitrary URL or inline SVG
+    is refused: the launcher is not a place to load remote images from, and a glyph
+    that must be fetched cannot render in a surface that promises to issue no
+    request.
+    """
+
+    id: str = ""
+    title: str = ""
+    subtitle: str = ""
+    icon: str = ""
+    keywords: list[str] = field(default_factory=list)
+    prompt: str = ""
+    autoSend: bool = False
+    argument: CommandArgument | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"id": self.id, "title": self.title, "prompt": self.prompt}
+        if self.subtitle:
+            d["subtitle"] = self.subtitle
+        if self.icon:
+            d["icon"] = self.icon
+        if self.keywords:
+            d["keywords"] = list(self.keywords)
+        if self.autoSend:
+            d["autoSend"] = True
+        if self.argument is not None:
+            arg_d = self.argument.to_dict()
+            if arg_d:
+                d["argument"] = arg_d
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CommandContribution:
+        arg_raw = data.get("argument")
+        keywords_raw = data.get("keywords", [])
+        return cls(
+            id=str(data.get("id", "")),
+            title=str(data.get("title", "")),
+            subtitle=str(data.get("subtitle", "")),
+            icon=str(data.get("icon", "")),
+            keywords=[str(k) for k in keywords_raw] if isinstance(keywords_raw, list) else [],
+            prompt=str(data.get("prompt", "")),
+            # Identity against the JSON boolean, NOT ``bool(...)``: every non-empty
+            # string is truthy, so ``"autoSend": "false"`` would coerce to True and
+            # then serialize back as ``true`` -- a manifest that reads as disabled
+            # silently enabling the one capability that sends text on the reader's
+            # behalf. Only the literal ``true`` turns it on.
+            autoSend=data.get("autoSend") is True,
+            argument=CommandArgument.from_dict(arg_raw) if isinstance(arg_raw, dict) else None,
+        )
+
+    def validate(self) -> list[str]:
+        errors: list[str] = []
+        where = f"contributes.commands[{self.id or '?'}]"
+        if not self.id:
+            errors.append("contributes.commands: entry missing id")
+        elif not _COMMAND_SLUG_RE.match(self.id):
+            errors.append(
+                f"{where}: id must be lowercase alphanumeric with dashes, got {self.id!r}"
+            )
+        if not self.title:
+            errors.append(f"{where}: missing title")
+        elif len(self.title) > _MAX_TITLE:
+            # Mirrors `MAX_TITLE` in `contributedCommands.ts`. Missing here originally,
+            # which meant an over-long title passed the manifest and was then dropped by
+            # the frontend -- the command vanished from the launcher with the app author
+            # having seen no error on install, the worst of both validators.
+            errors.append(
+                f"{where}: title exceeds {_MAX_TITLE} characters ({len(self.title)})"
+            )
+        if not self.prompt:
+            # A command with no prompt has no action. There is no other verb yet, so
+            # this is a broken row rather than a differently-shaped one.
+            errors.append(f"{where}: missing prompt")
+        elif len(self.prompt) > _MAX_PROMPT_TEMPLATE:
+            errors.append(
+                f"{where}: prompt exceeds {_MAX_PROMPT_TEMPLATE} characters "
+                f"({len(self.prompt)})"
+            )
+        interpolates = ARGUMENT_TOKEN in self.prompt
+        if self.argument is None:
+            if interpolates:
+                errors.append(
+                    f"{where}: prompt interpolates {ARGUMENT_TOKEN} but the command "
+                    "declares no argument"
+                )
+            if self.autoSend:
+                # The host's consent mechanism for autoSend is the resolved-prompt
+                # preview, and that preview lives in the ARGUMENT state. A command
+                # with no argument never enters it, so autoSend there would send
+                # app-authored text to a tool-enabled agent with nothing shown to the
+                # reader at all. Refused rather than silently downgraded, so the app
+                # author learns the rule instead of wondering why it did not fire.
+                errors.append(
+                    f"{where}: autoSend requires an argument -- the host shows the "
+                    "resolved prompt in the argument field before sending, and a "
+                    "command with no argument never reaches that step"
+                )
+        else:
+            if not interpolates:
+                # The reader is asked for a value the command then ignores -- always a
+                # mistake, and a confusing one, because the command still runs.
+                errors.append(
+                    f"{where}: declares an argument but the prompt never uses "
+                    f"{ARGUMENT_TOKEN}"
+                )
+            errors.extend(self._validate_matcher(where))
+        return errors
+
+    def _validate_matcher(self, where: str) -> list[str]:
+        errors: list[str] = []
+        arg = self.argument
+        if arg is None:
+            return errors
+        if arg.saw_pattern:
+            # An app written against the revision of this contract that accepted its
+            # own regex. Refused rather than migrated: `pattern` is an unknown key now,
+            # so ignoring it would leave the argument on the default `text` matcher --
+            # accepting ANY non-empty string -- while the app still declares autoSend
+            # and still believes its pattern is guarding the value. Failing loudly is
+            # the only outcome that does not quietly widen what reaches the agent.
+            errors.append(
+                f"{where}: argument.pattern is no longer accepted -- declare "
+                f"argument.kind ({', '.join(CommandArgument.KINDS)}) instead, because "
+                "the host implements the matcher and a manifest cannot supply one"
+            )
+        if arg.kind not in CommandArgument.KINDS:
+            errors.append(
+                f"{where}: argument.kind must be one of "
+                f"{', '.join(CommandArgument.KINDS)} (got {arg.kind!r})"
+            )
+        if arg.hosts and arg.kind != "url":
+            errors.append(f"{where}: argument.hosts applies only to kind 'url'")
+        if len(arg.hosts) > _MAX_ARGUMENT_HOSTS:
+            errors.append(
+                f"{where}: argument.hosts exceeds {_MAX_ARGUMENT_HOSTS} entries "
+                f"({len(arg.hosts)})"
+            )
+        for host in arg.hosts:
+            # A host is compared literally against the parsed URL's hostname, so
+            # anything that is not a hostname cannot match and is a manifest bug worth
+            # naming rather than silently never matching. A leading dot is allowed and
+            # means "this domain or any subdomain".
+            if not _HOST_RE.match(host):
+                errors.append(f"{where}: argument.hosts entry is not a hostname ({host!r})")
+        return errors
+
+
+@dataclass
+class Contributes:
+    """What an app adds to host surfaces it does not own.
+
+    Separate from ``ui`` on purpose: ``ui`` is where an app declares surfaces of
+    its OWN (a page, an overlay it supplies a component for), while a contribution
+    is a row inside a surface the host renders and controls. Keeping them apart is
+    what lets an app with no page, no bundle and no backend -- a manifest and a
+    skill -- still reach the launcher.
+    """
+
+    commands: list[CommandContribution] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        if self.commands:
+            d["commands"] = [c.to_dict() for c in self.commands]
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Contributes:
+        raw = data.get("commands", [])
+        return cls(
+            commands=[
+                CommandContribution.from_dict(c) for c in raw if isinstance(c, dict)
+            ]
+            if isinstance(raw, list)
+            else []
+        )
+
+    def validate(self) -> list[str]:
+        errors: list[str] = []
+        seen: set[str] = set()
+        for cmd in self.commands:
+            errors.extend(cmd.validate())
+            if cmd.id:
+                if cmd.id in seen:
+                    # Two rows with one id: the second silently wins the frecency
+                    # record and one of them becomes unreachable by usage.
+                    errors.append(f"contributes.commands: duplicate id {cmd.id!r}")
+                seen.add(cmd.id)
+        return errors
+
+
 _KNOWN_FIELDS = frozenset(
     {
         "name",
@@ -1132,6 +1447,7 @@ _KNOWN_FIELDS = frozenset(
         "dependencies",
         "publishProvider",
         "notifications",
+        "contributes",
     }
 )
 
@@ -1192,6 +1508,15 @@ class AppManifest:
 
     # --- Notifications (RFC local notification bus, Phase 2) ---
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+
+    # --- Contributions to host-owned surfaces ---
+    #
+    # Typed rather than left to ``extra``, even though an unknown top-level key
+    # already round-trips to the dashboard through ``extra``: a contribution that
+    # ends up as the text of an instruction sent to an agent has to be CHECKED, and
+    # ``extra`` is by definition the un-checked bucket. Being a known field is what
+    # makes ``validate()`` see it on every parse.
+    contributes: Contributes = field(default_factory=Contributes)
 
     # --- Discovery ---
     tags: list[str] = field(default_factory=list)
@@ -1335,6 +1660,9 @@ class AppManifest:
         # Notification channel validation (RFC Phase 2: 8-channel cap, kebab ids)
         errors.extend(self.notifications.validate())
 
+        # Contributed commands: ids, prompt/argument agreement, bounded anchored pattern.
+        errors.extend(self.contributes.validate())
+
         return errors
 
     def signing_payload(self) -> bytes:
@@ -1366,6 +1694,27 @@ class AppManifest:
             # command/script/env. Included only when non-empty so manifests
             # signed before crons existed keep producing the identical payload.
             body["crons"] = [c.to_dict() for c in self.crons]
+        if self.contributes.commands:
+            # A contributed command's `prompt` is sent to an agent with tools as if
+            # the reader typed it, and `autoSend` fires it without a further
+            # keystroke -- the same class of surface as a cron's `command`/`script`
+            # one clause up, and for the same reason: vetting bounds the SHAPE of a
+            # contribution, but only the signature authenticates PUBLISHER INTENT.
+            # Left out, a signed app's rows would be the one part of it an attacker
+            # could rewrite with the signature still verifying, and the reader's
+            # trust in the signature is precisely what would carry the tampered
+            # prompt into a session.
+            #
+            # `argument` rides along inside each entry's canonical to_dict(), which
+            # matters as much as the prompt: widening a matcher (`kind: url` with a
+            # host allowlist -> `text`) does not change a single visible character of
+            # the row, and it is what decides whether the value spliced into that
+            # prompt was checked at all.
+            #
+            # List order preserved, so reordering is a signature-relevant change.
+            # Included only when non-empty, so manifests signed before contributions
+            # existed keep producing the identical payload.
+            body["contributes"] = self.contributes.to_dict()
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     # -----------------------------------------------------------------
@@ -1424,6 +1773,9 @@ class AppManifest:
         notif_d = self.notifications.to_dict()
         if notif_d:
             d["notifications"] = notif_d
+        contrib_d = self.contributes.to_dict()
+        if contrib_d:
+            d["contributes"] = contrib_d
         if self.tags:
             d["tags"] = self.tags
         if self.jobFamilies:
@@ -1490,6 +1842,13 @@ class AppManifest:
             else NotificationsConfig()
         )
 
+        contrib_raw = data.get("contributes", {})
+        contributes = (
+            Contributes.from_dict(contrib_raw)
+            if isinstance(contrib_raw, dict)
+            else Contributes()
+        )
+
         return cls(
             name=str(data.get("name", "")),
             version=str(data.get("version", "")),
@@ -1517,6 +1876,7 @@ class AppManifest:
             platform=platform_cfg,
             publishProvider=publish_provider,
             notifications=notifications,
+            contributes=contributes,
             tags=[str(t) for t in data.get("tags", []) if t],
             jobFamilies=[str(j) for j in data.get("jobFamilies", []) if j],  # noqa: N815
             extra=extra,

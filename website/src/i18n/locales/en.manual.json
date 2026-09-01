@@ -1226,7 +1226,11 @@
         "command": "Command",
         "setting": "Setting",
         "view": "View"
-      }
+      },
+      "placeholder_argument": "Enter a value…",
+      "argument_invalid": "That value is not accepted by this command.",
+      "argument_withdrawn": "That command is no longer available.",
+      "will_send": "Will send"
     },
     "papyrus": {
       "workspace": {

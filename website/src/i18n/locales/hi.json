@@ -4655,7 +4655,11 @@
         "command": "कमांड",
         "setting": "सेटिंग",
         "view": "व्यू"
-      }
+      },
+      "placeholder_argument": "एक मान डालो…",
+      "argument_invalid": "यह कमांड उस मान को स्वीकार नहीं करता।",
+      "argument_withdrawn": "वह कमांड अब उपलब्ध नहीं है।",
+      "will_send": "भेजा जाएगा"
     },
     "awsControl": {
       "manifest": {

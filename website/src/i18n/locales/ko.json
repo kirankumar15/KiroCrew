@@ -990,7 +990,11 @@
         "command": "명령",
         "setting": "설정",
         "view": "보기"
-      }
+      },
+      "placeholder_argument": "값 입력…",
+      "argument_invalid": "이 명령은 해당 값을 허용하지 않습니다.",
+      "argument_withdrawn": "해당 명령을 더 이상 사용할 수 없습니다.",
+      "will_send": "보낼 내용"
     },
     "crewCompanion": {
       "accessory": {

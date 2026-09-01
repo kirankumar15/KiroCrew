@@ -4733,7 +4733,11 @@
         "command": "Comando",
         "setting": "Configuração",
         "view": "Visualização"
-      }
+      },
+      "placeholder_argument": "Digite um valor…",
+      "argument_invalid": "Este comando não aceita esse valor.",
+      "argument_withdrawn": "Esse comando já não está disponível.",
+      "will_send": "Será enviado"
     },
     "awsControl": {
       "manifest": {

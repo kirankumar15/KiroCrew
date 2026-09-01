@@ -29,6 +29,17 @@ export type RootRowKind =
   | 'navigate'
   /** Run a callback and close; never navigates. */
   | 'invoke'
+  /**
+   * Collect ONE argument inside the bar, then act on it.
+   *
+   * Distinct from `invoke` because activating it does no work: a row whose whole
+   * operation is defined by a value the user has not supplied yet cannot run on
+   * Enter, so activation enters an argument state and a second Enter is what acts.
+   * That second step is not friction to be optimized away — for a row that writes
+   * to somewhere shared, the argument IS the blast radius, and it is worth its own
+   * keystroke on a field the user is looking at.
+   */
+  | 'prompt'
 
 /**
  * The groups the root is allowed to show, in display order.
@@ -89,10 +100,32 @@ export interface RootRow {
   route?: string
   /** `view` rows: which scoped view to enter. */
   view?: string
+  /**
+   * `prompt` rows: id of the argument-taking mode this row enters.
+   *
+   * A plain string rather than a union of the modes that exist, so this module
+   * stays free of what any particular mode DOES — the caller declaring the row is
+   * the only place that needs to know, and it is the one that resolves this back
+   * to a mode when the argument is submitted.
+   */
+  prompt?: string
   /** For `invoke` rows: the work to run. A rejection is surfaced, never swallowed. */
   run?: () => Promise<unknown>
   /** Extra strings that should match but are not displayed (aliases, keywords). */
   keywords?: string[]
+  /**
+   * Sort this row to the END of its group while the query is EMPTY.
+   *
+   * The empty-query order is frecency, and an unused row scores zero — so the tie
+   * breaks alphabetically, which is a fine rule for rows that are equals and a bad
+   * one for rows that are not. A launcher opens with its first row selected, and
+   * "Approve all PRs" sorting above "New Session" on the letter A would make a bulk
+   * write the default thing Cmd+K offers.
+   *
+   * Only the IDLE order is affected: a row the user has actually typed toward ranks
+   * on its match like any other, which is the whole point of naming a command.
+   */
+  idleDemote?: boolean
 }
 
 /**
@@ -132,6 +165,16 @@ const FRECENCY_WEIGHT = 6
 
 /** Cap per group so no single group can push the others off the first page. */
 const PER_GROUP_LIMIT = 6
+
+/**
+ * Penalty applied to an `idleDemote` row while the query is empty.
+ *
+ * Sized to lose to a single real use, not to hide the row for good: one use scores
+ * `1 * FRECENCY_WEIGHT`, so a row the user actually reaches for climbs back out
+ * immediately. What this fixes is the COLD state, where every score is zero and the
+ * alphabet alone decides what a launcher opens on.
+ */
+const IDLE_DEMOTION = 1
 
 /**
  * Tighter cap for the settings group on an EMPTY query.
@@ -220,7 +263,11 @@ export function rankRootRows(
   for (const row of rows) {
     const boost = frecencyScore(usage[row.id], now) * FRECENCY_WEIGHT
     if (!q) {
-      ranked.push({ ...row, score: boost, indices: [], matchField: 'title' })
+      // Demotion is subtracted rather than applied as a sort key so a row the user
+      // DOES use can still climb: frecency is a positive boost, so habit eventually
+      // outweighs the penalty instead of being permanently capped under it.
+      const idle = row.idleDemote ? boost - IDLE_DEMOTION : boost
+      ranked.push({ ...row, score: idle, indices: [], matchField: 'title' })
       continue
     }
     const hit = bestFieldMatch(q, row)
