@@ -84,9 +84,11 @@ When a nonempty `Tick.epoch` changes, `irq.run` removes epoch-scoped alerts and
 open-window entries, then retains epoch-independent alerts and open-window
 entries. Check-derived observations must not survive a head change, or an old
 head can be reported as current. Conversation-derived observations must survive,
-or a head change replays already-reported discussion. The carried window receives
-a fresh start stamp: this preserves the pending delivery while ensuring a fresh
-head receives its full settling floor. These invariants are pinned by
+or a head change replays already-reported discussion. Each carried entry's own
+open time is dropped, so its clock restarts on the new epoch: this preserves the
+pending delivery while ensuring a fresh head receives its full settling floor,
+and because the entry itself is carried, the restart is a delay and never a loss.
+These invariants are pinned by
 `test_an_open_epoch_scoped_window_is_dropped_by_an_epoch_change`,
 `test_a_sticky_key_survives_an_epoch_change`,
 `test_a_fresh_epoch_anomaly_still_gets_a_full_settling_floor`, and
@@ -103,20 +105,46 @@ the only reporting value. See `irq.run`,
 
 ## Coalescing
 
-A non-NMI `WAKE` observation opens a persisted window. The window fires all
-entries when the convergence floor has passed and `Tick.pending` is zero, or
-when the hard cap has passed; the hard cap is independent of the floor. The
-floor prevents a newly changed subject from reporting a transient empty rollup
-as convergence. The cap prevents a permanently pending subject from losing an
-otherwise actionable wake. These properties are pinned by
+A non-NMI `WAKE` observation opens a persisted window, and each entry records its
+own open time. An entry triggers delivery when its own age has passed the
+convergence floor and `Tick.pending` is zero, or, for an epoch-independent entry,
+when its own age has passed the floor alone. Separately, when the oldest entry's
+age passes the hard cap the whole window flushes; the hard cap is independent of
+the floor and remains window level. The floor prevents a newly changed subject
+from reporting a transient empty rollup as convergence. The cap prevents a
+permanently pending subject from losing an otherwise actionable wake, and stays a
+window-level flush because withholding an unconverged entry from a cap wake would
+turn one flush into one wake per entry.
+The floor is per entry because one window holds signals of different ages: a
+partial fire leaves entries that have already waited, and a later tick can add one
+that has not. A shared window age let such an entry trigger a wake with no
+settling window of its own, so signals arriving one at a time each produced a
+wake. Once an entry triggers, the wake carries every entry the population gate
+admits, aged or not; riding along cannot add a wake, while withholding an admitted
+entry produces another one later. These properties are pinned by
 `test_floor_blocks_a_premature_converged_wake`,
-`test_hard_cap_fires_when_pending_never_drains`, and
-`test_hard_cap_outranks_a_floor_set_above_it`.
+`test_hard_cap_fires_when_pending_never_drains`,
+`test_hard_cap_outranks_a_floor_set_above_it`,
+`test_the_hard_cap_flushes_the_WHOLE_window_not_only_the_capped_entry`,
+`test_an_entry_joining_after_a_partial_fire_serves_its_own_floor`, and
+`test_coalescing_folds_staggered_reds_into_one_wake`.
+
+`coalesce_started_at` is never written. It survives as a read in `load_state`
+only, to seed entries persisted before they carried their own open time, so an
+upgrade does not restart an in-flight window; see
+`test_a_window_written_before_per_entry_ages_keeps_the_age_it_had`. Because it is
+not stored, the legacy field falls off at the first write after the upgrade.
+
+The window age the cap reads is the oldest SURVIVING entry's age, so a partial
+fire that delivers the entry which opened the window moves the cap clock onto the
+survivor. That is a bound rather than a reset: an entry is flushed no later than
+the cap measured from its own arrival. See
+`test_an_entry_left_by_a_partial_fire_still_reaches_the_cap`.
 
 While pending work remains after the floor, epoch-independent entries fire and
-epoch-scoped entries remain in the window. The partial fire retains the original
-window start time for the remaining entries, so repeated discussion cannot keep
-postponing a check-derived observation. See
+epoch-scoped entries remain in the window. The remaining entries keep their own
+open times, so repeated discussion cannot keep postponing a check-derived
+observation. See
 `test_a_sticky_wake_fires_at_the_floor_while_checks_are_still_pending` and
 `test_the_sticky_half_fires_while_the_epoch_scoped_half_keeps_waiting`.
 

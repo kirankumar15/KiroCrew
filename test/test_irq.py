@@ -337,14 +337,79 @@ def test_hard_cap_outranks_a_floor_set_above_it():
     assert isinstance(verdict, Report), "the cap must fire even below the floor"
 
 
+def test_the_hard_cap_flushes_the_WHOLE_window_not_only_the_capped_entry():
+    """The cap stays a WINDOW-level wall even though the floor is per entry.
+
+    Making the cap per entry as well was tried and reverted here: for a subject
+    whose `pending` never drains, withholding an unconverged neighbour from a cap
+    wake turns ONE flush into one wake per entry, spaced by their arrival
+    spacing. That is the per-wake cost the window exists to remove, and it is the
+    opposite of the payload rule -- riding along cannot add a wake, withholding
+    guarantees one. The floor is what a joining entry must serve; the cap is the
+    promise that a wedged queue costs a delay and not a wake per signal.
+    """
+    first = _wake("red:a", "first red")
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[first], pending=5),
+            # A second red arrives long after the first opened, so on a per-entry
+            # cap it would be nowhere near its own wall.
+            Tick(epoch="e1", observations=[first, _wake("red:b", "second red")], pending=5),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=999, coalesce_max_secs=9999), Skip)
+    _settle()
+    verdict = _verdict(probe, coalesce_secs=999, coalesce_max_secs=_COALESCE)
+    assert isinstance(verdict, Report)
+    body = str(verdict)
+    assert "first red" in body
+    assert "second red" in body, "the cap flushes the window, not just what aged out"
+
+
+def test_an_entry_left_by_a_partial_fire_still_reaches_the_cap():
+    """The cap's promise is a bounded delay, and a partial fire must not extend it.
+
+    The window's age is now the oldest SURVIVING entry's age, so a partial fire
+    that delivers the entry which opened the window moves the cap clock onto the
+    survivor. That is a bound, not a reset: an entry is flushed no later than the
+    cap measured from its own arrival, which is what "delayed, never dropped"
+    means per entry. Seeded from disk rather than slept for, so the bound is
+    asserted rather than raced.
+    """
+    path = state_path("test-kind", "sub-1", "job-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = dedupe_key(_wake("red:a"))
+    path.write_text(
+        json.dumps(
+            {
+                "epoch": "e1",
+                # What a partial fire leaves: the sticky half already delivered,
+                # one epoch-scoped survivor carrying the age it earned.
+                "coalescing": {key: {"brief": "a red", "opened_at": time.time() - 600}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("red:a", "a red")], pending=4)])
+    # The floor is unreachable, so only the cap can produce this wake.
+    verdict = _verdict(probe, coalesce_secs=9999, coalesce_max_secs=300)
+    assert isinstance(verdict, Report), "the survivor's own cap must still fire"
+    assert "a red" in str(verdict)
+
+
 def test_window_state_survives_across_ticks():
     probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("red:a")], pending=3)])
     _verdict(probe, coalesce_secs=999)
     state = load_state(state_path("test-kind", "sub-1", "job-1"))
     # Asserted through the kernel's own key helper rather than a literal: the
     # test's subject is that the window PERSISTED, not how a key is spelled.
-    assert list(state["coalescing"]) == [dedupe_key(_wake("red:a"))]
-    assert state["coalesce_started_at"] > 0
+    key = dedupe_key(_wake("red:a"))
+    assert list(state["coalescing"]) == [key]
+    # The age lives on the ENTRY. There is no window-level stamp to assert: one
+    # scalar could not serve entries admitted at different times, which is the
+    # defect `test_an_entry_joining_after_a_partial_fire_serves_its_own_floor`
+    # pins.
+    assert state["coalescing"][key]["opened_at"] > 0
 
 
 def test_window_cleared_after_it_fires():
@@ -460,8 +525,14 @@ def test_cleared_anomaly_is_pruned_from_an_open_window():
             Tick(epoch="e1", observations=[_wake("red:a", "A failed")], pending=3),
             # red:a reran green; only red:b is still observed this tick
             Tick(epoch="e1", observations=[_wake("red:b", "B failed")], pending=0),
+            Tick(epoch="e1", observations=[_wake("red:b", "B failed")], pending=0),
         ]
     )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    # red:b joined on this tick, so it serves a floor of its OWN rather than
+    # inheriting the age of the window red:a opened. It is the wake below that
+    # must not carry red:a, and the extra tick is what red:b's own floor costs.
     assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
     _settle()
     verdict = _verdict(probe, coalesce_secs=_COALESCE)
@@ -1000,3 +1071,103 @@ def test_a_partial_fire_defers_to_the_unwritable_state_fallback():
     assert "said" in body, "the sticky half must still be delivered"
     assert "green" in body, "the withheld half must NOT be held back into a lost window"
     assert "unwritable" in body, "the operator has to be told why repeats are coming"
+
+
+# ------------------------------------------- one window, entries of different ages
+
+
+def test_an_entry_joining_after_a_partial_fire_serves_its_own_floor():
+    """A partial fire leaves the window open, and the next tick can add a signal
+    that has not waited at all. One window-level start stamp handed that signal
+    an age it never spent, so it was delivered on the very next tick with no
+    settling window of its own -- and the signal arriving seconds behind it then
+    needed a wake of its own too, which is the per-wake cost coalescing exists to
+    remove.
+
+    Both halves are pinned here: the joining entry does not ride out early, and
+    it is DELAYED rather than dropped -- it arrives once its own floor closes, in
+    ONE wake together with the signal that joined behind it.
+    """
+    conversation = _sticky("comment:1", "said")
+    checks = _wake("red:a", "a red")
+    probe = ScriptedProbe(
+        [
+            # A comment lands while checks run, so the window opens and cannot
+            # converge.
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+            # Past the floor: the sticky half fires and the check entry stays, so
+            # the window -- and its one start stamp -- survives the partial fire.
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+            # A second comment joins the aged window having waited nothing.
+            Tick(epoch="e1", observations=[checks, _sticky("comment:2", "two")], pending=4),
+            # And a third joins behind it, inside the second one's floor.
+            Tick(
+                epoch="e1",
+                observations=[
+                    checks,
+                    _sticky("comment:2", "two"),
+                    _sticky("comment:3", "three"),
+                ],
+                pending=4,
+            ),
+            Tick(
+                epoch="e1",
+                observations=[
+                    checks,
+                    _sticky("comment:2", "two"),
+                    _sticky("comment:3", "three"),
+                ],
+                pending=4,
+            ),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+
+    partial = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(partial, Report)
+    assert "said" in str(partial)
+
+    # No _settle() on purpose: comment:2 has waited nothing.
+    joined = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(joined, Skip), "a joining entry must not inherit the window's age"
+
+    # Still no _settle(): comment:3 lands inside comment:2's floor, which is what
+    # gives the two something to coalesce INTO.
+    behind = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(behind, Skip)
+
+    _settle()
+    late = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(late, Report), "a held entry must be delayed, never dropped"
+    body = str(late)
+    assert "two" in body and "three" in body, "both joiners belong in ONE wake"
+
+
+def test_a_window_written_before_per_entry_ages_keeps_the_age_it_had():
+    """An upgrade must not restart the clock of a window already open on disk.
+
+    State written before entries carried their own open time has one window-level
+    stamp and bare brief strings. Reading that shape has to seed every entry from
+    the old stamp, or an in-flight watch silently serves a second floor across the
+    version change -- a delay the operator cannot see the reason for.
+    """
+    path = state_path("test-kind", "sub-1", "job-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = dedupe_key(_sticky("comment:1"))
+    path.write_text(
+        json.dumps(
+            {
+                "epoch": "e1",
+                "coalescing": {key: "said"},
+                "coalesce_started_at": time.time() - 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    probe = ScriptedProbe(
+        [Tick(epoch="e1", observations=[_sticky("comment:1", "said")], pending=4)]
+    )
+    verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(verdict, Report), "the entry had already waited ten minutes"
+    assert "said" in str(verdict)
