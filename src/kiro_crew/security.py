@@ -5649,29 +5649,6 @@ _WRITE_PROTECTED_HOME_PATHS += [
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
-    # Downloaded MODEL WEIGHTS (speech recognition and embeddings both land here).
-    # WRITE-protected as a whole directory, not read+write sensitive: the weights hold
-    # no secret, and the settings surface and `kirocrew doctor` both read the directory
-    # to report what is installed.
-    #
-    # They are an INPUT TO A TRUST DECISION. Each store verifies its file against a
-    # pinned sha256 and then hands the PATH to a native loader, so a writable directory
-    # leaves a window between the digest and the open in which the bytes can be
-    # swapped -- and no amount of re-hashing closes it, because the loader re-opens by
-    # name. Removing the writability removes the window instead: the agent cannot
-    # modify the file at all, so the verified bytes are the loaded bytes. A poisoned
-    # model is persistent and invisible, and for speech it means the user's own words
-    # reaching the agent as something they did not say.
-    #
-    # Kiro Crew's own downloaders write here directly and do not route through this
-    # gate, so first-run fetches, re-downloads after a failed check and the embedding
-    # model install all keep working; only the agent's file-edit and shell tools are
-    # refused. Paired with the same entry in _WRITE_PROTECTED_BASH_LEAVES -- protected
-    # on one path only is not protected.
-    f"{prefix}/models"
-    for prefix in _CREW_HOME_PREFIXES
-]
-_WRITE_PROTECTED_HOME_PATHS += [
     # The Connections tool-alias OWNERSHIP RECORD, third instance of the same class as the
     # two above and with the same read/write asymmetry. It holds no secret and the rebuild
     # reads it on every run, so classifying it sensitive would break the feature — but it is
@@ -5856,12 +5833,6 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
     # re-converges it. The residual ``cd``-relative form is the low-severity case
     # the scope note already accepts on purpose.
     "playwright-cli-config.json",
-    # Downloaded model weights, paired with the same entry in
-    # _WRITE_PROTECTED_HOME_PATHS so the file-edit and shell paths agree. A directory
-    # rather than a leaf: the trailing separator the pattern already accepts makes this
-    # cover everything beneath it, which is what the trust decision needs (any file the
-    # loader might open, not one filename).
-    "models",
 )
 
 # ── Anchor-INDEPENDENT leaf matching ──
@@ -5890,28 +5861,6 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
 # distinctive at all (their distinguishing part is the ``apps/.../data/``
 # subpath) and must stay anchored.
 _BARE_TOKEN_PROTECTED_LEAVES: tuple[str, ...] = ("connections-tool-aliases.json",)
-
-# Whisper weight files, matched as a NAME with no anchor, for the same reason as the
-# alias record above: the filename IS the grant. `stt.models` verifies a file's sha256
-# and then hands its PATH to a native loader that re-opens it by name, so the bytes a
-# C++ GGML parser actually consumes are whatever sits at ``ggml-<model>.bin`` at open
-# time, not the bytes that were hashed. The ``models`` entry in
-# _WRITE_PROTECTED_BASH_LEAVES fences the crew-home spelling of that path and is what
-# the file tools go through, but an anchored pattern falls to a single ``cd``:
-# ``cd ~/.kiro/crew/models; cp evil.bin ggml-base.bin`` names no home, no crew prefix
-# and no separator. Anchoring cannot be part of this contract, so it is not.
-#
-# A pattern rather than the four catalog filenames, so a model row added to
-# ``stt.models.CATALOG`` later is fenced without a second edit here -- a new row is
-# exactly the change nobody would think to mirror into this module.
-#
-# The SCOPE test above is met and the cost is stated rather than assumed: ``ggml-``
-# plus ``.bin`` is the whisper.cpp/llama.cpp artifact convention and appears in no
-# ordinary command line, but it is deliberately wider than the crew home, so an
-# unrelated checkout of someone else's GGML weights cannot be copied or renamed from
-# the agent's SHELL either. That is a denial rather than a grant, and the file tools
-# are untouched, which is the affordable direction for the trade.
-_WHISPER_WEIGHT_NAME = r"ggml-[A-Za-z0-9][A-Za-z0-9._-]*\.bin"
 
 # Regex for bash commands that read sensitive paths.
 # Matches: cat, head, tail, less, more, strings, xxd, base64, cp, scp, open,
@@ -5945,7 +5894,7 @@ _WRITE_CMDS = (
 _SCRIPT_OPEN = r"(?:python|ruby|perl)\S*\s.*open\s*\("
 
 
-def _build_sensitive_regex() -> re.Pattern[str]:
+def _build_sensitive_regex(home: str | None = None) -> re.Pattern[str]:
     """Build a compiled regex matching bash reads OR writes of sensitive paths.
 
     Matching strategies, OR'd:
@@ -5961,14 +5910,21 @@ def _build_sensitive_regex() -> re.Pattern[str]:
       3. a write-protected LEAF under the crew home, in POSIX and in
          Windows-native spelling, matched verb-independently;
       4. an anchor-INDEPENDENT bare path SEGMENT for the distinctive leaves in
-         ``_BARE_TOKEN_PROTECTED_LEAVES``, and for a whisper weight filename
-         (``_WHISPER_WEIGHT_NAME``) — the only strategy that survives a ``cd``
-         into the crew home followed by a relative filename.
+         ``_BARE_TOKEN_PROTECTED_LEAVES`` — the only strategy that survives a
+         ``cd`` into the crew home followed by a relative filename.
     The home anchor accepts ``~`` / ``$HOME`` / the literal ``Path.home()`` AND a
     generic ``/home/<user>`` / ``/Users/<user>`` literal so an unexpanded
     ``/home/$USER/...`` or another user's literal path is still caught.
+
+    *home* optionally supplies the resolved home already read by the caller. The cache
+    in :func:`_get_sensitive_re` MUST pass it: reading ``Path.home()`` here as well
+    would resolve it a second time, and a home repointed between the two reads would
+    file a pattern built for the NEW home under the OLD home's key — every later call
+    seeing the old home then gets a pattern whose embedded home literal cannot match
+    it, so the deny gate fails OPEN. ``None`` (direct callers and tests) resolves it
+    here.
     """
-    home = re.escape(str(Path.home()))
+    home = re.escape(home if home is not None else str(Path.home()))
     tilde = re.escape("~")
     home_var = re.escape("$HOME")
     # Generic home roots so a literal "/home/<user>" or "/Users/<user>" token
@@ -5979,14 +5935,13 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     dirs_pattern = "|".join(escaped_dirs)
     # What may TERMINATE a sensitive path token. A path is very often the last thing
     # before a shell metacharacter, and accepting only whitespace, a quote, ``/`` or
-    # end-of-string let punctuation defeat the gate outright: ``cd ~/.aws;`` and
-    # ``cd ~/.kiro/crew/models;`` were allowed, while the same commands written with
-    # ``&&`` were blocked -- for no better reason than that ``&&`` is preceded by a
-    # space and ``;`` is not. The asymmetry is the tell; nothing about a semicolon
-    # makes the path less named. So the class is every character a shell itself treats
-    # as the end of a word. Widening a DENY boundary can only ever deny more, which is
-    # the safe direction for this gate, and the rule it enforces is unchanged: naming a
-    # fenced path is the signal.
+    # end-of-string let punctuation defeat the gate outright: ``cd ~/.aws;`` was allowed,
+    # while the same command written with ``&&`` was blocked -- for no better reason than
+    # that ``&&`` is preceded by a space and ``;`` is not. The asymmetry is the tell;
+    # nothing about a semicolon makes the path less named. So the class is every character
+    # a shell itself treats as the end of a word. Widening a DENY boundary can only ever
+    # deny more, which is the safe direction for this gate, and the rule it enforces is
+    # unchanged: naming a fenced path is the signal.
     path_end = r"(?:/|\s|$|['\"]|[;&|()<>,:`])"
     sensitive_path = rf"{home_alts}/(?:{dirs_pattern}){path_end}"
     # Write-protected leaves (e.g. the on-call schedule): a full home-anchored
@@ -6026,7 +5981,8 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # or filesystem treats as equivalent, and review found three it had missed in
     # succession -- a metacharacter, an expanded-away ``$var``, and a ``/./`` segment.
     # The lookahead closes that whole family instead of the members discovered so far,
-    # which is why this branch does not reuse ``path_end`` / ``win_path_end``.
+    # which is why this branch does not reuse an enumerated terminator class such as
+    # ``win_path_end``.
     artifact_parents_pattern = "|".join(re.escape(d) for d in _KEYSTONE_ARTIFACT_PARENTS)
     artifact_suffix_alt = "|".join(
         re.escape(suffix.lstrip(".")) for suffix in _KEYSTONE_ARTIFACT_SUFFIXES
@@ -6078,25 +6034,23 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # elsewhere — the safe direction for this gate, which blocks on naming
     # alone. The name run is length-capped to bound backtracking.
     win_gsep = rf"(?:{win_sep}(?:\.|[^\\/\s'\"]{{1,64}}{win_sep}\.\.))*{win_sep}"
-    # Shell word-end terminator for the Windows-native branches below. Mirrors the POSIX
-    # ``path_end`` above, INCLUDING the shell metacharacters, and for the reason stated
-    # there: the class is every character a shell itself treats as the end of a word, and
-    # widening a DENY boundary can only ever deny more, which is the safe direction for a
-    # gate that blocks on naming alone.
+    # Shell word-end terminator for the Windows-native branches below: every character a
+    # shell itself treats as the end of a word. Deliberately WIDER than the
+    # ``(?:sep|space|$|quote)`` the POSIX branches above accept, because widening a DENY
+    # boundary can only ever deny more, which is the safe direction for a gate that blocks
+    # on naming alone.
     #
-    # Until this existed each Windows branch spelled its own ``(?:sep|space|$|quote)``,
-    # which a metacharacter walked straight through -- ``type <fenced path>&whoami`` named
-    # the file and was not matched, while the POSIX spelling of the same command was. Found
-    # by the GPT review lane on the artifact branch; applied to the whole family, because a
-    # fence that is tight on an atomic-write temp and loose on the keystone leaf beside it
-    # protects the transient copy and not the secret.
+    # A per-branch narrow class lets a metacharacter walk straight through it --
+    # ``type <fenced path>&whoami`` names the file and matches nothing -- so one class
+    # governs the whole Windows family: a fence that is tight on an atomic-write temp and
+    # loose on the keystone leaf beside it protects the transient copy and not the secret.
     # ``$`` is a literal member of the class, not the regex end-anchor that appears
     # earlier in the alternation: PowerShell (and cmd.exe with ``$env:``) EXPANDS a
     # variable reference, so ``Get-Content <fenced path>$null`` removes the ``$null`` and
     # reads the fenced file, while the matcher saw an unterminated path and allowed it.
     # A literal ``$`` therefore ends a path for matching purposes. The POSIX side is
-    # already covered here by its own branches -- measured, not assumed -- so this is
-    # deliberately a Windows-only addition rather than a change to ``path_end``.
+    # already covered here by its own branches -- measured, not assumed -- so this member
+    # is deliberately Windows-only rather than part of their terminator class.
     # ``.`` is deliberately NOT a member, though Windows does strip a trailing dot when
     # opening a file. Adding it here refused ``ls -d ~/.kiro/crew/backup.tar``: these
     # branches accept forward slashes too, so they also govern POSIX spellings, and
@@ -6354,11 +6308,6 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # blocks on naming alone.
     bare_leaves = "|".join(re.escape(leaf) for leaf in _BARE_TOKEN_PROTECTED_LEAVES)
     bare_protected_path = rf"(?<![\w.\-])(?:{bare_leaves})(?![\w\-])"
-    # Same token boundaries, and for the same reasons: the lookbehind keeps a name that
-    # merely ENDS with one of these out (``my-ggml-base.bin`` stays allowed), while a
-    # trailing ``.`` or separator still matches, so ``ggml-base.bin.tmp`` and the
-    # mkdir-as-directory form are covered.
-    bare_weight_path = rf"(?<![\w.\-]){_WHISPER_WEIGHT_NAME}(?![\w\-])"
     return re.compile(
         # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
         # appears anywhere as a token.  The token anchor accepts start-of-string
@@ -6402,22 +6351,30 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # only); tool-path reads stay allowed.
         rf"|(?:^|.*[\s'\"=:,;]){agents_write_path}"
         rf"|(?:^|.*[\s'\"=:,;]){win_agents_write_path}"
-        # (10) whisper weight FILENAMES, also with no anchor, because the digest the
-        # model store checks only binds the bytes if the name it then loads cannot be
-        # rewritten by a ``cd``-relative command.
-        rf"|{bare_protected_path}"
-        rf"|{bare_weight_path})",
+        rf"|{bare_protected_path})",
         re.IGNORECASE,
     )
 
 
 _SENSITIVE_RE: re.Pattern[str] | None = None
+# The home the cached pattern was built from. The pattern EMBEDS the resolved
+# home as a literal anchor, so a home that changes after the first call would
+# otherwise leave the gate matching against the old one and silently
+# under-block: the fence fails OPEN, which is the wrong direction for a deny.
+_SENSITIVE_RE_HOME: str | None = None
 
 
 def _get_sensitive_re() -> re.Pattern[str]:
-    global _SENSITIVE_RE
-    if _SENSITIVE_RE is None:
-        _SENSITIVE_RE = _build_sensitive_regex()
+    global _SENSITIVE_RE, _SENSITIVE_RE_HOME
+    # Resolve the home ONCE and use the same string for both the key and the build.
+    # Resolving separately would let a home repointed between the two reads file the
+    # NEW home's pattern under the OLD home's key — a fail-OPEN TOCTOU, the same shape
+    # ``_home_dir_targets`` documents and pins below. Pinned by
+    # test_the_home_is_resolved_once_for_key_and_build.
+    home = str(Path.home())
+    if _SENSITIVE_RE is None or _SENSITIVE_RE_HOME != home:
+        _SENSITIVE_RE = _build_sensitive_regex(home)
+        _SENSITIVE_RE_HOME = home
     return _SENSITIVE_RE
 
 

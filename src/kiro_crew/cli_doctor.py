@@ -19,7 +19,7 @@ from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
 from kiro_crew import agent as _agent
-from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox, stt
+from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox
 from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.acp.kas_transport import (
@@ -100,7 +100,12 @@ from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
 from kiro_crew.session_pid_sig import signing_health
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
-from kiro_crew.transcribe import _find_ffmpeg, availability_detail, ensure_ffmpeg_in_path
+from kiro_crew.transcribe import (
+    _faster_whisper_model,
+    _find_parakeet_mlx,
+    _find_whisper,
+    ensure_ffmpeg_in_path,
+)
 from kiro_crew.validation import _AGENT_NAME_RE
 
 logger = logging.getLogger(__name__)
@@ -2828,65 +2833,62 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Speech-to-Text (optional) ──
     print("\nSpeech-to-Text")
     stt_active = cfg.stt.enabled
+    needs_whisper = stt_active and cfg.stt.provider == "whisper"
+    # Every provider but ``faster`` shells out to something that needs the system
+    # ffmpeg; faster-whisper decodes in-process through PyAV's bundled copy, so
+    # reporting a missing ffmpeg as an ISSUE there would send the user to install a
+    # binary their configuration never calls.
+    needs_ffmpeg = stt_active and cfg.stt.provider != "faster"
 
     if not stt_active:
         print("  status:      ⏹ disabled (enable from dashboard → Settings → Speech-to-Text)")
     else:
         print(f"  provider:    ✅ {cfg.stt.provider}")
 
-    # Source installs may omit the optional voice extra. Preserve Windows's
-    # historical non-fatal report for that case so an enabled-by-default feature
-    # cannot block gateway startup; desktop releases gate both native components
-    # at build time and should never reach the missing branches.
+    # STT ships enabled-by-default, but neither whisper nor ffmpeg is on a stock
+    # Windows box and neither is a Kiro Crew dependency there. Reporting them as
+    # hard issues makes `kirocrew doctor` exit 1 on a healthy first install, so
+    # the guide's `kirocrew doctor && kirocrew gateway` never launches the
+    # gateway. On Windows treat them as non-fatal notes; POSIX keeps failing so
+    # a real STT setup gap is still surfaced.
     stt_fatal = not platform_compat.IS_WINDOWS
     stt_mark = "❌" if stt_fatal else "⚠️ "
 
-    if stt_active and cfg.stt.provider == "local":
-        engine = availability_detail(cfg.stt)
-        if engine.ok:
-            print("  engine:      ✅ local recogniser loadable (whisper.cpp, in-process)")
-        else:
-            print(f"  engine:      {stt_mark} {engine.detail}")
-            if stt_fatal:
-                issues.append(f"speech recogniser ({engine.code})")
-        # The weights are fetched on first use, so "not downloaded" is the normal
-        # first-run state and never an issue. Naming the size is the useful part,
-        # because that transfer is what a first dictation waits on.
-        model = stt.resolve_model(cfg.stt.model)
-        if stt.is_present(model):
-            print(f"  model:       ✅ {model.name} at {stt.models_dir() / model.filename}")
-        else:
-            print(
-                f"  model:       ⏹ {model.name} not downloaded yet "
-                f"({model.size_bytes // 1_000_000} MB, fetched on first use)"
+    whisper_bin = _find_whisper(cfg.stt.whisper_path)
+    if whisper_bin:
+        print(f"  whisper:     ✅ {whisper_bin}")
+    elif needs_whisper:
+        mark = stt_mark
+        print(f"  whisper:     {mark} not found")
+        print(
+            "               Fix: "
+            + _os_fix_hint(
+                "brew install openai-whisper",
+                "pipx install openai-whisper  (or pip install --user openai-whisper)",
+                windows="pip install openai-whisper",
             )
+        )
+        if stt_fatal:
+            issues.append("whisper")
+    else:
+        print("  whisper:     ⏭  not installed (not needed)")
 
     ensure_ffmpeg_in_path()
-    # The same resolver the transcode path uses, so what doctor REPORTS is what would
-    # actually be exec'd. A bare `which` here reported a PATH-chosen ffmpeg that
-    # `_find_ffmpeg` would decline, which is the more misleading of the two failures.
-    ffmpeg_bin = _find_ffmpeg()
+    ffmpeg_bin = shutil.which("ffmpeg")
     if ffmpeg_bin:
-        # The resolved path can contain a username or a credential-bearing mount
-        # name. Doctor only needs to confirm the exact resolver found a decoder.
-        print("  ffmpeg:      ✅ available")
-    elif stt_active:
-        # A prerequisite of every provider, not of one of them: a Slack voice memo
-        # arrives as ogg/Opus and the dashboard records webm, so the only input
-        # that reaches a recogniser without ffmpeg is a 16 kHz mono WAV.
-        print(f"  ffmpeg:      {stt_mark} not found")
-        if platform_compat.is_bundled_interpreter():
-            print("               Fix: reinstall Kiro Crew (the bundled audio decoder is missing)")
-        else:
-            print(
-                "               Fix: "
-                + _os_fix_hint(
-                    "brew install ffmpeg",
-                    "drop a static ffmpeg build into ~/.local/bin "
-                    "(not in AL2023 repos; Kiro Crew auto-detects it)",
-                    windows="winget install Gyan.FFmpeg",
-                )
+        print(f"  ffmpeg:      ✅ {ffmpeg_bin}")
+    elif needs_ffmpeg:
+        mark = stt_mark
+        print(f"  ffmpeg:      {mark} not found")
+        print(
+            "               Fix: "
+            + _os_fix_hint(
+                "brew install ffmpeg",
+                "drop a static ffmpeg build into ~/.local/bin "
+                "(not in AL2023 repos; Kiro Crew auto-detects it)",
+                windows="winget install Gyan.FFmpeg",
             )
+        )
         if stt_fatal:
             issues.append("ffmpeg")
     else:
@@ -2912,23 +2914,52 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  boto3:       ⏹ optional AWS SDK not installed")
             print("               Install: pip install 'kirocrew[voice]'")
 
-    # Apple's on-device speech is a host capability rather than an install, so the
-    # only useful thing to print is the reason it cannot run. Reaching a not-ok
-    # state here means the operator selected a provider this machine does not
-    # support, which is a real configuration fault and not a first-run state.
-    #
-    # Deliberately fatal on EVERY platform, so it does not take the Windows
-    # downgrade above. That carve-out exists for prerequisites a user can simply
-    # install; this is a provider that cannot be made to work on the host at all,
-    # and reporting it as a note would have `kirocrew doctor` exit 0 on a
-    # configuration that can only ever fail at the first recording.
-    if stt_active and cfg.stt.provider == "apple":
-        apple = availability_detail(cfg.stt)
-        if apple.ok:
-            print("  apple:       ✅ on-device SpeechAnalyzer available")
+    # Parakeet (NVIDIA Parakeet via parakeet-mlx) is Apple-Silicon-only and, like
+    # mlx_whisper, installed out-of-band — so report its CLI the same way.
+    if stt_active and cfg.stt.provider == "parakeet":
+        parakeet_bin = _find_parakeet_mlx()
+        if parakeet_bin:
+            print(f"  parakeet:    ✅ {parakeet_bin}")
         else:
-            print(f"  apple:       ❌ {apple.detail}")
-            issues.append(f"apple speech ({apple.code})")
+            mark = stt_mark
+            print(f"  parakeet:    {mark} parakeet-mlx not found")
+            print("               Fix: pipx install parakeet-mlx  (Apple Silicon only)")
+            if stt_fatal:
+                issues.append("parakeet-mlx")
+
+    # faster-whisper (CTranslate2) is installed on demand, not as a declared extra,
+    # so an unavailable library is the expected first-run state rather than a broken
+    # install. Windows on ARM is called out separately because no CTranslate2 wheel
+    # exists there at all — the install button cannot fix it, and telling the user to
+    # retry would waste their time instead of naming a provider that does work.
+    if stt_active and cfg.stt.provider == "faster":
+        if _faster_whisper_model() is not None:
+            print("  faster:      ✅ faster-whisper importable")
+        elif platform_compat.is_windows_on_arm():
+            # Deliberately NOT routed through ``stt_mark``/``stt_fatal``. That
+            # Windows downgrade exists because whisper and ffmpeg are absent from a
+            # stock Windows box yet trivially installable, so failing a first-run
+            # doctor over them is noise. This is the opposite case: ``faster`` is
+            # never the default, so reaching here means the user explicitly selected
+            # a provider that CANNOT be made to work on this machine. That is a real
+            # configuration fault, and the whole point of naming the alternatives is
+            # that the run should not exit 0 as if nothing were wrong.
+            print("  faster:      ❌ not available (Windows on ARM — no CTranslate2 wheel)")
+            print(
+                "               Alternatives: set stt.provider to 'whisper' "
+                "(local) or 'transcribe' (AWS)"
+            )
+            issues.append("faster-whisper: unavailable on Windows ARM")
+        else:
+            # The ordinary not-yet-installed state, which the install button DOES
+            # fix — so this one follows the platform convention like whisper above.
+            print(f"  faster:      {stt_mark} not installed")
+            print(
+                "               Install from dashboard → Settings → "
+                "Speech-to-Text, or: pip install faster-whisper"
+            )
+            if stt_fatal:
+                issues.append("faster-whisper")
 
     # ── Slack (optional) ──
     print("\nSlack Integration")

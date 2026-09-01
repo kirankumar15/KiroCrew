@@ -184,3 +184,11 @@ src/kiro_crew/apps/builtins/ops_mission_control/backend/providers/cloudwatch.py:
 # ...and its test, which asserts the console host is what a validated region produces and
 # that an injected one cannot move it. Same public domain, same line-anchored narrowing.
 src/kiro_crew/apps/builtins/ops_mission_control/tests/test_providers.py:.*console\.aws\.amazon\.com
+
+# Non-ASCII path fixture, not a personal home. The atomic-write helper must
+# round-trip a unit's WorkingDirectory byte-for-byte, so the test needs a path
+# whose UTF-8 encoding is not its ASCII encoding; the identity scan sees the
+# generic ``/home/<word>`` shape and cannot tell a fixture from a real account.
+# Line-anchored to that one accented literal so a genuine home path added to this
+# file is still caught.
+test/test_atomic_write_named_duplicates.py:.*/home/tést

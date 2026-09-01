@@ -541,17 +541,10 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
     if Path(audio_path).suffix.lower() in _NATIVE_AUDIO_SUFFIXES:
         return audio_path, False
 
-    from kiro_crew.transcribe import (
-        _close_ffmpeg_for_execution,
-        _create_ffmpeg_subprocess,
-        _resolve_ffmpeg_for_execution,
-        ensure_ffmpeg_in_path,
-    )
+    from kiro_crew.transcribe import _find_ffmpeg, ensure_ffmpeg_in_path
 
     await asyncio.to_thread(ensure_ffmpeg_in_path)
-    # A bundled decoder is 49-88 MB and is SHA-256 authenticated on every
-    # execution. Keep that blocking read off the gateway event loop.
-    ffmpeg = await _resolve_ffmpeg_for_execution()
+    ffmpeg = _find_ffmpeg()
     if not ffmpeg:
         logger.warning(
             "apple_speech: %s needs transcoding but ffmpeg was not found",
@@ -562,11 +555,7 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
     # Both syscalls in ONE thread hop. `os.close` alone is trivial, but
     # `tempfile.mkstemp` is the heavier half — it creates a file — and leaving it
     # on the loop while offloading only the close would be the worse split.
-    try:
-        out = await asyncio.to_thread(_mkstemp_path, ".wav")
-    except BaseException:
-        await _close_ffmpeg_for_execution(ffmpeg, preserve_active_exception=True)
-        raise
+    out = await asyncio.to_thread(_mkstemp_path, ".wav")
     # The `.wav` stays invocation-owned until the success return below hands it
     # to the caller. A spawn failure or a cancellation (`CancelledError` is a
     # `BaseException`, so `except Exception` would miss it) never transfers
@@ -576,7 +565,7 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
     # still-running child can race the removal. Every cleanup step is
     # best-effort — the exception in flight is the one that must surface.
     try:
-        proc = await _create_ffmpeg_subprocess(
+        proc = await asyncio.create_subprocess_exec(
             ffmpeg,
             "-y",
             "-i",

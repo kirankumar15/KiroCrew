@@ -3,7 +3,6 @@ import { AlertTriangle, X } from 'lucide-react'
 import MicSourceMenu from './MicSourceMenu'
 
 import { i18nT } from '../i18n/t'
-import { downloadLabel } from '../lib/sttProviders'
 interface Props {
   /** True while actively capturing audio. */
   recording: boolean
@@ -21,8 +20,6 @@ interface Props {
   onSelectDevice: (deviceId: string) => void
   /** True when a switch applies immediately rather than to the next recording. */
   deviceSwitchIsLive?: boolean
-  /** Byte progress of the one-time speech-model download this session waits on. */
-  download?: { done: number; total: number } | null
 }
 
 /**
@@ -31,7 +28,7 @@ interface Props {
  * dot + input-level meter + active microphone name) while capturing. Renders
  * nothing when idle and error-free.
  */
-export default function VoiceStatusBar({ recording, level, deviceLabel, deviceId, error, onDismissError, onSelectDevice, deviceSwitchIsLive, download }: Props) {
+export default function VoiceStatusBar({ recording, level, deviceLabel, deviceId, error, onDismissError, onSelectDevice, deviceSwitchIsLive }: Props) {
   if (error) {
     return (
       <div
@@ -86,14 +83,6 @@ export default function VoiceStatusBar({ recording, level, deviceLabel, deviceId
         liveSwitch={deviceSwitchIsLive}
         triggerClass="text-danger opacity-80 hover:opacity-100"
       />
-      {/* Placed AFTER the device picker and allowed to truncate: a first-run
-          download is the most important thing on this strip, but it must not
-          push the controls that end the recording off the row. */}
-      {download && (
-        <span className="ml-auto min-w-0 truncate text-muted font-normal">
-          {downloadLabel(download)}
-        </span>
-      )}
     </div>
   )
 }

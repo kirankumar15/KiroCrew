@@ -21,30 +21,27 @@ vi.mock('../api/client', () => ({
   api: {
     sttConfig: vi.fn(),
     saveSttConfig: vi.fn(),
-    sttStatus: vi.fn(),
-    sttPrepare: vi.fn(),
+    sttInstall: vi.fn(),
   },
 }))
 
 const mockApi = api as unknown as {
   sttConfig: ReturnType<typeof vi.fn>
   saveSttConfig: ReturnType<typeof vi.fn>
-  sttStatus: ReturnType<typeof vi.fn>
 }
 
 function payload(over: Record<string, unknown> = {}) {
   return {
     enabled: true,
-    provider: 'local',
-    model: 'base',
+    provider: 'whisper',
     streaming: false,
-    providers: ['local', 'apple', 'transcribe'],
-    // A DELIBERATELY partial list: the point of these specs is that the panel
-    // reads the served capability rather than assuming, so the fixture withholds
-    // the capability from a provider that really has it.
+    providers: ['whisper', 'mlx', 'apple', 'transcribe'],
     streaming_providers: ['transcribe', 'apple'],
+    models: { turbo: '1.5 GB' },
+    mlx_models: {},
     language_codes: ['en-US'],
-    prereqs: [],
+    install_step: '',
+    prereqs: {},
     ...over,
   }
 }
@@ -53,13 +50,6 @@ function mount(over: Record<string, unknown> = {}) {
   const data = payload(over)
   mockApi.sttConfig.mockResolvedValue(data)
   mockApi.saveSttConfig.mockImplementation(async (p: Record<string, unknown>) => ({ ...data, ...p }))
-  mockApi.sttStatus.mockResolvedValue({
-    available: true,
-    code: '',
-    detail: '',
-    models: [{ name: 'base', size_bytes: 147951465, present: true }],
-    download: { step: 'idle', model: '', downloaded_bytes: 0, total_bytes: 0, error: '' },
-  })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <Provider store={store}>
@@ -71,7 +61,7 @@ function mount(over: Record<string, unknown> = {}) {
 }
 
 /** The Streaming row, identified by its description copy. */
-const streamingRow = () => screen.queryByText(/show the transcript in the input box/i)
+const streamingRow = () => screen.queryByText(/stream live partial transcripts/i)
 
 /**
  * The provider `<select>`, located by its accessible name rather than by index —
@@ -108,14 +98,14 @@ describe('SttSettings streaming gate', () => {
   })
 
   it('hides the streaming toggle for a provider that cannot stream', async () => {
-    mount({ provider: 'local' })
+    mount({ provider: 'whisper' })
     await waitFor(() => expect(mockApi.sttConfig).toHaveBeenCalled())
     await waitFor(() => expect(providerSelect()).toBeTruthy())
     expect(streamingRow()).toBeNull()
   })
 
   it('turns streaming on when moving to a streaming-capable provider', async () => {
-    mount({ provider: 'local', streaming: false })
+    mount({ provider: 'whisper', streaming: false })
     await waitFor(() => expect(providerSelect()).toBeTruthy())
     await pickProvider(/Apple Speech/i)
     await waitFor(() =>
@@ -123,22 +113,20 @@ describe('SttSettings streaming gate', () => {
     )
   })
 
-  it('turns streaming off when moving to a provider the served list excludes', async () => {
-    // Leaving it on would advertise partials the gateway has told us this provider
-    // does not produce.
+  it('turns streaming off when moving to a provider that cannot stream', async () => {
+    // Leaving it on would be a lie: the whisper/mlx CLIs have no partial channel.
     mount({ provider: 'apple', streaming: true })
     await waitFor(() => expect(providerSelect()).toBeTruthy())
-    await pickProvider(/^Local/)
+    await pickProvider(/^Whisper \(local\)$/)
     await waitFor(() =>
-      expect(mockApi.saveSttConfig).toHaveBeenCalledWith({ provider: 'local', streaming: false }),
+      expect(mockApi.saveSttConfig).toHaveBeenCalledWith({ provider: 'whisper', streaming: false }),
     )
   })
 
-  it('assumes every provider streams when the backend omits the capability list', async () => {
-    // All three providers stream, so a gateway serving no `streaming_providers`
-    // must not lose the toggle. The fallback used to be transcribe-only, which
-    // would now hide the DEFAULT provider's own toggle.
-    mount({ provider: 'local', streaming_providers: undefined })
+  it('falls back to transcribe-only when the backend omits the capability list', async () => {
+    // An older gateway serving no `streaming_providers` must not lose the toggle it
+    // already had.
+    mount({ provider: 'transcribe', streaming_providers: undefined })
     await waitFor(() => expect(streamingRow()).toBeTruthy())
   })
 })

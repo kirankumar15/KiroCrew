@@ -172,7 +172,6 @@ import SessionTabStrip from '../components/SessionTabStrip'
 import { useSessionTabs } from '../hooks/useSessionTabs'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
 import { modelSupportsEffort } from '../lib/effort'
-import { providerLabel } from '../lib/sttProviders'
 import { countCompletedTurns } from '../lib/completedTurns'
 import { displayModel, pinIsWithheld } from '../lib/model'
 import FollowUpCard from '../components/FollowUpCard'
@@ -1999,17 +1998,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const isMac = useAppSelector(s => s.dashboard.status?.platform) === 'darwin'
   const { data: sttCfg } = useQuery({
     queryKey: ['sttConfig'],
-    queryFn: () => api.sttConfig() as Promise<{ streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string }>,
+    queryFn: () => api.sttConfig() as Promise<{ streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string; streaming_providers?: string[] }>,
   })
-  const sttStreaming = !!sttCfg?.streaming
+  // Gate the stored `streaming` flag on the backend's own capability list. The
+  // flag is persisted per install and can outlive the provider that supported it
+  // — including when the config loader degrades a provider it no longer accepts
+  // — so a provider that cannot stream must still take the batch path rather
+  // than open a socket the gateway refuses and return with nothing captured. The
+  // fallback mirrors SttSettings so an older gateway that serves no
+  // `streaming_providers` keeps its toggle and the mic's path in agreement.
+  const streamingProviders = sttCfg?.streaming_providers?.length
+    ? sttCfg.streaming_providers
+    : ['transcribe']
+  const sttStreaming = !!sttCfg?.streaming && streamingProviders.includes(sttCfg?.provider ?? '')
   const sttEnabled = !!sttCfg?.enabled
   // The backend probes for the provider's binary and reports `available`.
   // Default true so a not-yet-loaded config doesn't flash the modal; the
   // separate sttConfigLoaded guard already covers the pre-load case.
   const sttAvailable = sttCfg?.available !== false
-  // The LOCALISED provider name, not the wire id: the modal puts it in a
-  // sentence, and a bare id reads as a typo there ("local is not installed").
-  const sttProvider = providerLabel(sttCfg?.provider || '')
+  const sttProvider = sttCfg?.provider || ''
   // Default true so the panel is the standard recording surface; the backend
   // sends an explicit boolean, so `undefined` here means "config not loaded yet"
   // rather than "off", and a pre-load recording would otherwise flash the bar.
@@ -8239,7 +8246,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               voiceStreaming={voice.streamEnabled}
               voiceSampleRef={voice.sampleRef}
               voicePartial={voiceOwned ? voice.partial : ''}
-              voiceDownload={voiceOwned ? voice.download : null}
               voiceCaretRef={voiceCaretRef}
               voicePendingCaretRef={voicePendingCaretRef}
               onVoiceToggle={voiceInputSupported ? toggleVoice : undefined}

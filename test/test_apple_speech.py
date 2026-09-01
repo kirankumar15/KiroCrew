@@ -22,12 +22,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from kiro_crew import apple_speech, platform_compat
-from kiro_crew.config.loader import (
-    _VALID_STT_PROVIDERS,
-    STT_PROVIDER_LOCAL,
-    SttConfig,
-    _validated_stt_provider,
-)
+from kiro_crew.config.loader import SttConfig, _validated_stt_provider
 
 _IS_MACOS = platform.system() == "Darwin"
 
@@ -36,16 +31,13 @@ class TestProviderRegistration:
     def test_apple_is_a_valid_provider(self):
         assert _validated_stt_provider("apple") == "apple"
 
-    def test_unknown_provider_falls_back_to_local(self):
-        """An unusable stored provider degrades to the one with no precondition, so
-        voice input keeps working instead of the load failing on it."""
-        assert _validated_stt_provider("nope") == STT_PROVIDER_LOCAL
+    def test_unknown_provider_still_falls_back(self):
+        assert _validated_stt_provider("nope") == "whisper"
 
-    def test_default_provider_is_local(self):
-        """Adding a provider must not move the default off the one that needs
-        nothing: `apple` is macOS-only and needs a Swift toolchain, and the default
-        has to work on all three platforms."""
-        assert SttConfig().provider == STT_PROVIDER_LOCAL
+    def test_default_provider_unchanged(self):
+        """Adding a provider must not move the default off whisper — `apple` is
+        macOS-only, and the default has to work on all three platforms."""
+        assert SttConfig().provider == "whisper"
 
 
 class TestAvailability:
@@ -202,8 +194,8 @@ class TestHelperBuild:
         `_build_helper` compiles with whatever the resolver returns and the gateway
         executes the product, so an agent-writable `swiftc` is the same escalation
         as an agent-writable output directory. `~/.local/bin` is on PATH for a
-        shell-launched gateway (it is where `pip install --user` and pipx put
-        executables), which is what makes this reachable rather than theoretical.
+        shell-launched gateway (mlx-whisper already installs there), which is what
+        makes this reachable rather than theoretical.
         """
         untrusted = [
             os.path.expanduser("~/.local/bin/swiftc"),
@@ -435,30 +427,11 @@ class TestTranscribePlumbing:
         ffmpeg we still hand the original path over so the caller surfaces the
         framework's own error rather than a silent unavailability."""
         with (
-            patch("kiro_crew.transcribe._open_ffmpeg_for_execution", return_value=None),
+            patch("kiro_crew.transcribe._find_ffmpeg", return_value=None),
             patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
         ):
             path, is_temp = await apple_speech._to_native_audio("/tmp/voice.webm")
         assert (path, is_temp) == ("/tmp/voice.webm", False)
-
-    @pytest.mark.asyncio
-    async def test_packaged_decoder_authentication_runs_off_the_event_loop(self, monkeypatch):
-        from kiro_crew import transcribe as tr
-
-        offloaded = []
-
-        async def run_off_loop(function, *args, **kwargs):
-            offloaded.append(function)
-            return function(*args, **kwargs)
-
-        monkeypatch.setattr(asyncio, "to_thread", run_off_loop)
-        monkeypatch.setattr(tr, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr(tr, "_open_ffmpeg_for_execution", lambda: None)
-
-        path, is_temp = await apple_speech._to_native_audio("/tmp/voice.webm")
-
-        assert (path, is_temp) == ("/tmp/voice.webm", False)
-        assert tr._open_ffmpeg_for_execution in offloaded
 
     @pytest.mark.asyncio
     async def test_helper_error_json_is_propagated(self):
@@ -549,10 +522,7 @@ class TestTranscodeTempOwnership:
         src = tmp_path / "voice.webm"
         src.write_bytes(b"data")
         with (
-            patch(
-                "kiro_crew.transcribe._open_ffmpeg_for_execution",
-                return_value="/fake/ffmpeg",
-            ),
+            patch("kiro_crew.transcribe._find_ffmpeg", return_value="/fake/ffmpeg"),
             patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
             patch("asyncio.create_subprocess_exec", side_effect=OSError("spawn failed")),
         ):
@@ -560,39 +530,6 @@ class TestTranscodeTempOwnership:
                 await apple_speech._to_native_audio(str(src))
         assert not owned.exists()
         assert src.exists()
-
-    @pytest.mark.asyncio
-    async def test_temp_creation_failure_closes_authenticated_decoder_off_loop(
-        self, tmp_path, monkeypatch
-    ):
-        from kiro_crew import transcribe as tr
-
-        binary = tmp_path / "ffmpeg"
-        binary.write_bytes(b"decoder")
-        opened = tr._AuthenticatedFfmpeg(str(binary), os.open(binary, os.O_RDONLY), str(binary))
-        event_loop_thread = threading.get_ident()
-        close_threads = []
-        original_close = tr._AuthenticatedFfmpeg.close
-
-        def recording_close(self):
-            if self.descriptor >= 0:
-                close_threads.append(threading.get_ident())
-            original_close(self)
-
-        def disk_full(_suffix):
-            raise OSError("disk full")
-
-        monkeypatch.setattr(tr._AuthenticatedFfmpeg, "close", recording_close)
-        monkeypatch.setattr(apple_speech, "_mkstemp_path", disk_full)
-        with (
-            patch.object(tr, "_resolve_ffmpeg_for_execution", return_value=opened),
-            patch.object(tr, "ensure_ffmpeg_in_path"),
-            pytest.raises(OSError, match="disk full"),
-        ):
-            await apple_speech._to_native_audio(str(tmp_path / "voice.webm"))
-
-        assert len(close_threads) == 1
-        assert close_threads[0] != event_loop_thread
 
     @pytest.mark.asyncio
     async def test_cancellation_reaps_ffmpeg_before_removing_the_owned_temp(
@@ -630,10 +567,7 @@ class TestTranscodeTempOwnership:
 
         monkeypatch.setattr(apple_speech.os, "unlink", tracked_unlink)
         with (
-            patch(
-                "kiro_crew.transcribe._open_ffmpeg_for_execution",
-                return_value="/fake/ffmpeg",
-            ),
+            patch("kiro_crew.transcribe._find_ffmpeg", return_value="/fake/ffmpeg"),
             patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
             patch("asyncio.create_subprocess_exec", return_value=_Proc()),
         ):
@@ -656,10 +590,7 @@ class TestTranscodeTempOwnership:
         proc.communicate = AsyncMock(return_value=(b"", b""))
         proc.returncode = 0
         with (
-            patch(
-                "kiro_crew.transcribe._open_ffmpeg_for_execution",
-                return_value="/fake/ffmpeg",
-            ),
+            patch("kiro_crew.transcribe._find_ffmpeg", return_value="/fake/ffmpeg"),
             patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
             patch("asyncio.create_subprocess_exec", return_value=proc),
         ):
@@ -1243,30 +1174,23 @@ class TestStreamingEndpointGate:
         assert "apple" in stt_stream._STREAMING_PROVIDERS
         assert "transcribe" in stt_stream._STREAMING_PROVIDERS
 
-    def test_the_gate_offers_exactly_the_selectable_providers(self):
-        """Every provider the loader can store produces partial results, so the gate
-        and the selectable set are the same set.
-
-        Pinned as an equality in both directions because each direction fails
-        differently and neither is visible from the endpoint: a selectable provider
-        missing from the tuple is a setting the user can choose and then get a 503
-        from, and a name in the tuple that the loader can never store (a retired
-        whole-file CLI with no partial-result channel) is a live path that would hang
-        a client until end of audio. Adding a provider without a partial channel has
-        to be a decision made here rather than inherited."""
+    def test_batch_only_providers_stay_out(self):
+        """whisper/mlx are whole-file CLIs with no partial-result channel — offering
+        them on the streaming endpoint would hang the client until end of audio."""
         from kiro_crew.dashboard import stt_stream
 
-        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS)
+        assert "whisper" not in stt_stream._STREAMING_PROVIDERS
+        assert "mlx" not in stt_stream._STREAMING_PROVIDERS
 
 
 class TestNoBlockingCallOnEventLoop:
     """The loop-reachable probes must never spawn a process.
 
     `transcribe.is_available` runs synchronously on the asyncio loop from the
-    `/api/config/stt` GET, `api_stt_transcribe`, and the Slack voice path. The
-    answer they want ("can this work") is one step away from one they must not
-    ask: `helper_path()` compiles the Swift helper with a 180s `swiftc` timeout,
-    and reaching it from any of those callers freezes chat turns and the liveness
+    `/api/config/stt` GET, `api_stt_transcribe`, and the Slack voice path — its
+    sibling `_stt_prereq_commands` is `asyncio.to_thread`'d for exactly this
+    reason. An earlier revision reached `helper_path()` from here, which runs
+    `swiftc` with a 180s timeout: that freezes chat turns and the liveness
     heartbeat for the whole compile. These tests are the guard.
     """
 
@@ -1318,48 +1242,14 @@ class TestNoBlockingCallOnEventLoop:
             assert is_available(SttConfig(enabled=True, provider="apple")) is True
 
     def test_provider_list_spawns_nothing(self):
-        """`_stt_providers` is called from the config GET handler on the loop.
-
-        It is the one advertiser that has to ASK whether a provider is usable, so
-        it is the likeliest place for a compile to creep back onto the loop: it
-        drops `apple` when the platform or the toolchain rules it out, and both
-        facts are exactly what a spawn would answer. The providers with no
-        precondition are asserted alongside so a probe that started refusing
-        everything would not read as a pass.
-        """
+        """`_stt_providers` is called from the config GET handler on the loop."""
         from kiro_crew.dashboard.handlers import core
 
         with ExitStack() as stack:
             for cm in self._no_spawn():
                 stack.enter_context(cm)
-            offered = core._stt_providers()
-        assert "apple" in offered
-        assert STT_PROVIDER_LOCAL in offered
-        assert "transcribe" in offered
-
-    def test_apple_is_dropped_rather_than_offered_unusably(self):
-        """Off Darwin, `apple` is omitted from the list instead of listed and refused.
-
-        The same list is what the PUT accepts, so an entry the platform cannot run
-        is a choice the picker offers and the save then rejects. Answering that
-        without a spawn is the other half: the platform check has to be reached
-        before any resolver, which is also why this needs no `_swiftc` stub.
-        """
-        from kiro_crew.dashboard.handlers import core
-
-        def boom(*args, **kwargs):
-            raise AssertionError(f"spawned a subprocess on the event-loop path: {args[:1]}")
-
-        with (
-            patch("subprocess.run", boom),
-            patch("subprocess.Popen", boom),
-            patch("subprocess.check_output", boom),
-            patch("platform.system", lambda: "Linux"),
-        ):
-            offered = core._stt_providers()
-        assert "apple" not in offered
-        assert STT_PROVIDER_LOCAL in offered
-        assert "transcribe" in offered
+            stack.enter_context(patch.object(core, "_is_apple_silicon", lambda: True))
+            assert "apple" in core._stt_providers()
 
     def test_fast_swiftc_resolver_never_spawns(self):
         def boom(*args, **kwargs):

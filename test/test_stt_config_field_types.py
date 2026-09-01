@@ -24,8 +24,7 @@ def _stub_host_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the response-building tail deterministic and off the host."""
     monkeypatch.setattr(core, "_stt_prereq_commands", lambda _provider: [])
     monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-    monkeypatch.setattr(core, "_find_ffmpeg", lambda: None)
-    monkeypatch.setattr(core, "_transcribe_extra_importable", lambda: True)
+    monkeypatch.setattr(core, "_voice_extra_importable", lambda: True)
     monkeypatch.setattr(core, "_pip_install_channel_available", lambda: True)
     monkeypatch.setattr(core.platform_compat, "is_bundled_interpreter", lambda: False)
     monkeypatch.setattr(core, "is_available", lambda _stt: False)

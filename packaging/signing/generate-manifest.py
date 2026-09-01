@@ -228,9 +228,9 @@ def find_archived_machos(app_path: str) -> "list[str]":
     "The binary is not signed with a valid Developer ID certificate",
     "The signature does not include a secure timestamp" and "The executable does
     not have the hardened runtime enabled" against a path of the form
-    `<archive>/<member>`. That is exactly how #6746 broke the release lane
-    (submission 3dbd3c7d): the Apple-Silicon imageio-ffmpeg executable was
-    gzip-sealed to survive signing byte-for-byte, and Apple looked inside.
+    `<archive>/<member>`. A dependency sealed inside an archive so its bytes
+    survive signing byte-for-byte is the shape that trips this: signing never
+    sees it, and the notary service does.
 
     Catch it HERE -- at sign time, with a bisectable trail -- instead of ~30
     minutes later as an opaque notarization Invalid. Only stdlib-openable
@@ -244,8 +244,7 @@ def find_archived_machos(app_path: str) -> "list[str]":
             "    Nothing signs a binary stored compressed, and the Apple notary "
             "service decompresses archive members and rejects the submission "
             "over it. Ship the executable UNCOMPRESSED so it is signed with the "
-            "other nested binaries (see kiro_crew.transcribe for how the runtime "
-            "authenticates a payload whose bytes signing rewrote)."
+            "other nested binaries."
         )
 
     for root, _dirs, files in os.walk(app_path):

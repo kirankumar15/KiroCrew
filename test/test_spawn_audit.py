@@ -118,12 +118,7 @@ _SPAWN_BASES = {"subprocess", "asyncio"}
 # Spawn helpers called as a BARE NAME rather than ``module.attr`` -- they are
 # imported directly, so the receiver check above cannot see them. Without this
 # the audit goes blind the moment a call site moves to the wrapper.
-_SPAWN_NAMES = {
-    "_create_ffmpeg_subprocess",
-    "create_subprocess_limited",
-    "run_limited",
-    "popen_limited",
-}
+_SPAWN_NAMES = {"create_subprocess_limited", "run_limited", "popen_limited"}
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
 # routed through the sandbox chokepoint. ``_prepare_sandboxed_spawn`` is the
@@ -955,6 +950,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # probe is to read the HOST's own macOS TCC grants, which a sandbox that
         # rewrites the process identity would answer wrongly.
         "dashboard/handlers/computer_use.py::_probe_permissions",
+        "dashboard/handlers/core.py::_is_apple_silicon",
+        "dashboard/handlers/core.py::_stt_prereq_commands",
+        "dashboard/handlers/core.py::api_stt_install",
         "dashboard/handlers/files.py::_run",
         "dashboard/handlers/files.py::api_screenshot",
         "dashboard/handlers/files.py::api_upload",
@@ -1183,10 +1181,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "slack/gateway.py::_warn_if_kiro_cli_outdated",
         "testing/harness.py::spawn_feature_gateway",
         # Apple on-device speech (macOS only). None of these takes an agent-authored
-        # command: the argv is a fixed toolchain path or the helper Kiro Crew itself
-        # compiled. `_build_helper` runs swiftc over a file that ships inside the
-        # package, writing to the data home's `run/` dir (sensitive-path fenced,
-        # 0700). The three spawns that EXECUTE the compiled helper
+        # command: the argv is a fixed toolchain path, the helper Kiro Crew itself
+        # compiled, or ffmpeg — and every variable part is a positional argument to
+        # execve (no shell), so a hostile value can only be a bad filename, not a
+        # second command. `_to_native_audio` mirrors the already-allowlisted
+        # `transcribe.py::_run_whisper_cli`: same ffmpeg invocation on the same
+        # user-supplied audio path. `_build_helper` runs swiftc over a file that ships
+        # inside the package, writing to the data home's `run/` dir (sensitive-path
+        # fenced, 0700). The three spawns that EXECUTE the compiled helper
         # (`transcribe`, `inventory`, `StreamingSession.start`) now route through
         # `sandbox.sandboxed_spawn_argv(mode="strict")` via `_sandboxed`, so they are
         # wrapped rather than merely declared; `strict` was verified to leave batch,
@@ -1205,33 +1207,8 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # (`transcribe.py::_python3_bin_dir` is absent: its scripts-dir probe
         # routes through `dep_sync.py::_probe_interpreter`, so an entry here
         # would be stale.)
-        # Every runtime audio conversion now converges here so the authenticated
-        # bundled image stays bound until spawn. The executable is either that
-        # digest-verified image or a fixed-directory system candidate; the three
-        # current callers pass fixed ffmpeg flags and positional audio/temp paths,
-        # never a shell, custom cwd, or agent-controlled environment. A hostile path
-        # can only name a bad input, not a second command. `_SPAWN_NAMES` propagates
-        # this audit through the generic helper, so each caller remains independently
-        # reviewed and a future caller fails the gate until it is classified.
-        "transcribe.py::_create_ffmpeg_subprocess",
-        # The macOS authenticity oracle for the bundled ffmpeg: spawns the
-        # absolute /usr/bin/codesign (never PATH) with constant flags and a
-        # requirement string built from a module-level team-ID constant. The
-        # only variable argument is the path of the process-private snapshot
-        # (`/proc/self/fd/N`-style descriptor or the 0o500 snapshot dir this
-        # module itself just wrote and digest-verified) — no agent influence
-        # over command, args, cwd, or env. It cannot route through
-        # sandboxed_spawn_argv: codesign must read the system trust store and
-        # evaluate the Apple certificate chain, which the OS sandbox denies.
-        "transcribe.py::_macos_developer_id_authentic",
-        "transcribe.py::_pcm_via_ffmpeg",
+        "transcribe.py::_run_whisper_cli",
         "transcribe.py::_transcribe_aws",
-        # The build probe executes the same authenticated image with the single
-        # fixed `-version` argument; it accepts no external input at all. Both
-        # streams are CAPTURED rather than discarded, so a refusal can name itself
-        # in the build log, and are decoded with errors="replace" because a loader
-        # complaint arrives in the host's console encoding.
-        "transcribe.py::_packaged_ffmpeg_version_probe",
         # JSON-Schema ``pattern`` validation for MCP app→gateway tool-call args
         # (validate_mcp_tool_arguments). The spawn's command surface is FULLY
         # fixed and NOT agent-selectable: binary is our own ``sys.executable``,

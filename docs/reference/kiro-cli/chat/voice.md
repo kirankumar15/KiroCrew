@@ -9,23 +9,20 @@ and voice output (text-to-speech). Both work in the dashboard and Slack.
 
 The chat input bar has a microphone button. Here's how it works:
 
-1. Click the mic button, and your browser asks for microphone permission.
-2. Speak your message. Words appear in the message box as you talk.
-3. Stop by clicking the mic button again, or (on the default local provider)
-   just by pausing: a silence of `stt.silence_ms` ends the utterance for you.
-4. Review and edit the text, then press Enter to send.
+1. Click the mic button — your browser requests microphone permission.
+2. Speak your message. The button pulses red while recording.
+3. Click the mic button again to stop recording.
+4. The audio is sent to the backend and transcribed locally using
+   [OpenAI Whisper](https://github.com/openai/whisper).
+5. The transcribed text appears in the input field. Review and edit it, then
+   press Enter to send.
 
-Recognition runs on your own machine by default, on a model Kiro Crew keeps
-loaded, so no audio leaves your device and a finished phrase becomes text in
-tens of milliseconds. Turning `stt.streaming` off transcribes once at the end
-instead, and the button shows a spinner while it works. If recognition fails or
-returns nothing, nothing is inserted.
+The button shows a spinner while transcribing. If transcription fails or
+returns empty text, nothing is inserted.
 
-**Browser requirements:** Chrome, Edge, Firefox, or Safari with microphone
-access. Live transcription needs `getUserMedia`, `AudioWorklet` and `WebSocket`;
-a browser missing any of them falls back to recording the whole utterance with
-`MediaRecorder` and transcribing it on release (WebM/Opus preferred, MP4/OGG
-fallback).
+**Browser requirements:** Chrome, Edge, or Firefox with microphone access.
+The browser must support `getUserMedia` and `MediaRecorder`. Audio format is
+auto-detected (WebM/Opus preferred, MP4/OGG fallback).
 
 ### Slack Voice Memos
 
@@ -33,68 +30,114 @@ When STT is enabled, voice memos sent in Slack threads are automatically
 transcribed. Kiro Crew processes the audio and responds to the transcribed text
 as if you had typed it.
 
-### Setup
+### Setup (Required for Both)
 
-Speech-to-text is on by default, and the default provider runs on this machine.
-Desktop releases already contain the recognizer and audio decoder; users only
-download their selected model. For a source/PyPI install, add the recognizer:
+Whisper must be installed for voice input to work in both the dashboard and
+Slack. Transcription runs entirely on your machine — no audio leaves your
+device.
 
-```bash
-pip install "kirocrew[voice]"
-```
+1. Open **Settings > Voice** — the Speech-to-Text card is there.
+2. Toggle **Speech-to-Text** on.
+3. Install system dependencies and build ffmpeg:
 
-Source environments also need a system FFmpeg for WebM, M4A, and ogg/Opus; Kiro
-Crew deliberately does not execute packaged binaries from an agent-writable
-project venv. Desktop installers instead carry and verify their pinned decoder,
-so desktop users never install Homebrew, Winget, Apt, or FFmpeg. Prebuilt
-recognizer wheels cover Apple silicon
-macOS, glibc and musl Linux on x86_64 and arm64, and Windows. An Intel Mac has
-none, so `pip` builds from source there and needs a C++ toolchain plus CMake.
-Settings reports that as its own state, not as a missing extra.
+   **AL2023:**
+   ```bash
+   sudo dnf install -y python3.11 python3.11-pip python3.11-devel gcc gcc-c++
+   sudo dnf install -y gcc make nasm diffutils
+   bash /path/to/KiroCrew/scripts/build-ffmpeg.sh
+   ```
 
-Then open **Settings > Voice**. The Speech-to-Text card reports whether the
-recognizer loaded and names the reason when it did not, and picks the model:
+   **macOS:**
+   ```bash
+   brew install python@3.11 ffmpeg
+   ```
 
-| Model | One-time download | Use it when |
-|-------|-------------------|-------------|
-| `tiny` | 78 MB | The machine is short of memory |
-| `base` | 148 MB | The default, and right for most dictation |
-| `small` | 488 MB | Accents or jargon are being misheard |
-| `large-v3-turbo` | 1.6 GB | You want the accuracy ceiling |
+   **AL2/AL2023 (recommended):** Install via brew (avoids glibc/dependency issues):
+   ```bash
+   brew install openai-whisper ffmpeg
+   ```
+   The `dnf` instructions above are for building from source when brew is unavailable.
 
-Choose the model and click **Download now**. The download is verified against a
-pinned sha256 digest before it is used and is reused from disk after that.
-Nothing else needs installing by hand: there is no separate transcription
-program, provider-specific runtime, or system FFmpeg dependency. `kirocrew
-doctor` reports the recognizer, model, and bundled decoder.
+4. Choose a model size:
 
-The other two providers, the full setting list and the retired providers are in
-Kiro Crew's own [configuration reference](../../../../src/kiro_crew/docs/configuration.md).
+   | Model | Download | Speed | Accuracy |
+   |-------|----------|-------|----------|
+   | `tiny` | ~75 MB | Fastest | Lower |
+   | `base` | ~145 MB | Fast | Good |
+   | `small` | ~484 MB | Medium | Better |
+   | `medium` | ~1.5 GB | Slow | High |
+   | `large-v3` | ~3.1 GB | Slowest | Highest |
+   | `turbo` | ~1.6 GB | Fast | High (default) |
+
+   `turbo` is `large-v3-turbo`: it keeps most of `large-v3`'s accuracy while
+   decoding several times faster, which is why it is the default.
+
+5. Click **Install** in the Speech-to-Text card — this installs the
+   `openai-whisper` Python package and ffmpeg. The model itself downloads
+   lazily on the first transcription, so the first dictation after a fresh
+   install takes noticeably longer.
+
+### MLX provider (Apple Silicon GPU)
+
+On Apple Silicon (M-series) Macs, the `mlx` provider runs Whisper on the Metal
+GPU via Apple's [MLX](https://github.com/ml-explore/mlx) framework — typically
+~5× faster than the CPU-based `whisper` provider. The `mlx` provider is
+selectable on every platform but only *available* on arm64 macOS; elsewhere the
+status badge stays "not installed".
+
+1. In the Speech-to-Text card, set **Provider** to `mlx`.
+2. Click **Install** — this runs `pipx install mlx-whisper` plus `ffmpeg`
+   (the provider-aware install button installs the right runtime for whichever
+   provider is selected).
+3. The MLX model (`mlx_model`, default `mlx-community/whisper-large-v3-turbo`)
+   downloads from Hugging Face on first transcription and is cached under
+   `~/.cache/huggingface/hub/`.
+
+`mlx-whisper` is installed out-of-band via `pipx` rather than as a package
+dependency because the `mlx` wheel is arm64-only; Kiro Crew invokes the
+`mlx_whisper` CLI as a subprocess, exactly like the `whisper` provider.
 
 ### CPU threads (many-core hosts)
 
-Kiro Crew derives the recognizer's thread count from the host: **half the
-available cores**, capped at 16. The count comes from `sched_getaffinity` where
-available, so a CPU-restricted container gets its real budget rather than the
-whole machine's.
+Kiro Crew derives the Whisper subprocess's thread count from the host: **half the
+available cores**, capped at 16. To control it yourself, set `OMP_NUM_THREADS` or
+`OPENBLAS_NUM_THREADS` — if either is set, Kiro Crew leaves both alone and your
+value is used as-is. The count comes from `sched_getaffinity` where available, so
+a CPU-restricted container gets its real budget rather than the whole machine's.
 
 Why not use every core: Whisper decodes one output step at a time, and each step
 is a small matmul that ends in a thread barrier. Wide thread pools therefore cost
 latency per step instead of buying throughput, and on a host that is doing other
-work (a Kiro Crew host runs the gateway and agent sessions alongside) the workers
-get time-sliced, so each barrier waits on threads the scheduler has not run yet.
+work — a Kiro Crew host runs the gateway and agent sessions alongside — the
+workers get time-sliced, so each barrier waits on threads the scheduler has not
+run yet.
 
 Measured on a 32-vCPU Graviton3 host with an 11-second clip, 16 threads beat 31
-(`base` 4.9s vs 7.3s, `large-v3-turbo` 20.8s vs 26.9s), and restricted to 16
-cores with `taskset`, 8 threads beat 16 (5s vs 7s). The headroom buys
-predictability more than raw speed: 8 threads measured 4.9-5.0s across repeats,
-while taking all 32 ranged 8.1-68.4s depending on how busy the machine was.
+(`base` 4.9s vs 7.3s, `turbo` 20.8s vs 26.9s), and restricted to 16 cores with
+`taskset`, 8 threads beat 16 (5s vs 7s). The headroom buys predictability more
+than raw speed: 8 threads measured 4.9–5.0s across repeats, while taking all 32
+ranged 8.1–68.4s depending on how busy the machine was.
 
-The cap is where both model shapes stop gaining. On the same clip in-process,
-`base` runs 0.96s at 8 threads, 1.13s at 16 and 1.18s at 24, while the
-encoder-heavy `large-v3-turbo` keeps improving (6.26s / 5.13s / 4.81s), so 16 is
-the width that leaves both within a few percent of their own best rather than
-extrapolating onto a 64-core host nobody measured.
+### Parakeet provider (Apple Silicon GPU)
+
+On Apple Silicon Macs, the `parakeet` provider runs NVIDIA's
+[Parakeet](https://github.com/senstella/parakeet-mlx) ASR models on the Metal
+GPU via MLX. Parakeet TDT 0.6b v3 is multilingual (25 languages), streams much
+faster than Whisper, and needs only about 600 MB of memory, which makes it a
+strong local default. Like `mlx`, the `parakeet` provider is selectable on every
+platform but only *available* on arm64 macOS.
+
+1. In the Speech-to-Text card, set **Provider** to `parakeet`.
+2. Click **Install**, which runs `pipx install parakeet-mlx` plus `ffmpeg`
+   (the provider-aware install button installs the right runtime for whichever
+   provider is selected).
+3. The Parakeet model (`parakeet_model`, default
+   `mlx-community/parakeet-tdt-0.6b-v3`) downloads from Hugging Face on first
+   transcription and is cached under `~/.cache/huggingface/hub/`.
+
+`parakeet-mlx` is installed out-of-band via `pipx` for the same arm64-only
+reason as `mlx-whisper`; Kiro Crew invokes the `parakeet-mlx` CLI as a
+subprocess, reusing the same runner as the `whisper` and `mlx` providers.
 
 ## Voice Output (Text-to-Speech)
 
@@ -280,8 +323,10 @@ you can't or don't want to use Amazon Polly.
    ```
 
 4. **ffmpeg is NOT required for Piper** (it outputs WAV directly that Slack
-   plays natively). ffmpeg is still needed for voice-memo *input*, whichever
-   speech-to-text provider is selected.
+   plays natively). ffmpeg is still needed for voice-memo *input* on every
+   speech-to-text provider except two: `faster` decodes audio in-process, and
+   `transcribe` uploads an `.ogg` memo to AWS as-is, needing ffmpeg only to
+   remux a `.webm` into ogg first.
 
 - **ffmpeg** for audio stitching (replay/Slack uploads). Not needed for
   streaming playback in the dashboard.

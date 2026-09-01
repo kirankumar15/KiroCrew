@@ -3,7 +3,6 @@ import { motion } from 'framer-motion'
 import Strands, { strandsSupported } from './Strands'
 import type { AudioSample } from '../hooks/mic'
 import MicSourceMenu from './MicSourceMenu'
-import { downloadLabel } from '../lib/sttProviders'
 import { i18nT } from '../i18n/t'
 
 /** One tracked token of the in-flight partial hypothesis. */
@@ -181,8 +180,6 @@ interface Props {
    * same time as the button saying it is noise.
    */
   gestureDriven?: boolean
-  /** Byte progress of the one-time speech-model download this session waits on. */
-  download?: { done: number; total: number } | null
 }
 
 /**
@@ -192,7 +189,7 @@ interface Props {
  * backend is solid, the in-flight partial hypothesis is muted. Both come from
  * the composer's own value, so what is shown here is exactly what will be sent.
  */
-export default function VoiceDictationPanel({ sampleRef, value, partial, deviceLabel, deviceId, onSelectDevice, deviceSwitchIsLive, streaming, gestureDriven, download }: Props) {
+export default function VoiceDictationPanel({ sampleRef, value, partial, deviceLabel, deviceId, onSelectDevice, deviceSwitchIsLive, streaming, gestureDriven }: Props) {
   // Split committed vs partial without coupling to STT internals: the partial
   // is appended to the composer value, so it is the suffix — but only trust
   // that when it actually matches (the user may have typed since).
@@ -241,62 +238,43 @@ export default function VoiceDictationPanel({ sampleRef, value, partial, deviceL
             </span>
           )}
         </div>
-        {/* One flex child, not two, so the outer `justify-between` keeps placing
-            the status row at the top and this block at the bottom whether or not
-            a download line is present. */}
-        <div className="flex flex-col gap-1">
-          {/* Text sits over a live shader, so it carries its own shadow floor
-              rather than relying on the background staying dark. */}
-          <div
-            className="text-[17px] leading-[1.45] text-text-strong max-h-20 overflow-hidden [text-shadow:0_1px_12px_var(--bg),0_0_3px_var(--bg)]"
-            data-testid="voice-dictation-transcript"
-          >
-            {committed}
-            {hasPartial && (
-              <span className="text-muted">
-                {tokens.map((t, i) =>
-                  t.stability === null ? (
-                    <span key={`ws-${i}`}>{t.text}</span>
-                  ) : (
-                    <motion.span
-                      // The alignment-stable id: a surviving word keeps its span
-                      // across insertions (no remount, no spurious re-flash),
-                      // and a revised word gets a fresh id, which is what
-                      // restarts the flash. Ids are never reused, so keys also
-                      // cannot collide across phrase commits.
-                      key={t.id}
-                      data-testid="dictation-word"
-                      data-stability={t.stability}
-                      data-generation={t.generation}
-                      // A revised word enters bright — full text color, not just
-                      // full-alpha muted, so the flash clears the muted ceiling
-                      // and reads over the live shader — then settles into the
-                      // dimness it has earned. Fresh words (generation 0) skip
-                      // the flash: appending is dictation, not revision.
-                      initial={
-                        t.generation > 0 ? { opacity: 1, color: 'var(--text-strong)' } : false
-                      }
-                      animate={{ opacity: restOpacity(t.stability), color: 'var(--muted)' }}
-                      transition={{ duration: 0.35 }}
-                    >
-                      {t.text}
-                    </motion.span>
-                  ),
-                )}
-              </span>
-            )}
-          </div>
-          {/* Under the transcript rather than in the status row: while the weights
-              are still arriving there IS no transcript, and this line is the only
-              thing distinguishing a first-run download from a dead microphone. */}
-          {download && (
-            <div
-              aria-live="polite"
-              className="text-[12px] text-muted [text-shadow:0_1px_12px_var(--bg),0_0_3px_var(--bg)]"
-              data-testid="voice-dictation-download"
-            >
-              {downloadLabel(download)}
-            </div>
+        {/* Text sits over a live shader, so it carries its own shadow floor
+            rather than relying on the background staying dark. */}
+        <div
+          className="text-[17px] leading-[1.45] text-text-strong max-h-20 overflow-hidden [text-shadow:0_1px_12px_var(--bg),0_0_3px_var(--bg)]"
+          data-testid="voice-dictation-transcript"
+        >
+          {committed}
+          {hasPartial && (
+            <span className="text-muted">
+              {tokens.map((t, i) =>
+                t.stability === null ? (
+                  <span key={`ws-${i}`}>{t.text}</span>
+                ) : (
+                  <motion.span
+                    // The alignment-stable id: a surviving word keeps its span
+                    // across insertions (no remount, no spurious re-flash), and
+                    // a revised word gets a fresh id, which is what restarts the
+                    // flash. Ids are never reused, so keys also cannot collide
+                    // across phrase commits.
+                    key={t.id}
+                    data-testid="dictation-word"
+                    data-stability={t.stability}
+                    data-generation={t.generation}
+                    // A revised word enters bright — full text color, not just
+                    // full-alpha muted, so the flash clears the muted ceiling
+                    // and reads over the live shader — then settles into the
+                    // dimness it has earned. Fresh words (generation 0) skip the
+                    // flash: appending is dictation, not revision.
+                    initial={t.generation > 0 ? { opacity: 1, color: 'var(--text-strong)' } : false}
+                    animate={{ opacity: restOpacity(t.stability), color: 'var(--muted)' }}
+                    transition={{ duration: 0.35 }}
+                  >
+                    {t.text}
+                  </motion.span>
+                ),
+              )}
+            </span>
           )}
         </div>
       </div>

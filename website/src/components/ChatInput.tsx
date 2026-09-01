@@ -388,10 +388,6 @@ interface ChatInputProps {
   voiceSampleRef?: { current: AudioSample }
   /** Latest partial hypothesis, rendered muted in the dictation panel. */
   voicePartial?: string
-  /** Byte progress of the one-time speech-model download the live session waits
-   *  on, or null. Both recording surfaces render it: a multi-hundred-megabyte
-   *  transfer with nothing on screen is indistinguishable from a hung mic. */
-  voiceDownload?: { done: number; total: number } | null
   /** Live composer caret, updated by ChatInput so ChatPage's dictation handler
    *  can splice the transcript in at the cursor instead of appending. */
   voiceCaretRef?: React.MutableRefObject<{ start: number; end: number } | null>
@@ -750,7 +746,6 @@ function ChatInput({
   voiceStreaming = false,
   voiceSampleRef,
   voicePartial = '',
-  voiceDownload = null,
   voiceCaretRef,
   voicePendingCaretRef,
   onClearVoiceError,
@@ -3155,9 +3150,9 @@ function ChatInput({
              keyboard hint stays suppressed for exactly the drain the finger
              just committed — and stays SHOWN for a keyboard-binding capture,
              where Esc/Enter genuinely work. */
-          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'} download={voiceDownload} />
+          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'} />
         ) : (
-          <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} download={voiceDownload} />
+          <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} />
         )}
 
         {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-yellow-400" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
