@@ -109,6 +109,147 @@ _VOICE_RUNTIME_LEAF = os.path.join("run", "voice-runtime")
 #: The data home the ``$HOME``-relative entries below assume.
 _CREW_HOME_DEFAULT = ".kiro/crew"
 
+#: Both data-home spellings every crew-relative rule below has to cover: a host that
+#: has not run the ``~/.kirocrew`` -> ``~/.kiro/crew`` migration still holds the real
+#: bytes at the legacy path, and ``config_dir()`` can resolve to either.
+_CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
+
+# ── The crew data home's governance tree, reconciled with security.py ──
+#
+# ``security.sensitive_home_dirs()`` is the AGENT-TOOL gate: it is what
+# ``is_sensitive_path`` refuses for a file_read/file_write tool call. The lists in this
+# module are a SEPARATE, OS-level gate — a spawned ``python -c`` or a shell command does
+# an ``open()`` that never routes through the tool gate, so a path fenced only there is
+# readable through any sandbox mode. Two entries (``.vault``, ``policy_cache``) were
+# already carried in both; the rest of the governance tree was not, which left the
+# ceiling itself (``security_policy.json``) readable and WRITABLE from an app lifecycle
+# script, a script hook, or a command cron.
+#
+# Reconciling the two is NOT a union, and the reason is specific: KiroCrew's own MCP
+# servers (``mcp_core``, ``mcp_cron``, ``mcp_computer``) are spawned by kiro-cli UNDER
+# this launcher and share the agent's mount namespace, as does a script cron's
+# ``boot_platform()``. Whatever they open at OS level cannot be masked. So each crew-home
+# leaf gets one of three dispositions:
+#
+#   HIDDEN    Nothing that runs inside the sandbox reads it. An empty dir/file is
+#             bind-mounted over it, in EVERY mode — the treatment ``.vault`` already
+#             gets, for the same reason.
+#   READONLY  In-sandbox code READS it and a WRITE would let the agent choose its own
+#             ceiling. Hiding a ceiling is the WRONG direction: an absent policy file
+#             resolves to the permissive standalone default, so masking
+#             ``security_policy.json`` from the process that enforces it REMOVES the
+#             ceiling instead of protecting it. Exposed read-only instead, which is what
+#             ``policy_cache`` already does.
+#   VISIBLE   In-sandbox code needs READ *and* WRITE, so no OS rule can apply without
+#             breaking it. These stay on the tool gate alone.
+#
+# ``test_sandbox_governance_mask.py`` pins the union of the three equal to the crew-home
+# half of ``security.sensitive_home_dirs()``, so a leaf added there cannot silently land
+# in none of them. Spelled here rather than imported so this low-level module keeps not
+# importing the 7k-line security module (the ``_POLICY_CACHE_LEAF`` convention above).
+
+#: Crew-home leaves with no legitimate in-sandbox reader — bind-masked in every mode.
+_CREW_HIDDEN_LEAVES: tuple[str, ...] = (
+    # Channel credentials. Already file-masked in cc/strict via ``_CC_FILES``; listing
+    # it here extends the same treatment to standard, where a spawned command could
+    # otherwise read every Slack/Discord token off disk.
+    ".env",
+    # App data holding live credentials or owner-authorization bits. Whole DIRECTORY,
+    # not the leaf file, because an atomic write renames a sibling temp into place.
+    "apps/aws-control/data",
+    "apps/meetings/data/edits",
+    "whatsapp",
+    "workspace/md-notebook/pat",
+    "workspace/md-notebook/vaults.json",
+    "workspace/md-notebook/settings.json",
+    # Browser session material. The extension token reaches the CLI through the
+    # environment, never by ``open()``, so masking the file costs nothing; the other
+    # four are retired leaves with no reader left in the tree. The LIVE browser paths
+    # (``browser-state``, ``playwright-snapshots``, ``pw``, ``playwright-cli-config.json``)
+    # are deliberately absent from the sensitive list and stay fully visible.
+    "browser-cookies.txt",
+    "playwright-storage-state.json",
+    "playwright-extension-token",
+    "browser-mode-enabled",
+    "browser-engine",
+    # Cross-session state whose authorization model is "a session reaches only its own",
+    # enforced by the HTTP routes. Every legitimate reader goes through the gateway, so
+    # OS-masking closes the sideways path without touching a live consumer.
+    "ledger",
+    "cron-history",
+    "workflow_library",
+    "agentcore-inbound",
+    "routing",
+    "webhooks",
+    "live_target.json",
+    "backup",
+    "mcp-apps",
+    # Auth stores and signing keys owned by the gateway web server alone.
+    "token_signing.key",
+    "refresh_chains.json",
+    "kas",
+    "ops_mission_control_secrets.json",
+    "ops_mission_control_policy.json",
+    # No producer and no consumer left in the tree; masked so a backup restore that
+    # resurrects a stale file cannot make it readable either.
+    ".kiro_cli_binary_trust.json",
+)
+
+#: Crew-home CEILINGS: read by in-sandbox code, never writable by it. Exposed
+#: read-only rather than hidden — see the READONLY note above for why hiding a
+#: ceiling inverts its effect.
+_CREW_READONLY_LEAVES: tuple[str, ...] = (
+    # The governance ceiling and its trust root. ``boot_platform()`` resolves both
+    # inside the sandbox for a script cron, and an absent file means "no ceiling".
+    "security_policy.json",
+    "admission_policy.json",
+    "profiles",
+    "app_admission.json",
+    # Opt-out and consent ceilings the config loader reads in-sandbox. A writable
+    # ``denied_commands.json`` lets an auto-approved agent set ``disable_all`` and
+    # defeat the deny gate after a restart; a writable ``computer_use.json`` lets it
+    # turn computer use on for itself.
+    "denied_commands.json",
+    "computer_use.json",
+    "oauth_endpoints.json",
+    "aws_service_consent.json",
+)
+
+#: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
+#: a deliberate exception a reviewer should re-check, not an oversight.
+_CREW_SANDBOX_VISIBLE_LEAVES: tuple[str, ...] = (
+    # Holds this launcher itself (``<config_dir>/run/kirocrew_sandbox_*.py``), so the
+    # child cannot exec if it is masked. Already sealed READ-ONLY through
+    # ``_voice_runtime_parent_paths()``, with only the ``run/voice-runtime`` leaf hidden.
+    "run",
+    # The SEL trust root and its append targets. ``verify_session_pid`` reads
+    # ``trust/sel_hmac.key`` inside the sandbox to resolve the strict session identity,
+    # ``skill_search`` reads ``trust/project-skills.json``, and the in-sandbox MCP
+    # servers append to the log directly — a masked log turns an audit-or-deny write
+    # into a denial of the action it was auditing.
+    "trust",
+    "sel_hmac.key",
+    "security_events.jsonl",
+    "security_events.d",
+    # How an in-sandbox MCP server authenticates back to the dashboard. Masking it
+    # breaks cron triggering, screencast, and the Sage review driver.
+    ".local_secret",
+    # ``mcp_cron`` builds a ``CronService(base_dir=config_dir())`` in-sandbox and both
+    # reads and rewrites the job store through it.
+    "crons.json",
+)
+
+
+def _crew_home_entries(leaves: tuple[str, ...]) -> list[str]:
+    """Expand *leaves* across both data-home spellings."""
+    return [f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in leaves]
+
+
+#: Bind-masked in every mode.
+_CREW_HIDDEN_DIRS: list[str] = _crew_home_entries(_CREW_HIDDEN_LEAVES)
+#: Exposed read-only in every mode.
+_CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
+
 _STRICT_DIRS: list[str] = [
     ".kiro/crew-auth-staging",
     ".aws",
@@ -142,6 +283,8 @@ _STRICT_DIRS: list[str] = [
     ".kiro/crew/run/voice-runtime",
     ".kirocrew/run/voice-runtime",
 ]
+_STRICT_DIRS += _CREW_HIDDEN_DIRS
+_STRICT_DIRS += [".midway"]
 
 _STANDARD_DIRS: list[str] = [
     ".kiro/crew-auth-staging",
@@ -167,6 +310,7 @@ _STANDARD_DIRS: list[str] = [
     ".kiro/crew/run/voice-runtime",
     ".kirocrew/run/voice-runtime",
 ]
+_STANDARD_DIRS += _CREW_HIDDEN_DIRS
 
 # CC mode: hides all credential dirs including .aws, but selectively exposes
 # .aws/config (needed for credential_process → Bedrock auth). All other .aws
@@ -197,6 +341,8 @@ _CC_DIRS: list[str] = [
     ".kiro/crew/run/voice-runtime",
     ".kirocrew/run/voice-runtime",
 ]
+_CC_DIRS += _CREW_HIDDEN_DIRS
+_CC_DIRS += [".midway"]
 
 
 def _relocated_policy_cache_dirs() -> list[str]:
@@ -2075,6 +2221,16 @@ def _build_launcher_script(
     # its lexical and canonical spellings read-only prevents an agent from
     # renaming the hidden voice-runtime mount out from under the path-based rule.
     readonly_dirs.extend(_voice_runtime_parent_paths())
+    # The crew data home's ceilings. Read-only rather than hidden because in-sandbox
+    # code resolves them (a script cron's ``boot_platform()``, the config loader) and an
+    # absent ceiling reads as the permissive standalone default — masking one would
+    # REMOVE it. A caller's ``extra_visible_dirs`` cannot re-open the write side, for the
+    # reason spelled out for the governance cache above.
+    readonly_dirs.extend(
+        os.path.join(home, target)
+        for target in _CREW_READONLY_TARGETS
+        if os.path.join(home, target) not in hidden_dirs
+    )
     # A caller-supplied hidden path may be a FILE, and the two launcher loops hide
     # each kind differently: a directory gets an empty dir bind-mounted over it, a file
     # gets an empty temp file. The dir loop is guarded by `if os.path.isdir(target)`, so
@@ -2372,12 +2528,17 @@ def main():
         # in our own user+mount namespace because we created the bind ourselves.
         for d in READONLY_DIRS:
             target = d.encode()
-            if os.path.isdir(target):
+            # ``exists``, not ``isdir``: a governance ceiling is a plain file
+            # (``security_policy.json``), and bind-over-self + MS_RDONLY seals a
+            # regular file exactly as it seals a directory. Guarding on ``isdir``
+            # would silently skip every ceiling FILE — the caller asks for it to be
+            # sealed, gets no error, and it stays writable.
+            if os.path.exists(target):
                 _mount_or_die(target, target, _MS_BIND,
-                              "exposing read-only directory %s" % d)
+                              "exposing read-only path %s" % d)
                 _mount_or_die(target, target,
                               _MS_REMOUNT | _MS_BIND | _MS_RDONLY,
-                              "sealing read-only directory %s" % d)
+                              "sealing read-only path %s" % d)
 
         # Restore selectively exposed files into the now-empty mounts
         for src_path, filename in EXPOSE_FILES:
@@ -2968,6 +3129,16 @@ def _build_seatbelt_profile(
     for target in _voice_runtime_ancestor_guards():
         escaped = target.replace('"', '\\"')
         rules.append(f'(deny file-write* (literal "{escaped}"))')
+    # The crew data home's ceilings: readable (in-sandbox code resolves them) but never
+    # writable, so a sandboxed process cannot hand itself a ceiling. Mirrors
+    # READONLY_DIRS on Linux. Both spellings, because a ceiling may be a file
+    # (``literal``) or a directory (``subpath``), and ``file-link`` stops the agent
+    # minting a writable alias to the same inode.
+    for target in (os.path.join(home, rel) for rel in _CREW_READONLY_TARGETS):
+        escaped = target.replace('"', '\\"')
+        rules.append(f'(deny file-write* (literal "{escaped}"))')
+        rules.append(f'(deny file-write* (subpath "{escaped}"))')
+        rules.append(f'(deny file-link (subpath "{escaped}"))')
     for f in files:
         target = os.path.join(home, f)
         escaped = target.replace('"', '\\"')
