@@ -84,6 +84,45 @@ def _validated_aliases(value: object) -> str:
     return text
 
 
+def _without_sync_status(properties):
+    """*properties* with any ``sync_status`` key removed.
+
+    The ``sources.sync_status`` COLUMN is the single source of truth for a
+    source's sync state: the dashboard list, the watcher's pre-scan skip and
+    ``SyncScheduler.sync_all`` all read it. A ``sync_status`` key inside the
+    properties JSON is a SECOND store that only the writer touching it observes
+    -- the divergence that let a paused folder go on being walked every sweep
+    and a vanished file go on rendering 'synced'.
+
+    Callers may still STATE a status in properties at INSERT time (that is the
+    channel ``_initial_sync_status`` reads, under an allowlist); it is dropped
+    from what gets persisted, so no row carries two answers. After insert the
+    column is written explicitly or not at all: a status found in a properties
+    write is discarded rather than applied, because a blob read off a legacy row
+    carries a value that is stale by definition, and honouring it would let the
+    watcher stamp 'missing' back onto a file it had just re-ingested.
+
+    The input is never mutated. A value that is not a JSON object (legacy
+    imports hold arrays), an unparsable blob, and a blob without the key all
+    pass through unchanged.
+    """
+    if isinstance(properties, str):
+        try:
+            parsed = json.loads(properties)
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError is a RuntimeError, so it needs naming: json.loads
+            # recurses per nesting level, and this helper sits on every insert
+            # and update path. A pathologically nested blob is left exactly as
+            # it was rather than failing the write.
+            return properties
+        if not isinstance(parsed, dict) or "sync_status" not in parsed:
+            return properties
+        return json.dumps(_without_sync_status(parsed))
+    if not isinstance(properties, dict) or "sync_status" not in properties:
+        return properties
+    return {k: v for k, v in properties.items() if k != "sync_status"}
+
+
 class _NodeView:
     """Minimal node-attribute view supporting get, subscript, iteration, and len."""
 
@@ -513,41 +552,77 @@ class KnowledgeStore:
         src_cols = {r[1] for r in self.db.execute("PRAGMA table_info(sources)").fetchall()}
         if "sync_status" not in src_cols:
             self.db.execute("ALTER TABLE sources ADD COLUMN sync_status TEXT DEFAULT 'pending'")
-        # Repair rows whose column still holds the un-written 'pending' default
-        # while the properties JSON carries the intended state (rows inserted
-        # before the column was written on INSERT). The dashboard picks the
-        # row's control from the column, so a divergent row renders Pause
-        # instead of Confirm and the source cannot be started. Only 'pending'
-        # rows are candidates: any row a handler transitioned already had its
-        # column written, so a repaired value never overwrites a live state.
-        divergent = self.db.execute(
-            "SELECT id, properties FROM sources WHERE sync_status = 'pending'").fetchall()
-        for row in divergent:
+        # ONE pass over the rows that still carry a blob copy of the status:
+        # converge it onto the column, then retire it. Every candidate for either
+        # kind of convergence is a row whose blob holds a status, so one SELECT
+        # covers both -- and after this pass no row has a copy at all, so on a
+        # store that has already opened once the scan matches nothing.
+        #
+        # An INITIAL state is repaired onto a column still at its un-written
+        # 'pending' default (rows inserted before the column was written on
+        # INSERT). The dashboard picks the row's control from the column, so a
+        # divergent row renders Pause instead of Confirm and the source cannot be
+        # started. Only 'pending' rows are candidates: any row a handler has
+        # transitioned already had its column written, so a repair never
+        # overwrites a live state.
+        #
+        # 'error' is LIFTED from any column, because it is the one LIFECYCLE value
+        # that ever lived in the blob alone -- rows quiesced by a pre-column
+        # ``SyncScheduler._record_failure`` carry it only there, and ``sync_all``
+        # now reads the column and nothing else, so without the lift those
+        # sources would be retried forever. It is deliberately NOT part of the
+        # initial-state repair: that allowlist exists because a promoted 'syncing'
+        # would make the sync endpoint report a conflict for a sync that never
+        # started. 'missing' (the watcher's old blob-only write) needs no lift --
+        # the watcher re-stats every file on every sweep and re-marks the column
+        # from the filesystem.
+        #
+        # The copy is then RETIRED. This runs on EVERY open, so leaving the key in
+        # place would make both reads above standing readers of a value that goes
+        # stale the moment a column-only writer moves the row: a legacy
+        # blob-'error' source that later syncs (ingestion writes the column and
+        # never touches properties) would have 'error' stamped back over its fresh
+        # 'synced' at the next start, and a bundle status the allowlist refused at
+        # import would be applied one reopen later. Retiring makes this a one-time
+        # repair instead.
+        #
+        # Every write is compare-and-set on the row as READ -- the blob AND the
+        # column -- so a concurrent writer wins. Binding the column matters as
+        # much as binding the blob: a column-only transition, which is what every
+        # live writer now does, leaves properties untouched, so a blob-only
+        # precondition would still match and would stamp a stale status over a
+        # sync that had just succeeded. Binding the blob matters for the reverse
+        # case, a pre-column writer moving the copy mid-pass. A row that moved
+        # under either is left alone and converged by the next open.
+        blob_copies = self.db.execute(
+            "SELECT id, properties, sync_status FROM sources "
+            "WHERE properties LIKE '%sync_status%'").fetchall()
+        for row in blob_copies:
             try:
                 props = json.loads(row["properties"] or "{}")
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
+                # RecursionError (a RuntimeError, so not covered by ValueError):
+                # json.loads recurses per nesting level, and this runs on EVERY
+                # open, so one pathologically nested legacy blob would otherwise
+                # abort every store construction -- a gateway that cannot start.
                 continue
-            if not isinstance(props, dict):
+            if not isinstance(props, dict) or "sync_status" not in props:
                 continue
-            json_status = props.get("sync_status")
-            if (isinstance(json_status, str) and json_status != "pending"
-                    and json_status in self._INITIAL_SYNC_STATUSES):
-                # Re-check BOTH copies in the UPDATE itself: a concurrent
-                # handler may have transitioned the row between the SELECT
-                # and this write, and its live state must win over the
-                # snapshot taken above. The column alone is not enough --
-                # ``SyncScheduler._record_failure`` writes the properties copy
-                # without the column, so a failure landing in that window
-                # would leave the JSON reading 'error' under a repaired
-                # 'pending_confirmation' column and the dashboard would offer
-                # Confirm for a source the scheduler has given up on. Binding
-                # the properties blob as read makes this a compare-and-set on
-                # both; a row that moved is skipped and repaired by the next
-                # open, since this runs on every one.
+            copied = props["sync_status"]
+            if (row["sync_status"] == "pending" and isinstance(copied, str)
+                    and copied != "pending" and copied in self._INITIAL_SYNC_STATUSES):
                 self.db.execute(
                     "UPDATE sources SET sync_status = ? "
                     "WHERE id = ? AND sync_status = 'pending' AND properties = ?",
-                    (json_status, row["id"], row["properties"]))
+                    (copied, row["id"], row["properties"]))
+            elif copied == "error":
+                self.db.execute(
+                    "UPDATE sources SET sync_status = 'error' "
+                    "WHERE id = ? AND properties = ? AND sync_status IS ?",
+                    (row["id"], row["properties"], row["sync_status"]))
+            self.db.execute(
+                "UPDATE sources SET properties = ? WHERE id = ? AND properties = ?",
+                (_without_sync_status(row["properties"]), row["id"], row["properties"]))
         if "summary_topic" not in src_cols:
             self.db.execute("ALTER TABLE sources ADD COLUMN summary_topic TEXT")
         if "summary_themes" not in src_cols:
@@ -1046,10 +1121,11 @@ class KnowledgeStore:
                     return None, False
             sid = str(uuid4())
             now = datetime.now().isoformat()
+            stored = _without_sync_status(properties)
             self.db.execute(
                 "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (sid, name, source_type, uri, json.dumps(properties),
+                (sid, name, source_type, uri, json.dumps(stored),
                  self._initial_sync_status(properties), now, now),
             )
             self.db.execute("COMMIT")
@@ -1305,12 +1381,13 @@ class KnowledgeStore:
             (item_id, entity_id, context, now))
         self.db.commit()
 
-    # States a sources row may legitimately START in. Lifecycle states
-    # (syncing/synced/error/paused/missing) are written by handlers as
-    # transitions and are never valid at insert: persisting a caller-supplied
-    # 'syncing' would make the sync endpoint report a conflict forever for a
-    # source whose sync never started.
-    _INITIAL_SYNC_STATUSES = frozenset({"pending", "pending_confirmation", "active"})
+    # States a sources row may legitimately START in: the DURABLE ones, which a
+    # caller (or a restored bundle) can assert about a source before any work has
+    # run. The transient and outcome states -- syncing/synced/error/missing --
+    # are claims about work, so only the operation that did the work may write
+    # them: persisting a caller-supplied 'syncing' would make the sync endpoint
+    # report a conflict forever for a source whose sync never started.
+    _INITIAL_SYNC_STATUSES = frozenset({"pending", "pending_confirmation", "active", "paused"})
 
     @staticmethod
     def _initial_sync_status(properties) -> str:
@@ -1325,19 +1402,30 @@ class KnowledgeStore:
         Values outside the initial-state allowlist fall back to 'pending'.
         """
         if isinstance(properties, dict):
-            status = properties.get("sync_status")
-            if isinstance(status, str) and status in KnowledgeStore._INITIAL_SYNC_STATUSES:
-                return status
+            return KnowledgeStore._initial_status_or_default(properties.get("sync_status"))
+        return "pending"
+
+    @staticmethod
+    def _initial_status_or_default(status) -> str:
+        """*status* if a row may legitimately start there, else 'pending'.
+
+        The allowlist itself, shared by every insert path so a status arriving
+        through the properties blob and one restored from a bundle's column are
+        held to the same rule.
+        """
+        if isinstance(status, str) and status in KnowledgeStore._INITIAL_SYNC_STATUSES:
+            return status
         return "pending"
 
     def add_source(self, name, source_type, uri, **kwargs) -> str:
         sid = str(uuid4())
         now = datetime.now().isoformat()
         properties = kwargs.get("properties", {})
+        stored = _without_sync_status(properties)
         self.db.execute(
             "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
             "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (sid, name, source_type, uri, json.dumps(properties),
+            (sid, name, source_type, uri, json.dumps(stored),
              self._initial_sync_status(properties), now, now))
         self.db.commit()
         return sid
@@ -1349,15 +1437,42 @@ class KnowledgeStore:
     _SOURCE_COLUMNS = {"name", "source_type", "uri", "properties", "last_synced", "sync_status", "updated_at"}
 
     def update_source(self, source_id, **fields):
+        """Write *fields* to a sources row.
+
+        ``if_sync_status`` makes the write a compare-and-set on the status
+        column: the row is written only while it still reads that value. A caller
+        deriving a status from a SNAPSHOT it took earlier must pass it, because
+        the row can move in between -- a sweep that observed 'missing' and then
+        writes 'synced' would otherwise overwrite the 'error' a manual sync
+        recorded in the meantime. A caller writing the outcome of something that
+        just happened has current information and does not need it.
+        """
+        expected = fields.pop("if_sync_status", None)
         if not fields:
             return
+        if "properties" in fields:
+            # The blob is not a place a status can live. Dropping it here means a
+            # legacy row's second copy disappears the first time anything writes
+            # its properties, and no caller can mint a new one. It is DROPPED,
+            # not applied to the column: a blob read off a legacy row carries a
+            # stale value, so honouring it would let the watcher stamp 'missing'
+            # back onto a file it had just re-ingested. A transition passes
+            # sync_status= explicitly.
+            fields["properties"] = _without_sync_status(fields["properties"])
         fields["updated_at"] = datetime.now().isoformat()
         safe = {k: v for k, v in fields.items() if k in self._SOURCE_COLUMNS}
         if not safe:
             return
         cols = ", ".join(f"{k} = ?" for k in safe)
         vals = [json.dumps(v) if isinstance(v, (list, dict)) else v for v in safe.values()]
-        self.db.execute(f"UPDATE sources SET {cols} WHERE id = ?", (*vals, source_id))  # noqa: S608
+        sql = f"UPDATE sources SET {cols} WHERE id = ?"  # noqa: S608
+        params: list = [*vals, source_id]
+        if expected is not None:
+            # IS, not =, so a NULL column compares as a value rather than
+            # silently matching nothing.
+            sql += " AND sync_status IS ?"
+            params.append(expected)
+        self.db.execute(sql, params)
         self.db.commit()
 
     def add_source_location(self, item_id, source_id, chunk_range=None, section_title=None, anchor=None):
@@ -1559,11 +1674,33 @@ class KnowledgeStore:
         self.db.execute("BEGIN")
         try:
             for src in bundle.get("sources", []):
+                # Restore the status from the COLUMN, which ``export_all`` ships
+                # (it serializes SELECT * FROM sources). Reading the blob copy
+                # instead would land every bundle exported from a fixed store at
+                # the 'pending' default -- there is no copy there any more -- and
+                # silently resume a folder the user had paused. A bundle written
+                # before this change has the blob copy and no column, so fall
+                # back to it. Both go through the same allowlist as the other
+                # insert paths: a bundle is untrusted input, and a restored
+                # 'syncing' would report a conflict forever for a sync that
+                # never started.
+                #
+                # The blob is then stripped like every other insert path. Storing
+                # it verbatim would keep the refused value inside the row, and
+                # the migration's error-lift READS that key on every open -- so a
+                # bundle 'error' the allowlist just refused would be stamped onto
+                # the column at the next start, defeating the boundary one reopen
+                # later.
+                props_text = _validated_properties(src.get("properties"))
+                restored = src.get("sync_status")
+                if not isinstance(restored, str) or not restored:
+                    restored = json.loads(props_text or "{}").get("sync_status")
                 self.db.execute(
-                    "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, "
+                    "sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (src["id"], src["name"], src["source_type"], src["uri"],
-                     _validated_properties(src.get("properties")),
+                     _without_sync_status(props_text),
+                     self._initial_status_or_default(restored),
                      src.get("created_at", now), now))
             for item in bundle.get("items", []):
                 raw_emb = item.get("embedding")
