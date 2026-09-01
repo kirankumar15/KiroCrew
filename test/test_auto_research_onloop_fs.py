@@ -34,7 +34,7 @@ import inspect
 import json
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
@@ -355,3 +355,44 @@ class TestCancellationSettlesWorker:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert finished, "the worker ran to completion before cancellation propagated"
+
+    @pytest.mark.asyncio
+    async def test_on_settled_runs_after_settlement_only_when_cancelled(self):
+        """``on_settled`` is the seam the watchdog's failure logging rides on:
+        it must observe a SETTLED task (so ``task.result()`` cannot raise
+        ``InvalidStateError``), fire exactly once on the cancellation path,
+        and stay silent on the normal path. A REPEAT cancellation while the
+        helper is re-shielding must neither cancel the inner task nor abort
+        the settling loop (the ``continue`` branch).
+        """
+        release = threading.Event()
+        observed: list[bool] = []
+
+        def worker() -> NoReturn:
+            release.wait(timeout=10)
+            raise OSError("worker failed")
+
+        inner = asyncio.create_task(asyncio.to_thread(worker))
+        task = asyncio.create_task(
+            h._settle_before_cancellation(inner, on_settled=lambda t: observed.append(t.done()))
+        )
+        await asyncio.sleep(0.05)  # let the worker thread start
+        task.cancel()
+        await asyncio.sleep(0.05)  # first cancellation lands; helper re-shields
+        task.cancel()
+        await asyncio.sleep(0.05)  # repeat cancellation hits the continue branch
+        assert not task.done(), "a repeat cancellation must not abort the settling loop"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not inner.cancelled(), "no cancellation may reach the settling task"
+        assert observed == [True], "on_settled fires once, after the task settled"
+
+        # Normal path: the callback must not run when nothing was cancelled.
+        observed.clear()
+        result = await h._settle_before_cancellation(
+            asyncio.create_task(asyncio.to_thread(lambda: 42)),
+            on_settled=lambda t: observed.append(t.done()),
+        )
+        assert result == 42
+        assert observed == [], "on_settled must not fire on the uncancelled path"

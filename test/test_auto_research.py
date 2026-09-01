@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -2395,6 +2396,68 @@ class TestWatchdogStopTombstone:
         # A non-terminal campaign keeps its loop so restart can retry settling.
         assert svc.get_by_slot(f"research-{cid}") is loop
         svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_settlement_failure_is_logged_without_replacing_cancellation(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The watchdog reports a settlement failure it swallowed during shutdown.
+
+        The shield-and-settle discipline deliberately lets the ORIGINAL
+        cancellation win over a worker failure; the failure's only remaining
+        trace is the watchdog's log record. Pin that record so folding the
+        inline settlement loop onto ``_settle_before_cancellation`` (or any
+        later refactor of it) cannot silently drop the reporting path.
+        """
+        from kiro_crew.apps.builtins.auto_research import handlers as h
+        from kiro_crew.autonudge import AutoNudgeService
+
+        cid = "a1b2c3d4"
+        svc = AutoNudgeService(base_dir=tmp_path)
+        await svc.start()
+        await svc.add(slot_key=f"research-{cid}", message="watch", idle_secs=60)
+        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
+        monkeypatch.setattr(
+            h,
+            "_stalled_campaign_verdict",
+            lambda _cid, _files, *, stopped_reason="": (CampaignStatus.STOPPED, None),
+        )
+
+        status_write_started = threading.Event()
+        release_status_write = threading.Event()
+
+        def _persist(_cid, _status, **_kwargs):
+            status_write_started.set()
+            assert release_status_write.wait(timeout=5)
+            raise OSError("status store unavailable")
+
+        monkeypatch.setattr(h, "update_campaign_status", _persist)
+        monkeypatch.setattr(h, "_campaign_run_is_current", lambda _cid, _started: True)
+        task = asyncio.create_task(
+            h._settle_campaign_from_watchdog(
+                cid, [], {}, {}, observed_started_at=1.0
+            )
+        )
+        assert await asyncio.to_thread(status_write_started.wait, 5)
+
+        try:
+            task.cancel()
+            release_status_write.set()
+            with caplog.at_level(logging.ERROR, logger=h.__name__):
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=5)
+
+            failure_records = [
+                r
+                for r in caplog.records
+                if "terminal settlement failed during shutdown" in r.getMessage()
+            ]
+            assert failure_records, "the swallowed settlement failure must be logged"
+            assert failure_records[0].exc_info is not None, (
+                "the log record must carry the worker failure's traceback"
+            )
+        finally:
+            svc.stop()
 
     @pytest.mark.asyncio
     async def test_partial_terminal_persistence_still_removes_durable_loop(
