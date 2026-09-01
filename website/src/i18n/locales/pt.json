@@ -9538,7 +9538,8 @@
       "workflow_running_other": "{{count}} fluxos de trabalho em execução",
       "flat_view_hide_folders_in_board_columns": "Visão plana — ocultar pastas nas colunas do quadro",
       "show_folders_in_board_columns": "Mostrar pastas nas colunas do quadro",
-      "switch_to_flat_view_hide_folders_in_board_columns": "Mudar para visão plana (ocultar pastas nas colunas do quadro)"
+      "switch_to_flat_view_hide_folders_in_board_columns": "Mudar para visão plana (ocultar pastas nas colunas do quadro)",
+      "remote_sessions_are_not_shown_in_board_view": "{{count}} sessão(ões) remota(s) não são exibidas na visualização de quadro — as colunas correspondem por etiquetas, que uma sessão remota não possui."
     },
     "connectionsPage": {
       "action_failed": "Falha na ação: {{error}}",
@@ -9903,7 +9904,9 @@
         "inbound_webhook_tokens_registered_contexts_and_r": "Tokens de webhooks de entrada, contextos registrados e histórico de execuções. A API funciona; a página não está concluída.",
         "open_webhooks": "Abrir Webhooks",
         "the_crew_members_page_and_crew_mode_chats_both_a": "A página Membros da equipe e os chats do Crew Mode. Ambos ainda estão em construção, por isso só aparecem quando esta opção é ativada.",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "remote_instance_sessions": "Sessões da instância remota",
+        "merge_a_connected_remote_instances_live_sessions": "Combina as sessões ativas de uma instância remota conectada na lista de sessões, cada uma com um selo de servidor. Funcional, mas não finalizado."
       }
     },
     "developerPage": {

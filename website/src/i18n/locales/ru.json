@@ -9683,7 +9683,8 @@
       "workflow_running_other": "{{count}} рабочего процесса выполняется",
       "flat_view_hide_folders_in_board_columns": "Плоский вид — скрыть папки в колонках доски",
       "show_folders_in_board_columns": "Показать папки в колонках доски",
-      "switch_to_flat_view_hide_folders_in_board_columns": "Переключиться на плоский вид (скрыть папки в колонках доски)"
+      "switch_to_flat_view_hide_folders_in_board_columns": "Переключиться на плоский вид (скрыть папки в колонках доски)",
+      "remote_sessions_are_not_shown_in_board_view": "{{count}} удалённых сеансов не отображаются в режиме доски — столбцы сопоставляются по тегам, которых у удалённого сеанса нет."
     },
     "connectionsPage": {
       "action_failed": "Не удалось выполнить действие: {{error}}",
@@ -10049,7 +10050,9 @@
         "inbound_webhook_tokens_registered_contexts_and_r": "Токены входящих вебхуков, зарегистрированные контексты и история запусков. API работает, но страница не доделана.",
         "open_webhooks": "Открыть вебхуки",
         "the_crew_members_page_and_crew_mode_chats_both_a": "Страница «Участники команды» и чаты Crew Mode. Оба ещё в разработке, поэтому не отображаются, пока эта опция не включена.",
-        "webhooks": "Вебхуки"
+        "webhooks": "Вебхуки",
+        "remote_instance_sessions": "Сеансы удалённого экземпляра",
+        "merge_a_connected_remote_instances_live_sessions": "Объединяет активные сеансы подключённого удалённого экземпляра со списком сеансов, помечая каждый значком сервера. Работает, но ещё не завершено."
       }
     },
     "developerPage": {

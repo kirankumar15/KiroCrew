@@ -2979,6 +2979,27 @@ export const api = {
   instancesCreateRemoteSlot: (instanceId: string) =>
     post('/api/instances/' + encodeURIComponent(instanceId) + '/proxy/api/chat/slots',
       {}).then(j) as Promise<{ key?: string }>,
+
+  // A CONNECTED remote instance's LIVE sessions, read through the owner-only
+  // instance proxy. These three ride the proxy's existing ('api','chat')
+  // allowlist row — the row grants the whole subtree, so list/rename/close need
+  // no policy change. A remote instance's OLDER sessions are deliberately absent:
+  // they live under the peer's /api/sessions, and the prefix row that would admit
+  // them would also admit clear-all, session-restart, a memory read and a
+  // token-spending summarize.
+  instanceChatSlots: (id: string) =>
+    fetch('/api/instances/' + encodeURIComponent(id) + '/proxy/api/chat/slots').then(j),
+  instanceRenameSlot: (id: string, slot: string, title: string) =>
+    patch(
+      '/api/instances/' + encodeURIComponent(id) + '/proxy/api/chat/slots/' +
+        encodeURIComponent(slot) + '/title',
+      { title },
+    ).then(j),
+  instanceCloseSlot: (id: string, slot: string) =>
+    del(
+      '/api/instances/' + encodeURIComponent(id) + '/proxy/api/chat/slots/' +
+        encodeURIComponent(slot),
+    ).then(j),
   sessionDetail: (key: string) => fetch('/api/sessions/' + encodeURIComponent(key)).then(j),
   deleteSession: (key: string) => del('/api/sessions/' + encodeURIComponent(key)).then(j),
   clearSessions: () => del('/api/sessions').then(j),
