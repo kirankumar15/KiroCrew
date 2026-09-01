@@ -4687,9 +4687,34 @@ async def _run_chat(
                             "text": f"Hook {r.hook_name} BLOCKED: {r.stderr[:100] if r.stderr else 'denied'}",
                         },
                     )
-                elif r.exit_code not in (0, 2) and r.stderr:
-                    # Non-zero, non-block: show warning
-                    logger.warning("Hook %s warning: %s", r.hook_name, r.stderr[:200])
+                elif r.exit_code not in (0, 2):
+                    detail = (r.error or r.stderr or f"exited with code {r.exit_code}")[:200]
+                    if event == HOOK_EVENT_PRE_TOOL_USE:
+                        # Fail closed. A PreToolUse hook that timed out, crashed,
+                        # or could not be executed at all (missing binary → 127)
+                        # never rendered a verdict, so it is NOT "no opinion" —
+                        # the policy gate did not run and the tool must not
+                        # proceed. Treating it as a pass would mean breaking,
+                        # slowing, or deleting the deny hook silently disables
+                        # the policy it enforces. Same shape as the hook-store
+                        # and fire()-raised denials on this path.
+                        injected.append(f"BLOCKED:{r.hook_name}:{detail}")
+                        logger.error(
+                            "Hook %s could not deliver a verdict (%s) - blocking tool",
+                            r.hook_name,
+                            detail,
+                        )
+                        state.broadcast_ws(
+                            "activity_event",
+                            {
+                                "slot": slot.key,
+                                "kind": "hook",
+                                "text": f"Hook {r.hook_name} BLOCKED (no verdict): {detail[:100]}",
+                            },
+                        )
+                    elif r.stderr:
+                        # Non-zero, non-block on a non-gating event: warn only.
+                        logger.warning("Hook %s warning: %s", r.hook_name, r.stderr[:200])
         except Exception as exc:
             if event == HOOK_EVENT_PRE_TOOL_USE:
                 logger.warning("Hook fire error during blocking event %s: %s", event, exc)
