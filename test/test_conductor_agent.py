@@ -186,6 +186,37 @@ class TestConductorInstaller:
         # the four the test above withholds.
         assert "@kirocrew-dashboard" not in granted
 
+    def test_template_grants_never_leak_into_the_conductor_list(self, tmp_path, monkeypatch):
+        """No-op proof for #7401: the conductor replaces ``allowedTools``
+        wholesale with its own filtered ``granted`` list, so the ceiling filter
+        moving into ``build_agent_config`` changes nothing here — and template
+        grants (filtered or not) can never leak through.
+        """
+        monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+        monkeypatch.setattr(
+            agent,
+            "build_agent_config",
+            lambda: {
+                "name": "kirocrew",
+                "prompt": "file://x",
+                "mcpServers": {
+                    "kirocrew-core": {"command": "/resolved/kirocrew", "args": ["mcp-core"]}
+                },
+                "tools": ["fs_read", "@kirocrew-core"],
+                # A template list carrying floor builtins — as if the build-time
+                # filter did not exist. None of it may survive the replacement.
+                "allowedTools": ["fs_read", "code", "glob", "grep", "@kirocrew-core"],
+            },
+        )
+        monkeypatch.setattr(
+            agent, "_kirocrew_mcp_invocation", lambda sub: ("/resolved/kirocrew", [sub])
+        )
+        monkeypatch.setattr(agent, "_may_auto_approve", lambda ref: True)
+        agent._install_conductor_agent()
+        data = json.loads((tmp_path / CONDUCTOR_AGENT_FILENAME).read_text(encoding="utf-8"))
+        for template_grant in ("fs_read", "code", "glob", "grep"):
+            assert template_grant not in data["allowedTools"], template_grant
+
     def test_mounts_no_tool_the_charter_never_names(self, tmp_path, monkeypatch):
         """An unused grant is surface the charter cannot account for.
 

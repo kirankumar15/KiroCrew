@@ -2189,6 +2189,91 @@ class TestResearchAgentInstall:
         assert data["name"] == "kirocrew-research"
         assert "research" in data["prompt"].lower()
 
+    @staticmethod
+    def _floor_builtins() -> set[str]:
+        """The builtins whose always-on gate floor forbids a blanket grant.
+
+        Derived from the governance maps rather than hardcoding the four names,
+        so the assertion keeps holding if the template (or the map) changes.
+        """
+        from kiro_crew.platform.governance import _FLOOR_GATE_SCOPES, BUILTIN_TOOL_SCOPES
+
+        return {
+            name
+            for name, scopes in BUILTIN_TOOL_SCOPES.items()
+            if _FLOOR_GATE_SCOPES.intersection(scopes)
+        }
+
+    def _install_real(self, monkeypatch, tmp_path) -> dict:
+        """Install with the REAL build_agent_config — the fix under test lives
+        inside it, so stubbing it (as the identity test above does) would
+        bypass exactly the path #7401 is about."""
+        from kiro_crew import agent
+
+        monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", tmp_path)
+        agent._install_research_agent()
+        return json.loads((tmp_path / "kirocrew-research.json").read_text(encoding="utf-8"))
+
+    def test_no_floor_scoped_builtin_is_blanket_approved(self, monkeypatch, tmp_path):
+        """The installed research spec must not auto-approve a floor builtin.
+
+        The shipped template's ``allowedTools`` starts with floor-gated
+        builtins (``fs_read``, ``code``, …). ``code`` is the consequential one:
+        auto-approved, its calls never reach ``hooks.on_tool_call``, so the
+        sensitive-path check, the write-protected-config check, the governance
+        ceiling and the SEL deny record are all skipped — for the least
+        supervised agent in the product (#7401).
+        """
+        data = self._install_real(monkeypatch, tmp_path)
+        leaked = self._floor_builtins().intersection(data.get("allowedTools", []))
+        assert not leaked, f"floor-gated builtins on the blanket auto-approve list: {leaked}"
+
+    def test_floor_builtins_stay_mounted(self, monkeypatch, tmp_path):
+        """The regression guard proving capability was not removed.
+
+        The withhold removes the BLANKET grant only: the tool stays in
+        ``tools`` (mounted), and read-only file tools still auto-approve via
+        hooks AFTER the floor runs — so a stock install gains no new prompt
+        and the unattended research loop is not handed a stall.
+        """
+        from kiro_crew import agent
+
+        data = self._install_real(monkeypatch, tmp_path)
+        shipped_tools = set(agent.get_shipped_tools()["tools"])
+        expected_mounted = self._floor_builtins().intersection(shipped_tools)
+        assert expected_mounted, "template stopped mounting floor builtins; test needs updating"
+        missing = expected_mounted - set(data.get("tools", []))
+        assert not missing, f"filter must not unmount tools, only ungrant them: {missing}"
+
+    def test_withhold_leaves_the_standard_sel_record(self, monkeypatch, tmp_path):
+        """Withholding is a permission DECISION — same event, same feed as the
+        other ``allowedTools`` writers (``mcp_auto_approve_withheld``)."""
+        from kiro_crew import agent
+
+        events: list[dict] = []
+        monkeypatch.setattr(
+            agent,
+            "sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
+        )
+        self._install_real(monkeypatch, tmp_path)
+        withheld = [e for e in events if e.get("operation") == "mcp_auto_approve_withheld"]
+        assert withheld, "the floor withhold must leave a SEL record"
+        # The record names what lost its grant, so an operator can explain a prompt.
+        assert any("code" in e.get("resources", "") for e in withheld)
+
+    def test_audit_failure_never_fails_the_install(self, monkeypatch, tmp_path):
+        """Best-effort audit: SEL being unavailable must not break the install."""
+        from kiro_crew import agent
+
+        def _broken_sel():
+            raise RuntimeError("SEL unavailable")
+
+        monkeypatch.setattr(agent, "sel", _broken_sel)
+        data = self._install_real(monkeypatch, tmp_path)
+        assert data["name"] == "kirocrew-research"
+        assert not self._floor_builtins().intersection(data.get("allowedTools", []))
+
 
 # --- Watchdog unresponsive grace ---
 

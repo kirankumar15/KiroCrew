@@ -2125,6 +2125,11 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     ``kiro_hooks`` from ``~/.kiro/crew/config.json`` are then additively merged;
     bundled hooks always run first and cannot be removed.
 
+    The assembled ``allowedTools`` list is ceiling-filtered before return (see
+    :func:`_apply_allowed_tools_ceiling`), so every spec derived from this
+    template starts governed — an installer no longer has to remember the
+    filter to avoid shipping a blanket auto-approve for a floor-gated builtin.
+
     Args:
         gated_off: Managed servers whose ``spec_gate`` is closed. Pass the
             caller's snapshot so one rebuild's emit path and its withhold audit
@@ -2212,6 +2217,18 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     # a kiro-spec key — kiro-cli rejects unknown fields and would drop the whole
     # spec. build_agent_config stays pure (no disk writes) so its many
     # read-only callers don't mutate managed-state as a side effect.
+
+    # Governance ceiling over the assembled ``allowedTools`` — HERE, at the one
+    # constructor every derived-spec installer starts from, so the invariant is
+    # held by the predicate rather than by each installer's author remembering
+    # it (#7401). ``rebuild_agent_config`` keeps its own final pass because its
+    # ``_load_existing_config`` path takes entries from an on-disk spec that
+    # never comes through here; for that caller this filter is idempotent (the
+    # predicate is pure, so filtering twice equals filtering once). A caller
+    # that replaces ``allowedTools`` wholesale (``_install_conductor_agent``)
+    # is unaffected. The SEL audit inside is best-effort and never raises, so
+    # the purity note above still holds for config/managed-state.
+    _apply_allowed_tools_ceiling(config, source="build_agent_config")
     return config
 
 
@@ -3279,6 +3296,53 @@ def _may_auto_approve(ref: str) -> bool:
     tests without reaching into another module's namespace.
     """
     return may_skip_gate_now(ref)
+
+
+def _apply_allowed_tools_ceiling(config: dict, *, source: str) -> None:
+    """Filter ``config["allowedTools"]`` through the governance ceiling, in place.
+
+    ``allowedTools`` is the ONE path that never reaches the PreToolUse gate, so
+    every entry on it must be approved by :func:`_may_auto_approve`. This runs
+    inside :func:`build_agent_config` so every installer that derives a spec
+    from the template inherits the filter — ``_install_research_agent`` shipped
+    the template's ``fs_read``/``code``/``glob``/``grep`` grants verbatim
+    because the filter lived only in ``rebuild_agent_config``'s final pass,
+    which writes only ``kirocrew.json`` (#7401).
+
+    A withheld ref stays MOUNTED (``tools`` is untouched — mounting a tool is
+    not auto-approving it); its calls go through the gate, where the
+    per-argument rule applies. Non-string entries (a hand-edited config) are
+    dropped: they are not valid tool refs and would crash the predicate.
+
+    Withholding a grant is a permission DECISION, so it leaves the same
+    ``mcp_auto_approve_withheld`` SEL record every other ``allowedTools``
+    writer emits — best-effort, never raising, so an audit failure cannot
+    break a build or an install.
+    """
+    allowed = config.get("allowedTools")
+    if not isinstance(allowed, list):
+        return
+    kept: list[str] = []
+    withheld: list[str] = []
+    for ref in allowed:
+        if not isinstance(ref, str):
+            continue
+        (kept if _may_auto_approve(ref) else withheld).append(ref)
+    config["allowedTools"] = kept
+    if withheld:
+        try:
+            sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_withheld",
+                outcome="ok",
+                source=source,
+                resources=(
+                    f"{', '.join(withheld)} mounted without auto-approve "
+                    "(governance ceiling); calls go through the approval gate"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — the audit must not break the build
+            logger.debug("SEL audit unavailable for withheld auto-approve", exc_info=True)
 
 
 def _ceiling_filtered_spec(ref: str, spec: dict[str, Any]) -> dict[str, Any]:
