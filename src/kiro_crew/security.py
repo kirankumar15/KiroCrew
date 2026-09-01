@@ -7242,6 +7242,11 @@ def is_sensitive_bash_command(command: str) -> str | None:
     if native_result:
         return native_result
 
+    # ── Pass 4: alternate traversal tools rooted above a fenced path ──
+    alt_result = _check_alt_traversal_reaches_fence(command)
+    if alt_result:
+        return alt_result
+
     # IMDS access via any IP encoding (decimal, hex, octal, IPv6-mapped)
     imds_result = _check_imds_access(command)
     if imds_result:
@@ -12139,6 +12144,325 @@ _IMDS_IP = "169.254.169.254"
 # because canonicalize_ip returns native IPv6 unchanged; mirrors embeddings.py's
 # SSRF gate which also blocks it (CWE-918 dual-stack parity).
 _IMDS_IPV6 = "fd00:ec2::254"
+
+
+# ── Alternate traversal tools that reach a fenced path ──
+#
+# ``find`` is not the only program that factors a fenced path into a root plus a
+# name and then hands the result to a reader, and each tool spells the same shape
+# with its own grammar::
+#
+#     fd '^\.env$' ~/.kiro/crew -x cat        positional regex, exec is -x/-X
+#     fd -e key . ~/.kiro/crew -X cat         extension filter, batched exec
+#     grep -r secret ~/.kiro/crew             the reader IS the traversal
+#     rg --files ~/.kiro/crew | xargs cat     --files makes ripgrep a lister
+#     du -a ~/.kiro/crew | xargs cat          size lister used as a path producer
+#
+# The question this pass asks is the reverse-direction one
+# :func:`path_contains_sensitive` already answers for bulk operations -- does the
+# root HOLD a fenced path -- so a recursive read rooted above a credential store
+# is refused whatever name it goes looking for. A recursive read delivers every
+# file under its root, so narrowing by the pattern cannot make the store
+# unreachable: ``grep -r`` opens ``.env`` regardless of which lines it prints.
+#
+# This is NOT a producer allow-list and must not become one. Enumerating the
+# programs that are SAFE fails OPEN, because every tool nobody thought of reads as
+# covered. Each grammar below only ever ADDS a denial, so a traversal tool this
+# pass does not know is exactly as gated as it was before, and the shapes still
+# open are named in the residuals rather than half-closed:
+#
+#   * ``locate``/``plocate`` have NO root operand -- the database supplies the
+#     path -- so the root-containment clause every rule here rests on has nothing
+#     to test. Its pattern alone would have to carry the signal, and a pattern
+#     test recognising only the leaf names the fence DECLARES would still miss
+#     ``locate id_rsa | xargs cat`` (``.ssh`` is fenced as a whole directory, so
+#     no leaf name is declared for it) while reading as covered. Naming it here is
+#     the honest half of that trade.
+#   * A name list delivered through a command substitution (``cat $(fd …)``) or a
+#     ``while read`` loop instead of ``xargs``.
+#   * A root spelled relative to a ``cd`` the same line performs
+#     (``cd ~/.kiro/crew && grep -r x .``): candidate roots are resolved against
+#     the gateway's directory here, not the shell's.
+#
+# Cost, stated plainly: a recursive content read rooted at the crew data-home or
+# its workspace root is refused, because both hold declared credential leaves
+# (``.env``, ``token_signing.key``, the Notes vault's PAT). Scoping the read to a
+# subdirectory that holds none of them is allowed and is the intended spelling.
+
+#: ``fd`` and the Debian/Ubuntu name for the same binary.
+_FD_PROGRAM_NAMES: frozenset[str] = frozenset({"fd", "fdfind"})
+
+#: ``fd``'s ``find -exec`` equivalents. Presence of any of these makes the
+#: traversal deliver file CONTENT rather than a name list, so no separate sink is
+#: needed for the read to happen.
+_FD_EXEC_FLAGS: frozenset[str] = frozenset({"-x", "-X", "--exec", "--exec-batch"})
+
+#: GNU grep and its aliases. ``rgrep`` is recursive without a flag.
+_GREP_PROGRAM_NAMES: frozenset[str] = frozenset({"grep", "egrep", "fgrep"})
+_ALWAYS_RECURSIVE_GREP_NAMES: frozenset[str] = frozenset({"rgrep"})
+
+#: The long spellings that turn grep into a traversal. The short forms are
+#: recognised by scanning cluster letters (``-rn`` is ``-r -n``), which a set of
+#: whole tokens cannot see.
+_GREP_RECURSIVE_LONG_FLAGS: frozenset[str] = frozenset(
+    {"--recursive", "--dereference-recursive"}
+)
+
+#: ripgrep, which is recursive with no flag at all.
+_RIPGREP_PROGRAM_NAMES: frozenset[str] = frozenset({"rg"})
+
+#: ripgrep's pure-lister mode: ``--files`` prints paths without opening them, so
+#: it needs a sink before anything is disclosed. ``-l``/``--files-with-matches``
+#: is NOT here -- it still opens every file to decide whether to print it.
+_RIPGREP_LISTER_FLAGS: frozenset[str] = frozenset({"--files"})
+
+#: Programs whose whole job is to emit paths under a root. Harmless alone; they
+#: matter when a sink turns the list into content.
+_PATH_LISTER_PROGRAMS: frozenset[str] = frozenset({"du"})
+
+#: Programs that take the name list on stdin and run a command per name, which is
+#: what converts a lister into a read.
+_NAME_LIST_EXEC_PROGRAMS: frozenset[str] = frozenset({"xargs", "parallel"})
+
+#: Anything that opens a file it is handed. Union of the two sets the module
+#: already maintains so a verb added to either reaches this pass with no second
+#: edit.
+_ALT_CONTENT_READER_PROGRAMS: frozenset[str] = (
+    _NORMALIZER_READ_VERBS | _DATA_CONSUMER_PROGRAMS
+)
+
+
+def _alt_pipeline_stages(command: str) -> list[list[str]]:
+    """Split *command* into per-stage token lists.
+
+    Segments come from :func:`_split_shell_segments` (quote-aware, and it declines
+    to split inside a substitution), then each segment is split again on an
+    unquoted ``|`` because a pipeline's stages are separate programs and this pass
+    identifies a program by its own first token.
+
+    Stages are returned FLAT, with no record of which pipeline they belonged to.
+    That is deliberate: the sink test below asks whether the command contains a
+    reader anywhere, and over-approximating across a ``&&`` boundary can only add
+    a denial. Pairing each lister with only its own downstream stages would be the
+    narrower answer and is not worth the grammar.
+    """
+    stages: list[list[str]] = []
+    for segment in _split_shell_segments(command):
+        for piece in _split_unquoted_pipes(segment):
+            if not piece.strip():
+                continue
+            try:
+                tokens = normalize_shell_command(piece)
+            except Exception:
+                continue
+            if tokens:
+                stages.append(tokens)
+    return stages
+
+
+def _split_unquoted_pipes(segment: str) -> list[str]:
+    """Split on ``|`` outside quotes, leaving ``||`` alone.
+
+    ``_split_shell_segments`` consumes ``||`` as a separator before this runs, so
+    a doubled bar does not normally arrive here. It is still handled, so the
+    helper is correct on any fragment rather than only on that caller's output.
+    """
+    pieces: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                buf.append(segment[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(segment[i + 1])
+            i += 2
+            continue
+        if ch == "|":
+            if i + 1 < n and segment[i + 1] == "|":
+                pieces.append("".join(buf))
+                buf = []
+                i += 2
+                continue
+            pieces.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    pieces.append("".join(buf))
+    return pieces
+
+
+def _alt_stage_head(tokens: list[str]) -> tuple[str, list[str]]:
+    """The stage's program basename and the operands that follow it.
+
+    ``NAME=value`` prefixes and a leading ``env`` are skipped so the real program
+    is found: ``env fd . ~/.kiro/crew -x cat`` reads as ``env`` otherwise, and the
+    module already models that wrapper (:data:`_ENV_SPLIT_PROGRAMS`).
+    :func:`_program_basename` resolves a quoted, path-qualified or ``.exe``
+    spelling the same way every other program check here does.
+    """
+    index = 0
+    stripped_env = False
+    while index < len(tokens):
+        token = tokens[index]
+        if _SHELL_ASSIGN_RE.match(token):
+            index += 1
+            continue
+        if not stripped_env and _program_basename(token).lower() in _ENV_SPLIT_PROGRAMS:
+            stripped_env = True
+            index += 1
+            continue
+        return _program_basename(token).lower(), tokens[index + 1 :]
+    return "", []
+
+
+def _alt_root_reaching_fence(operands: list[str]) -> str | None:
+    """Which operand names a directory that HOLDS a fenced path, if any.
+
+    Every operand is tested, not just the ones a per-tool grammar would classify
+    as a root. Tracking which flags take a value would need a table per tool, and
+    each omission from such a table is a MISS -- whereas testing a flag's value as
+    if it were a root can only add a denial, and a flag value that names a
+    credential store (``--search-path ~/.kiro/crew``, ``--exclude-dir=…``) is
+    security-relevant wherever it sits. ``key=value`` and glued-redirect spellings
+    come from :func:`_path_candidates`, the same extraction the operand checks in
+    the normalizer pass use.
+
+    A non-path operand costs nothing: a pattern like ``secret`` resolves under the
+    gateway's directory and holds no fence, so it answers no.
+    """
+    for token in operands:
+        for cand in _path_candidates(token):
+            if not cand or cand == "-" or cand.startswith("--"):
+                continue
+            if path_contains_sensitive(cand):
+                return cand
+    return None
+
+
+def _alt_implicit_cwd_root() -> str | None:
+    """The fenced-holding answer for a traversal given no root at all.
+
+    ``fd .env -x cat`` walks the working directory, so the root is real even
+    though no operand names it.
+    """
+    return "." if path_contains_sensitive(".") else None
+
+
+def _grep_is_recursive(operands: list[str]) -> bool:
+    """Does this grep invocation traverse directories?
+
+    Short flags cluster, so the LETTERS of every single-dash token are scanned
+    rather than the token compared whole: ``-rn`` is ``-r -n``, and it is the
+    spelling a person actually types. Everything after ``--`` is an operand.
+    """
+    for token in operands:
+        if token == "--":
+            break
+        if token in _GREP_RECURSIVE_LONG_FLAGS:
+            return True
+        if token.startswith("--"):
+            continue
+        if token.startswith("-") and len(token) > 1:
+            if any(letter in ("r", "R") for letter in token[1:]):
+                return True
+    return False
+
+
+def _alt_has_reader_sink(stages: list[list[str]]) -> bool:
+    """Does any stage turn a name list into file content?
+
+    ``xargs``/``parallel`` run their payload once per name, so the payload's
+    program is what decides. A bare ``| cat`` is NOT a sink: it prints the name
+    list on stdin, it does not open the files those names point to.
+
+    EVERY operand is examined rather than only the first non-flag one, because
+    several of ``xargs``'s own flags take a value (``-n 1``, ``-P 4``, ``-I {}``)
+    and that value sits exactly where the payload would -- so the first non-flag
+    token can be ``1`` rather than ``cat``. Scanning on can only add a denial, and
+    a non-payload operand that happens to share a reader's name is not a shape
+    worth a per-flag table.
+    """
+    for tokens in stages:
+        program, operands = _alt_stage_head(tokens)
+        if program not in _NAME_LIST_EXEC_PROGRAMS:
+            continue
+        for token in operands:
+            if token.startswith("-"):
+                continue
+            if _program_basename(token).lower() in _ALT_CONTENT_READER_PROGRAMS:
+                return True
+    return False
+
+
+def _check_alt_traversal_reaches_fence(command: str) -> str | None:
+    """Is a non-``find`` traversal rooted at a directory that holds a fenced path?
+
+    Three shapes, each with its own delivery question:
+
+    * ``grep -r``/``rg`` in matching mode open every file under the root, so the
+      traversal IS the read and no sink is needed.
+    * ``fd`` with ``-x``/``-X`` runs a reader per hit, which is the same delivery
+      ``find -exec`` performs.
+    * ``fd`` without an exec flag, ``rg --files`` and ``du -a`` emit names only, so
+      they are refused only when the command also contains a sink that opens them.
+
+    Returns a denial reason, or None when clean.
+    """
+    stages = _alt_pipeline_stages(command)
+    if not stages:
+        return None
+    sink = _alt_has_reader_sink(stages)
+    for tokens in stages:
+        program, operands = _alt_stage_head(tokens)
+        delivers: bool
+        if program in _FD_PROGRAM_NAMES:
+            delivers = sink or any(
+                token in _FD_EXEC_FLAGS or token.split("=", 1)[0] in _FD_EXEC_FLAGS
+                for token in operands
+            )
+        elif program in _ALWAYS_RECURSIVE_GREP_NAMES:
+            delivers = True
+        elif program in _GREP_PROGRAM_NAMES:
+            if not _grep_is_recursive(operands):
+                continue
+            delivers = True
+        elif program in _RIPGREP_PROGRAM_NAMES:
+            lister = any(
+                token.split("=", 1)[0] in _RIPGREP_LISTER_FLAGS for token in operands
+            )
+            delivers = sink if lister else True
+        elif program in _PATH_LISTER_PROGRAMS:
+            delivers = sink
+        else:
+            continue
+        if not delivers:
+            continue
+        root = _alt_root_reaching_fence(operands) or _alt_implicit_cwd_root()
+        if root is not None:
+            return (
+                "Blocked: recursive traversal rooted at a directory that holds a "
+                f"sensitive credential path ({program}: {root[:80]})"
+            )
+    return None
 
 
 def _check_imds_access(command: str) -> str | None:
