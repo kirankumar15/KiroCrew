@@ -49,6 +49,33 @@ _POSIX_ONLY = pytest.mark.skipif(
 )
 
 
+@pytest.fixture()
+def systemd_run_resolvable(monkeypatch):
+    """Make ``trusted_system_bin("systemd-run")`` resolve on a host without systemd.
+
+    The cgroup-scope tests below mock ``_probe_cgroup_scope`` to "available" and
+    assert the argv ``cgroup_scope_argv`` BUILDS. That argv is only built when
+    the wrapper also resolves from a trusted system directory, and on macOS /
+    a container without systemd it never does -- so the code degraded (no
+    ceiling, loud warning), and seven tests about argv SHAPE failed for a reason
+    that has nothing to do with argv shape. Only ``systemd-run`` is faked; every
+    other name still goes through the real resolver, so the tests that assert
+    degradation when it is ABSENT (they patch the resolver to ``None``
+    themselves, inside their own ``with``) are unaffected -- an inner patch
+    wins and reverts to this one.
+    """
+    from kiro_crew import platform_compat
+
+    real = platform_compat.trusted_system_bin
+
+    def _resolve(name: str) -> str | None:
+        if name == "systemd-run":
+            return "/usr/bin/systemd-run"
+        return real(name)
+
+    monkeypatch.setattr(sandbox_mod.platform_compat, "trusted_system_bin", _resolve)
+
+
 @pytest.fixture(autouse=True)
 def clean_backend(monkeypatch):
     """Reset cached backend between tests.
@@ -316,6 +343,79 @@ class TestBuildSeatbeltProfile:
                 sandbox_mod.assert_voice_runtime_outside_agent_workspace(unsafe)
 
         sandbox_mod.assert_voice_runtime_outside_agent_workspace(sibling)
+
+    def test_voice_runtime_workspace_conflict_preflight(self, monkeypatch, tmp_path):
+        """#7392: the non-raising pre-flight mirrors the lexical guard and
+        names both paths, the data home, and the remedy."""
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        sibling = tmp_path / "workspace"
+        runtime.mkdir(parents=True)
+        sibling.mkdir()
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+
+        contains = sandbox_mod.voice_runtime_workspace_conflict(tmp_path)
+        assert contains is not None and "contains" in contains
+        assert "protected voice runtime" in contains
+        assert str(tmp_path) in contains
+        assert str(runtime) in contains
+        # Same remedy sentence as the spawn-time refusal (#7407's shared formatter).
+        assert "Pick a project subdirectory" in contains
+
+        inside = sandbox_mod.voice_runtime_workspace_conflict(runtime / "nested")
+        assert inside is not None and "inside it" in inside
+
+        assert sandbox_mod.voice_runtime_workspace_conflict(sibling) is None
+
+    def test_voice_runtime_workspace_conflict_passes_off_darwin(self, monkeypatch, tmp_path):
+        """The pre-flight matches the guards it mirrors: every spawn-time
+        guard early-returns off macOS, so an overlapping workspace spawns
+        fine on Linux/Windows today — the pre-flight must not 400 a working
+        configuration there (Design/FP review round 1)."""
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "linux")
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        runtime.mkdir(parents=True)
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+        assert sandbox_mod.voice_runtime_workspace_conflict(tmp_path) is None
+
+    def test_preflight_and_spawn_guard_refuse_with_the_same_message(self, monkeypatch, tmp_path):
+        """Drift pin (Design/FP review round 2): the pre-flight and the
+        spawn-time guard share ONE containment scan and ONE formatter, so the
+        same overlapping workspace must produce byte-identical refusal text on
+        both surfaces. If either ever grows its own copy again, this fails."""
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        runtime.mkdir(parents=True)
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+        preflight = sandbox_mod.voice_runtime_workspace_conflict(tmp_path)
+        assert preflight is not None
+        with pytest.raises(RuntimeError) as exc:
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(tmp_path)
+        assert str(exc.value) == preflight
+
+    def test_voice_runtime_workspace_conflict_fails_open_on_prime_error(
+        self, monkeypatch, tmp_path
+    ):
+        """Pre-flight passes when runtime paths cannot resolve; the spawn-time
+        guard (fail-closed) stays authoritative."""
+
+        def _boom() -> tuple[str, ...]:
+            raise OSError("no data home")
+
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", _boom)
+        assert sandbox_mod.voice_runtime_workspace_conflict(tmp_path) is None
 
     def test_delegated_macos_agent_workspace_checks_canonical_alias(self, monkeypatch, tmp_path):
         runtime = tmp_path / "real-data" / "run" / "voice-runtime"
@@ -608,7 +708,7 @@ class TestBuildSeatbeltProfile:
             sandbox_mod, "_bound_agent_workspace_matches", lambda *_args: True
         )
         monkeypatch.setattr(
-            "kiro_crew.hooks._fd_real_path", lambda _fd: "/canonical/workspace"
+            "kiro_crew.sandbox.fd_real_path", lambda _fd: "/canonical/workspace"
         )
 
         assert (
@@ -628,7 +728,7 @@ class TestBuildSeatbeltProfile:
         monkeypatch.setattr(
             sandbox_mod, "_bound_agent_workspace_matches", lambda *_args: True
         )
-        monkeypatch.setattr("kiro_crew.hooks._fd_real_path", lambda _fd: None)
+        monkeypatch.setattr("kiro_crew.sandbox.fd_real_path", lambda _fd: None)
 
         with pytest.raises(OSError):
             sandbox_mod.bound_agent_workspace_target(41, "/mutable/workspace")
@@ -873,19 +973,21 @@ class TestBuildLauncherScript:
         assert "unknown arch" not in script
 
         # Execute the arch-dispatch block itself, so this proves the refusal
-        # FIRES rather than that its message is present as text.
+        # FIRES rather than that its message is present as text. The block
+        # starts at the machine read: ``import platform`` no longer sits here —
+        # it is hoisted to the preamble so no first-time stdlib import runs
+        # after namespace/mount isolation (#8151).
         lines = script.splitlines()
         start = -1
         end = -1
         for index, line in enumerate(lines):
-            if start < 0 and line.strip() == "import platform as _plat":
+            if start < 0 and line.strip() == "_machine = _plat.machine()":
                 start = index
             elif start >= 0 and "if _DENY_SYSCALLS:" in line:
                 end = index
                 break
         assert start >= 0 and end > start, "arch-dispatch block not found"
         block = textwrap.dedent("\n".join(lines[start:end]))
-        block = block.replace("import platform as _plat", "")
 
         class _FakePlat:
             def __init__(self, machine):
@@ -1915,6 +2017,7 @@ class TestSessionHostPreexec:
             self._reset_cache()
 
 
+@pytest.mark.usefixtures("systemd_run_resolvable")
 class TestCgroupScopeArgv:
     """cgroup_scope_argv() wraps agent spawns in a transient systemd --user
     --scope with pids.max + memory.max — the default-on fork-bomb / memory-DoS
@@ -2214,6 +2317,7 @@ class TestCgroupScopeArgv:
             self._reset_probe()
 
 
+@pytest.mark.usefixtures("systemd_run_resolvable")
 class TestAgentsSliceLimits:
     """ensure_agents_slice_limits() puts an AGGREGATE MemoryMax/TasksMax on
     kirocrew-agents.slice — the parent of every per-spawn scope — so N
@@ -2414,7 +2518,14 @@ class TestAgentsSliceLimits:
                 patch("kiro_crew.sandbox._cpu_controller_delegated", return_value=False),
             ):
                 out = sb.cgroup_scope_argv(["kiro-cli", "chat"])
-            assert f"--slice={sb._CGROUP_AGENTS_SLICE}" in out
+            # Still placed under the aggregate boundary, now via a per-instance
+            # child of it (see _agents_slice_name) — cgroup v2 bounds a
+            # descendant by the minimum effective limit along its ancestor
+            # chain, so the aggregate layer of the two-level model is intact.
+            parent_stem = sb._CGROUP_AGENTS_SLICE[: -len(".slice")]
+            assert any(
+                a.startswith(f"--slice={parent_stem}") and a.endswith(".slice") for a in out
+            ), out
             assert "MemoryMax=4096M" in out
             assert "TasksMax=8192" in out
         finally:
@@ -2563,6 +2674,7 @@ class TestAgentsSliceLimits:
             sb._CGROUP_SCOPE_PROBE = None
 
 
+@pytest.mark.usefixtures("systemd_run_resolvable")
 class TestCgroupScopeBusEnv:
     """The systemd-run scope prepended by cgroup_scope_argv needs the user
     session bus in the environment it is spawned with. Callers that build that
@@ -2893,16 +3005,13 @@ class TestKiroInternalSandboxExclusion:
         mock_ns.assert_called_once()
 
     def test_windows_explicit_kiro_backend_delegates_before_backend_probe(self, monkeypatch):
-        """Fresh Windows installs use the positively identified Kiro sandbox."""
+        """Windows delegates only when the Kiro sandbox it delegates TO is on."""
         monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
         launch = r"C:\Program Files\Kiro\kiro-cli.exe"
         with (
             patch("kiro_crew.sel.sel", return_value=MagicMock()),
             patch("kiro_crew.sandbox.detect_backend") as mock_detect,
-            patch(
-                "kiro_crew.sandbox.kiro_internal_sandbox_enabled",
-                side_effect=AssertionError("Windows delegation must not depend on macOS settings"),
-            ),
+            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=True) as mock_cap,
         ):
             argv, cleanup = wrap_argv(
                 [launch, "acp"],
@@ -2913,6 +3022,51 @@ class TestKiroInternalSandboxExclusion:
         assert argv == [launch, "acp"]
         assert cleanup is None
         mock_detect.assert_not_called()
+        # The capability is CONSULTED, not assumed: the unwrapped argv above is
+        # only safe because the layer it defers to actually exists.
+        mock_cap.assert_called()
+
+    def test_windows_kiro_sandbox_disabled_fails_closed(self, monkeypatch):
+        """Classification alone cannot buy the Windows delegation.
+
+        A classified Kiro spawn on a host whose internal sandbox is OFF has no
+        isolation layer to delegate to, so it must fall through to the normal
+        no-backend policy and fail closed — not return an unwrapped argv while
+        the audit trail claims a delegated sandbox.
+        """
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: False)
+        with (
+            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=False),
+            patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            pytest.raises(sandbox_mod.SandboxUnavailableError),
+        ):
+            wrap_argv(
+                [r"C:\Program Files\Kiro\kiro-cli.exe", "acp"],
+                mode="auto",
+                is_kiro_cli=True,
+            )
+        # Fall-through reached the ordinary backend decision rather than
+        # short-circuiting into the delegation.
+        mock_detect.assert_called_once_with(config_mode="auto")
+
+    def test_windows_kiro_sandbox_disabled_honours_explicit_opt_in(self, monkeypatch):
+        """The fall-through is the NORMAL path, opt-in included — not a crash."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: True)
+        launch = r"C:\Program Files\Kiro\kiro-cli.exe"
+        with (
+            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=False),
+            patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+        ):
+            argv, cleanup = wrap_argv([launch, "acp"], mode="auto", is_kiro_cli=True)
+        assert argv[-2:] == [launch, "acp"]
+        assert cleanup is None
+        # Distinguishes the opted-in FALL-THROUGH from the delegation, which
+        # returns the same argv but short-circuits before any backend decision.
+        mock_detect.assert_called_once_with(config_mode="auto")
 
     @pytest.mark.parametrize("classification", [None, False])
     def test_windows_nonclassified_spawn_still_fails_closed(self, monkeypatch, classification):
@@ -3068,6 +3222,49 @@ class TestMacOsNestingDetection:
         # EPERMs, and reading that as a host verdict is the bug this fixes.
         mock_detect.assert_not_called()
 
+    @patch("kiro_crew.sandbox.detect_backend")
+    def test_the_passthrough_silently_drops_extra_hidden_dirs(
+        self, mock_detect, monkeypatch, tmp_path
+    ):
+        """A caller's ``extra_hidden_dirs`` is UNENFORCED on the passthrough.
+
+        It is not a bug -- a nested re-wrap is denied by design on both platforms,
+        so there is no mount namespace to build and nothing to bind-mask into --
+        but it is a fact a caller must not build a security control on, and it is
+        invisible from the call site: the wrap returns successfully, and the mask
+        it was asked for simply does not exist.
+
+        This bites hardest where it is least visible. Every app backend is spawned
+        through ``wrap_argv`` by ``apps/backend.py``, so it runs with this marker
+        set, and every spawn IT then wraps takes this branch. Dev Fleet's sync is
+        exactly that shape -- it wraps each sync step from inside the sandbox -- so
+        a mask an app backend asks for to keep a step away from one of its own paths
+        would cover nothing while reading, at the call site, as a control. An app
+        backend that needs such a boundary has to get it somewhere other than here:
+        the sync runner keeps the synced checkout off its import path with the
+        interpreter's own ``-I`` rather than with a mask.
+
+        CHARACTERIZATION, NOT A CONTRACT. If nested confinement ever becomes
+        possible, this test is one of the things that should change WITH it -- it
+        records what the passthrough does today so a caller cannot be misled by it,
+        and it is not an argument for keeping the behaviour.
+        """
+        secret = tmp_path / "provenance"
+        secret.mkdir()
+        monkeypatch.setenv("KIROCREW_SANDBOX_ACTIVE", "1")
+        monkeypatch.setattr(sandbox_mod, "_macos_sandbox_state", lambda: True)
+        with patch("kiro_crew.sel.sel"):
+            result, cleanup = wrap_argv(
+                ["/usr/bin/npm", "ci"], mode="strict", extra_hidden_dirs=(str(secret),)
+            )
+
+        # No launcher script, so nothing exists that COULD carry a bind-mask...
+        assert cleanup is None
+        # ...and the path appears nowhere in what will actually be executed.
+        assert not any(str(secret) in arg for arg in result)
+        assert result[-2:] == ["/usr/bin/npm", "ci"]
+        mock_detect.assert_not_called()
+
     @patch("kiro_crew.sandbox.detect_backend", return_value="none")
     def test_forged_marker_without_kernel_confirmation_is_refused(
         self, mock_detect, monkeypatch
@@ -3169,6 +3366,7 @@ class TestMacOsNestingDetection:
             sandbox_mod._macos_sandbox_state.cache_clear()
 
 
+@pytest.mark.usefixtures("systemd_run_resolvable")
 class TestAgentSliceMemoryHigh:
     """_ensure_agent_slice_memory_high() reconciles the AGGREGATE MemoryHigh
     ceiling on kirocrew-agents.slice — bounding the SUM of all concurrent agent
@@ -3382,7 +3580,13 @@ class TestAgentSliceMemoryHigh:
             ):
                 out = sb.cgroup_scope_argv(["kiro-cli", "chat"])
             ensure.assert_called_once_with()
-            assert "--slice=kirocrew-agents.slice" in out
+            # The slice is a per-instance child of the aggregate parent (see
+            # _agents_slice_name), so match the parent stem rather than an exact
+            # name: the reconciliation this test is about still targets the
+            # parent, which is what the ceiling is applied to.
+            assert any(
+                a.startswith("--slice=kirocrew-agents") and a.endswith(".slice") for a in out
+            ), out
         finally:
             sb._CGROUP_SCOPE_PROBE = None
 

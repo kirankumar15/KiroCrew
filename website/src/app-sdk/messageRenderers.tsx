@@ -20,7 +20,9 @@ import { isNoteRow } from '../lib/noteContract'
 import { parseOptions } from './protocol'
 import { extractToolFilePath } from '../utils/toolFilePath'
 import { isSafePath } from '../utils/safePath'
+import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage'
+import { type FileChangeEntry } from '../components/FileChangeChips'
 import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
@@ -261,6 +263,10 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'assistant',
     roles: ['assistant', 'streaming'],
     render: (m, ctx) => {
+      // A quiet monitor-loop cycle replies with a bare zero-width space
+      // (U+200B): invisible-only content would draw as an empty bubble.
+      // Same skip as ChatPage's inline chain — see utils/invisibleText.
+      if (isHiddenInvisibleAssistantRow(m)) return null
       const isStreaming = m.role === 'streaming'
       // The footer belongs to a FINISHED reply. It shows once the turn is over,
       // which is either because another user or assistant row follows, or
@@ -270,6 +276,9 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
         let nextRelevant = false
         for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
           if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
+          // A hidden invisible-only row draws nothing, so it cannot host the
+          // footer; pass over it to the row that renders.
+          if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
           if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
         }
         if (!nextRelevant) showFooter = !ctx.running
@@ -287,6 +296,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
             variants={m.variants}
             variantIdx={m.variant_idx}
             turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
+            fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
             suppressSteerAck={turnHadPolicyBlock(ctx.messages, ctx.index)}
           />
         </div>,
@@ -323,8 +333,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       return ctx.wrapper(
         <>
           {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
-          <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-            <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary>
+          <div className="msg-content px-4 py-3 text-sm leading-6 rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+            <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} softBreaks /></MessageErrorBoundary>
           </div>
         </>,
       )

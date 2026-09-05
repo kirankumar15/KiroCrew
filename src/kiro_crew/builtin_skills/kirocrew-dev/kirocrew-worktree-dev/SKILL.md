@@ -1,6 +1,6 @@
 ---
 name: kirocrew-worktree-dev
-description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not for users' own projects): every change is built and verified inside a git worktree, never against the live gateway. Covers worktree creation, the blocking local build gates (pytest + isort + flake8 + mypy + tsc + vitest), the built-dist gotcha, feature flags, live preview paths (dev-backend.sh or isolated pods), and the PR workflow. Use only when building, testing, switching, or verifying a change to Kiro Crew's own codebase."
+description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not for users' own projects): every change is built and verified inside a git worktree, never against the live gateway. Covers worktree creation, the blocking local build gates (pytest + isort + flake8 + mypy + tsc + vitest), the built-dist gotcha, feature flags, live preview paths (isolated pods, dev-backend.sh as fallback), and the PR workflow. Use only when building, testing, switching, or verifying a change to Kiro Crew's own codebase."
 triggers: kirocrew worktree, kirocrew build gate, kirocrew dev, kirocrew source, contribute to kirocrew, kirocrew repo
 repo_scope: src/kiro_crew
 ---
@@ -59,8 +59,11 @@ To clean up after merging: `git worktree remove ../kirocrew-wt-<name>`
 
 ## Rule 2 — The build gate (ALL must pass before PR)
 
-**`.github/workflows/ci.yml` is the canonical gate list** — it is what actually
-gates the PR; if this skill and CI disagree, CI wins. What this rule adds is
+**`.github/workflows/ci.yml` plus `.github/workflows/fast-gate.yml` are the
+canonical gate list** — they are what actually gates the PR; if this skill and
+CI disagree, CI wins. The eleven cheap blocking gates live in `fast-gate.yml`
+and `ci.yml` blocks on it through `await-fast-gate`, so reading only `ci.yml`
+shows you the expensive half of the gate list and none of the fast half. What this rule adds is
 the worktree-specific gotchas (parallelism, mypy CI-parity, dist ordering),
 not a replacement gate list.
 
@@ -102,7 +105,8 @@ python -m pytest -q --override-ini="addopts=--ignore=build/private -n auto --dis
 
 Never a bare `--override-ini=addopts=` (it silently drops `--dist loadgroup`).
 For the full gate list itself, don't trust any restated copy (including this
-one) — read `.github/workflows/ci.yml`, which is what actually gates the PR.
+one) — read `.github/workflows/ci.yml` AND `.github/workflows/fast-gate.yml`,
+which together are what actually gates the PR.
 
 **Triaging failures: blame your change last, but verify.** Some hosts carry
 environment-specific failures (permissions, missing optional binaries) that are
@@ -241,29 +245,64 @@ the gate that lets you push.
 
 **Build gates green is the floor** — it proves the code compiles and tests pass.
 Actually *running* the worktree to click through it is an **optional** preview
-step with several paths; use whichever your environment supports:
+step. **Prefer the isolated pod over `dev-backend.sh`** — it is hands-off (no
+port/data-home bookkeeping to remember) and disposable (`pod down` leaves zero
+residue), where `dev-backend.sh` leaves a foreground process and a
+`.kirocrew-dev/` directory you manage yourself. Reach for `dev-backend.sh` only
+where a pod cannot run.
 
-1. **`dev-backend.sh` (simplest).** From the worktree root:
+1. **Isolated pod (preferred).** Preview the full stack on its own port without
+   touching the live gateway:
+   ```bash
+   kirocrew pod up <worktree-name> --json   # own KIROCREW_HOME, own port, no crons
+   kirocrew pod down <worktree-name>        # zero residue
+   ```
+   Best for QA agents and end-to-end tests, but the default for a human
+   iterating on a worktree too — it needs no cleanup discipline of its own.
+   `kirocrew pod --help` for all verbs (`ls`, `status`, `logs`, `provision`,
+   …). The worktree must be built first (venv + dist); `kirocrew pod up
+   --provision` does the full on-ramp.
+
+   For behavior that needs existing data, seed a shipped fixture instead of
+   clicking state in by hand:
+   ```bash
+   kirocrew pod up <worktree-name> --seed minimal --json
+   ```
+   A bare name populates the whole isolated home; an unknown name is refused
+   with the available names. A path remains the sanitized config-only form.
+
+   Pods need Linux `systemd --user` or macOS `launchd` (`kirocrew pod install`
+   once per machine) — see [`kiro_crew/pod/README.md`](../../../pod/README.md)
+   for the platform gate. Without one of those, fall through to
+   `dev-backend.sh` below.
+
+2. **`dev-backend.sh` (fallback where a pod cannot run).** From the worktree
+   root:
    ```bash
    ./dev-backend.sh
    ```
    Starts the gateway on its own dev port using `.kirocrew-dev/` as its data
    directory (isolated from your production `~/.kiro/crew/`). It uses
    `PYTHONPATH=src` so code changes are picked up on restart. Ctrl+C to stop,
-   re-run after changes.
-
-2. **Isolated pod (no cutover, hands-off).** Preview the full stack on its own
-   port without touching the live gateway:
-   ```bash
-   kirocrew pod up <worktree-name> --json   # own KIROCREW_HOME, own port, no crons
-   kirocrew pod down <worktree-name>        # zero residue
-   ```
-   Best for QA agents and end-to-end tests. `kirocrew pod --help` for all verbs
-   (`ls`, `status`, `logs`, `provision`, …). The worktree must be built first
-   (venv + dist); `kirocrew pod up --provision` does the full on-ramp.
+   re-run after changes. Use this on a host with no `systemd --user` / `launchd`
+   (or before running `kirocrew pod install`), or when you specifically need a
+   foreground process to attach a debugger to.
 
 3. **No preview at all (also valid).** For many changes, the build gate + unit
    tests are enough confidence to cut the PR. Previewing live is optional.
+
+### Turn a preview into proof
+
+A pod being healthy proves only that a gateway answered. To prove changed
+behavior, run the copy-pasteable trace in
+`docs/guides/worktree-verification-recipes.md` for the changed surface. The
+recipes use the feature map to select the owning endpoint, assert seeded backend
+state, run the packaged pod-e2e Playwright harness and preserve screenshot
+evidence, or diagnose and reclaim a failed pod.
+
+The recipes distinguish pod commands already on `main` from `pod api`, which
+arrives with PR #8218. They also record the current session-control compatibility
+gap rather than presenting an HTTP 403 as an agent-driving proof.
 
 ### Agent specs + MCP servers are a SEPARATE isolation axis from the data home
 

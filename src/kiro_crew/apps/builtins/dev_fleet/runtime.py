@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
-from kiro_crew.apps.builtins.dev_fleet import npm_preflight
+from kiro_crew.apps.builtins.dev_fleet import npm_preflight, sync_runner
 from kiro_crew.env import find_node_tool, node_bin_dirs
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
@@ -127,16 +127,29 @@ def _find_cli() -> list[str]:
 # overrides every config file) so EVERY git invocation from this handler —
 # foreground inspection, the unattended background fetch, rebase, sync pull,
 # and any git a build step runs — is neutralized at one chokepoint instead of
-# per-call-site flags. All four keys are attacker-configurable via an
+# per-call-site flags. The config keys are attacker-configurable via an
 # agent-writable ``.git/config`` and would otherwise execute code:
 #   * protocol pin  — ``ext::``/custom remote helpers refused by git itself
 #   * core.fsmonitor / core.hooksPath — repo-registered executables
 #   * credential.helper (reset to empty list) — helper commands
 #   * core.sshCommand (pinned to plain ``ssh``) — arbitrary command on fetch
+#
+# GIT_NO_REPLACE_OBJECTS is the odd one out: not a config key and not about code
+# execution, but about WHICH OBJECT GRAPH git answers from. A
+# ``refs/replace/<oid>`` ref substitutes one object for another in every read, so
+# ``log``, ``rev-list --count``, ``merge-base`` and ``merge --ff-only`` all answer
+# about the SUBSTITUTE graph — a history no checked-out commit names. Every git
+# answer this handler acts on is a statement about the checkout on disk, so the
+# real graph is the only one that answers the question asked. Grafting is a
+# legitimate local operation (``git replace``), so this is a correctness pin
+# first and a tamper pin second, and it is an env var rather than a config pair
+# so no config precedence applies to it at all. ``update_governance`` and
+# ``auto_improvement``'s clone setup already pin it for the same reason.
 # Harmless for non-git commands (pip/npm ignore GIT_*).
 _GIT_ENV_NEUTRALIZERS: dict[str, str] = {
     "GIT_ALLOW_PROTOCOL": "https:ssh",
     "GIT_PROTOCOL_FROM_USER": "0",
+    "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",
@@ -637,6 +650,15 @@ try:
 except OSError:  # pragma: no cover - frozen/zipimported install
     _PREFLIGHT_SOURCE = None
 
+#: The sync runner's source, captured ONCE at import — same contract, same
+#: reasons as :data:`_PREFLIGHT_SOURCE` above: the snapshot must be of the code
+#: THIS gateway is running, and ``None`` (unreadable ``__file__``) makes the
+#: sync REFUSE rather than fall back to reading the file later.
+try:
+    _SYNC_RUNNER_SOURCE: bytes | None = Path(sync_runner.__file__).read_bytes()
+except OSError:  # pragma: no cover - frozen/zipimported install
+    _SYNC_RUNNER_SOURCE = None
+
 #: Label of the ONE sync step whose binary is ours, so its exit code can be
 #: trusted to mean what :mod:`npm_preflight` says it means. Every other step runs
 #: worktree-controlled code and can exit any number it likes, so a reserved code
@@ -1083,6 +1105,7 @@ __all__ = (
     "_SHUTDOWN_ADMISSION_LOCK",
     "_SHUTDOWN_IN_PROGRESS",
     "_SYNC_LOCK",
+    "_SYNC_RUNNER_SOURCE",
     "_SYNC_RUN_LABEL",
     "_TRUSTED_BIN_CACHE",
     "_TRUSTED_BIN_DIRS",

@@ -91,6 +91,28 @@ describe('AgentBackendTab', () => {
     expect(button('KAS (kiro-agent)')).toBeInTheDocument()
   })
 
+  it('puts the two kiro-family harnesses first and sorts the adapters after', async () => {
+    // KAS is not an adapter -- it is kiro-cli's own ACP relay, resolved from the same
+    // binary and sharing kiro's install verdict -- so it sits beside Kiro CLI rather
+    // than under 'k' in the byte order, which had landed it behind every adapter whose
+    // id happens to start earlier ('claude', 'codex'). Order is a product decision, so
+    // it is pinned here: a later edit to the comparator cannot quietly restore the
+    // alphabet.
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'codex']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow(''), probeRow('claude'), probeRow('kas'), probeRow('codex')],
+    })
+    wrap()
+    await waitFor(() => expect(button('codex')).toBeEnabled())
+
+    const labels = ['Kiro CLI', 'KAS (kiro-agent)', 'Claude Code', 'codex']
+    const rendered = screen
+      .getAllByRole('button')
+      .map(b => b.textContent?.trim())
+      .filter(text => text && labels.includes(text))
+    expect(rendered).toEqual(labels)
+  })
+
   it('reflects the configured backend as the pressed option', async () => {
     kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: 'kas' } })
     wrap()
@@ -213,6 +235,49 @@ describe('AgentBackendTab', () => {
     await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
     expect(screen.queryByRole('button', { name: 'Claude Code' })).not.toBeInTheDocument()
     expect(patchConfigMock).not.toHaveBeenCalled()
+  })
+
+  it('offers an agent this frontend has no name for, under its policy id', async () => {
+    // The case a hard-coded candidate list could not express. An edition calls
+    // `register_selectable_backend`, so the id reaches the schema enum and the probe
+    // payload -- but nothing in this file knows it exists. Before, the row was
+    // filtered out of a literal `[KIRO, CLAUDE, KAS]` and the only control that sets
+    // `agent.acp_backend` could not offer a backend the wire already accepted.
+    //
+    // `policy_id` carries the label because it is the name a governance rule spells,
+    // so it is already a word rather than an internal token. Untranslated on purpose:
+    // legible beats a chip with no text, and a core agent that ships selectable earns
+    // a real translated entry instead.
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'codex']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow(''), probeRow('claude'), probeRow('kas'), probeRow('codex')],
+    })
+    wrap()
+    await waitFor(() => expect(button('codex')).toBeEnabled())
+
+    // Reachable, not merely rendered: the click has to write the id the wire accepts.
+    fireEvent.click(button('codex'))
+    await waitFor(() => expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', 'codex'))
+  })
+
+  it('hides a known-but-unselectable agent even when the probe lists it', async () => {
+    // `GET /api/acp-backends` returns a row per id the CORE knows, which is a wider
+    // set than the deployment may select -- codex ships known and not selectable. So
+    // widening `candidates` to the probe payload must not smuggle in a row the schema
+    // excludes, or the panel would offer an option PATCH answers 400 for.
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(''),
+        probeRow('claude'),
+        probeRow('kas'),
+        probeRow('codex', { selectable: false }),
+      ],
+    })
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.queryByRole('button', { name: 'codex' })).not.toBeInTheDocument()
+    expect(screen.queryByText('codex')).not.toBeInTheDocument()
   })
 
   it('saves the Claude Code selection the shipped build offers', async () => {
@@ -496,6 +561,43 @@ describe('AgentBackendTab', () => {
     wrap()
     await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
     expect(screen.queryByText(/normally asks before it acts/)).not.toBeInTheDocument()
+  })
+
+  it('tells a Codex operator that being installed is not being signed in', async () => {
+    // The gap the install line cannot cover. codex-acp ships its own Codex binary, so
+    // `installed` answers the whole binary question -- and a session with no credential
+    // still dies on the first turn, with nothing on the page having said what was
+    // absent. Both branches of the remedy must be named: Codex's own sign-in, and a
+    // model provider in ~/.codex/config.toml for credentials that come from elsewhere.
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'codex']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow(''), probeRow('claude'), probeRow('kas'), probeRow('codex')],
+    })
+    wrap()
+    await waitFor(() => expect(button('codex')).toBeEnabled())
+    expect(screen.getByText(/Codex signs in on its own/)).toBeInTheDocument()
+    expect(screen.getByText(/~\/\.codex\/config\.toml/)).toBeInTheDocument()
+  })
+
+  it('says the credential is not checked here rather than implying it is', async () => {
+    // The reason this is a standing caveat and not a probe line: the panel does not
+    // read those files, and a `missing` verdict would DISABLE the switch for an
+    // operator who is authenticated by a path the check cannot see. The sentence has
+    // to disclaim the measurement, or the reader takes silence for a green light.
+    schemaMock.mockReturnValue(schemaWith(['', 'codex']))
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow(''), probeRow('codex')] })
+    wrap()
+    await waitFor(() => expect(button('codex')).toBeEnabled())
+    expect(screen.getByText(/Neither is checked here/)).toBeInTheDocument()
+  })
+
+  it('does not put the Codex caveat on the other agents', async () => {
+    // Kiro CLI and KAS authenticate through Crew's own identity store, so telling
+    // their reader to finish a separate sign-in would be false.
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow(''), probeRow('claude'), probeRow('kas')] })
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.queryByText(/Codex signs in on its own/)).not.toBeInTheDocument()
   })
 
   it('states that the set is decided at gateway start', async () => {

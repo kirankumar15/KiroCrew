@@ -23,6 +23,9 @@ if TYPE_CHECKING:
         SessionPrincipal,
         WorkloadIdentity,
     )
+    from kiro_crew.security import DeniedCommandRule
+    from kiro_crew.skill_providers.base import SkillProvider
+    from kiro_crew.tips_pool import TipsPool
 
 from kiro_crew import security, sso_status
 from kiro_crew.platform.interfaces import (
@@ -299,6 +302,31 @@ class DefaultPromptSourceProvider:
     """No edition prompt/SOP roots — only user-authored prompts are listed."""
 
     def prompt_source_roots(self) -> List[Path]:
+        return []
+
+
+class DefaultSkillDiscoveryProvider:
+    """No edition skill discovery providers — the built-in catalog only."""
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        return []
+
+
+class DefaultTipsProvider:
+    """No edition tip pool — the public curated file + docs-scan catalog.
+
+    ``None`` is the "public pool unchanged" answer, so the standalone edition is
+    behaviorally identical to before the seam existed.
+    """
+
+    def tips_pool(self) -> "Optional[TipsPool]":
+        return None
+
+
+class DefaultDeniedRuleProvider:
+    """No edition denied-command rules — the built-in catalog only."""
+
+    def denied_rules(self) -> List["DeniedCommandRule"]:
         return []
 
 

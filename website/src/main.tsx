@@ -15,6 +15,7 @@ import { ProviderProvider } from './providers'
 import { ThemeProvider } from './hooks/useTheme'
 import { UIModeProvider } from './hooks/useUIMode'
 import ThemeExperienceLayer from './components/ThemeExperienceLayer'
+import { NavigationLeaveGuardProvider, NavigationBackGuard } from './components/NavigationLeaveGuard'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
 // i18n must initialize before the first render — a component rendering ahead of
@@ -28,6 +29,7 @@ import { queryClient } from './api/queryClient'
 import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
 import { installPageZoomSuppression } from './utils/pageZoom'
+import { installStaleShellHeal } from './lib/staleShellHeal'
 import 'katex/dist/katex.min.css'
 import './index.css'
 import './styles/cli-mode.css'
@@ -47,6 +49,8 @@ initI18n()
 // WebKit, which ignores both for user gestures. Installed before render so the
 // very first pinch is already suppressed. See utils/pageZoom.ts.
 installPageZoomSuppression()
+// Detect and break out of a stale service-worker shell (see the module doc).
+installStaleShellHeal()
 
 // Auto-recover from stale lazy-chunk errors after a frontend rebuild.
 // Vite fires `vite:preloadError` on window when a dynamic import() of a
@@ -148,21 +152,28 @@ createRoot(document.getElementById('root')!).render(
             <ThemeProvider>
               <UIModeProvider>
                 <ThemeExperienceLayer />
-                <BrowserRouter>
-                  <Routes>
-                    <Route path="/worlds-popout" element={<BrandingProvider><ProviderProvider><Suspense fallback={null}><WorldsPopout /></Suspense></ProviderProvider></BrandingProvider>} />
-                    <Route
-                      path="*"
-                      element={(
-                        <BrandingProvider>
-                          <ProviderProvider>
-                            <DashboardBootstrap>{withCommitProfiler('app', <App />)}</DashboardBootstrap>
-                          </ProviderProvider>
-                        </BrandingProvider>
-                      )}
-                    />
-                  </Routes>
-                </BrowserRouter>
+                <NavigationLeaveGuardProvider>
+                  <BrowserRouter>
+                    {/* Inside the router (it navigates) and outside the routes
+                        (it must survive every route change). Renders nothing,
+                        and stays out of the history stack entirely until a page
+                        publishes work at stake. */}
+                    <NavigationBackGuard />
+                    <Routes>
+                      <Route path="/worlds-popout" element={<BrandingProvider><ProviderProvider><Suspense fallback={null}><WorldsPopout /></Suspense></ProviderProvider></BrandingProvider>} />
+                      <Route
+                        path="*"
+                        element={(
+                          <BrandingProvider>
+                            <ProviderProvider>
+                              <DashboardBootstrap>{withCommitProfiler('app', <App />)}</DashboardBootstrap>
+                            </ProviderProvider>
+                          </BrandingProvider>
+                        )}
+                      />
+                    </Routes>
+                  </BrowserRouter>
+                </NavigationLeaveGuardProvider>
               </UIModeProvider>
             </ThemeProvider>
           </LanguageProvider>

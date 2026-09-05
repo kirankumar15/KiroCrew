@@ -85,26 +85,49 @@ which protects the SPAWN. Without the second check the refusal would hand kiro-c
 stranger's spec at our fixed name and initialize its ``mcpServers``. A refusal aborts
 warming entirely, audited: the cold path still serves every Connect.
 
-OWNERSHIP: these specs carry FIXED, predictable names in the user's own agents directory,
-so a name is where a spec of ours would GO and never proof that the file there is one.
-Every spec written here is stamped with :data:`_WARM_SPEC_SENTINEL` on its description --
-the stock defaults a spec body also fixes are values a user's own agent plausibly carries,
-so the sentinel is what actually discriminates. Neither :func:`_write_warm_mint_specs` nor
-:func:`_remove_warm_mint_specs` unlinks or overwrites a path whose contents this module did
-not write -- see :func:`_warm_spec_is_foreign`.
+OWNERSHIP: mode names remain fixed, but their files live only in one random, owner-only
+PROJECT scope under ``<data home>/run/connections-warm/generations``. That generation root is
+the runtime cwd, so both the initial ``--agent`` and later ``session/set_mode`` resolve the
+private ``.kiro/agents`` files before the user's global scope; the picker refuses the sensitive
+run tree. Every spec is still stamped with :data:`_WARM_SPEC_SENTINEL`, because content proof
+protects same-user races and licenses one-time cleanup of sentinel-owned global leftovers.
+An unsentinelled global file is never auto-deleted: a name cannot prove ownership.
+
+GENERATION LIFETIME follows the process. Its PID-reuse-resistant owner marker is written
+before spawn and completed with the child identity after spawn. Parking or a failed kill keeps
+the directory attached; a confirmed kill releases it. Gateway startup scavenges only roots
+whose gateway and runtime identities are both provably dead, while graceful cleanup retires the
+live singleton. Missing, malformed or unreadable evidence fails closed to retained clutter.
 
 INVARIANT: no coroutine here touches the filesystem directly. The spec helpers read the
-user's config, the shared agents dir, or kiro-cli's OAuth cache, and the credential gate
-reads the operator's OAuth-endpoint extension -- any of which can sit on a network mount
-where a stat is unbounded -- so they are synchronous, and a coroutine reaches them through
-``asyncio.to_thread``. Enforced by a fixed-point drift guard in
+user's config, private generation tree, global legacy agents dir, or kiro-cli's OAuth cache,
+and the credential gate reads the operator's OAuth-endpoint extension -- any of which can sit
+on a network mount where a stat is unbounded -- so they are synchronous, and a coroutine
+reaches them through ``asyncio.to_thread``. Enforced by a fixed-point drift guard in
 ``test/test_connections_warm.py``, not merely described here.
 
 REQUEST PATH: :func:`warm_mint_all` is driven by ``POST /api/connections/premint``, which the
-Connections page WILL fire once on mount -- no frontend caller exists yet, so today the endpoint
-is reachable through the API only. It scans the candidates and hands them over, so the slugs it
-reports and the rows the engine claims come from one registry read. Proactive refresh attaches
-in :func:`_warm_mint_reaper` when slice N3 lands.
+Connections page fires once on mount. It scans the candidates and hands them over, so the slugs
+it reports and the rows the engine claims come from one registry read. The consumer of what it
+warms is :func:`adopt_shared_mint`, which ``POST /api/connections/mint`` tries BEFORE reserving
+a row of its own -- without it that endpoint's ``reserve_mint_row`` popped the shared row and
+disposed the very URL the click had been warmed for. A table miss re-drains the newest live
+shared session that activated the provider and retries adoption before the dedicated cold path.
+
+RESILIENCE is lifecycle-owned by the same reaper that detects process death. An explicit page
+warm arms ONE automatic replacement. The dead generation reserves one single-flight re-arm task,
+which reuses the ordinary tri-state candidate scan and ``warm_mint_all`` path without granting
+itself another attempt. Concurrent observers share that task; deliberate shutdown disarms and
+cancels it before retiring the process. No provider-level recovery state crosses the API.
+Proactive refresh attaches in :func:`_warm_mint_reaper` when its dependent slice lands.
+
+TWO AXES, and conflating them is what the handoff had to separate. ``shared`` is OWNERSHIP: an
+unclaimed premint any Connect may adopt, and the only mark a row still ``minting`` carries.
+``generation``/``activation`` is PROVENANCE: the verifier lives in the shared process, so
+:func:`_warm_row_alive` judges redeemability however the row is owned. Adoption clears the first
+and keeps the second, so every warm-side predicate keys on :func:`_warm_table_row` -- the
+disjunction -- and the cold engine's ``_mint_holder_alive`` ABSTAINS on a row carrying a
+``generation`` rather than reading its absent ``client`` as death.
 """
 
 from __future__ import annotations
@@ -113,16 +136,22 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
+import shutil
+import stat
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from kiro_crew import agent as _agent
+from kiro_crew import hooks, platform_compat
 from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import AGENT_FILENAME
 from kiro_crew.config.loader import data_home
+from kiro_crew.config.paths import project_agents_dir
 from kiro_crew.connections.mint import (
     _MINT_AGENT_PREFIX,
     _MINT_GRANT_POLL_SECONDS,
@@ -167,6 +196,15 @@ _WARM_ALL_AGENT = f"{_WARM_AGENT_PREFIX}all"
 #: ``description`` is the only schema-legal field free enough to carry a marker: kiro-cli
 #: rejects an unknown spec key, and the agent-spec migration sweep strips bookkeeping keys.
 _WARM_SPEC_SENTINEL = "Kiro Crew warm mint spec (machine-written; safe to delete)"
+#: Each helper process resolves its internal modes from one private project scope. The
+#: directory name is random rather than a provider or agent name, so no stable internal
+#: mode appears under the user's global ``~/.kiro/agents`` scope.
+_WARM_GENERATION_PREFIX = "generation-"
+_WARM_GENERATION_MARKER = ".owner.json"
+_WARM_GENERATION_SENTINEL = "kirocrew.connections.warm.generation"
+_WARM_GENERATION_MARKER_VERSION = 1
+_WARM_GENERATION_MARKER_MAX_BYTES = 4096
+_WARM_RUNTIME_DIR_ATTR = "_kirocrew_warm_generation_dir"
 _WARM_SPAWN_TIMEOUT_SECONDS = 90.0
 _WARM_SESSION_TIMEOUT_SECONDS = 90.0
 _WARM_SESSION_DESTROY_TIMEOUT_SECONDS = 10.0
@@ -174,8 +212,9 @@ _WARM_SESSION_DESTROY_TIMEOUT_SECONDS = 10.0
 #: this only buys back a session already on its way; see ``_abandon_session_creation``.
 _WARM_SESSION_REAP_TIMEOUT_SECONDS = 10.0
 _WARM_KILL_TIMEOUT_SECONDS = 20.0
-#: The oauth_request frame lands a beat AFTER set_mode returns (~0.35s measured),
-#: beyond drain_init's idle window for a slow provider. Poll rather than race it.
+#: One bounded drain window. A run stops after this many consecutive quiet windows,
+#: while each newly observed provider renews that quiet budget. The absolute cap scales by
+#: the expected roster, so unique progress cannot extend collection without bound.
 _WARM_OAUTH_SETTLE_SECONDS = 0.5
 _WARM_OAUTH_SETTLE_ROUNDS = 6
 #: A tenth of the mint TTL: long enough that reopening the gallery reuses the
@@ -184,6 +223,9 @@ _WARM_IDLE_GRACE_SECONDS = _MINT_TTL_SECONDS / 10
 #: One respawn, then the cold path -- a second death means the process cannot stay
 #: up, and a Connect is better served by its own dedicated spawn.
 _WARM_ACTIVATION_ATTEMPTS = 2
+#: One automatic replacement per explicit page warm. The replacement does not re-arm this
+#: budget, so a repeatedly dying process cannot turn the reaper into a restart loop.
+_WARM_REARM_ATTEMPTS = 1
 #: Generation key for a process that never became ``self._runtime`` -- an abandoned spawn,
 #: which owns no rows. NEGATIVE because generations only ever increment from zero, so no row
 #: can carry it: ``_generation_holds_live_rows`` reads it as needed by nobody, and the sweep
@@ -374,14 +416,74 @@ def _warm_candidate_scan() -> tuple[list[Provider], list[Provider]]:
     return universe, _warm_activation_candidates(universe)
 
 
+def _current_warm_redrain_entry(slug: str) -> dict[str, Any] | None:
+    """The current eligible authorization entry for a late-session re-drain.
+
+    Rebuild the same candidate plan activation uses rather than trusting the provider
+    snapshot retained by an older session. This rechecks visibility, enabled state, the
+    tri-state grant verdict, configured-entry compatibility, and the registry auth shape.
+    The caller runs this off the event loop because those checks read user-owned files.
+    """
+    _universe, candidates = _warm_candidate_scan()
+    provider = next((item for item in candidates if item["slug"] == slug), None)
+    if provider is None:
+        return None
+    return _warm_spec_plan([provider]).entries.get(mcp_server_alias(slug))
+
+
+_GRANT_PRESENCE_READ_ID = "connections_premint.oauth_grant_presence"
+
+
 def mintable_providers() -> list[Provider]:
     """Providers an activation should warm right now, registry order."""
     return _warm_candidate_scan()[1]
 
 
+def _audited_mintable_providers() -> tuple[list[Provider], bool]:
+    """Return candidates and whether their acted-on grant scan was SEL-audited.
+
+    The explicit page warm and its one automatic replacement are one page-owned
+    lifecycle, so both use the premint read id. An empty scan drives no action and
+    therefore owes no event.
+    """
+    candidates = mintable_providers()
+    if not candidates:
+        return candidates, True
+    recorded = hooks.emit_internal_read_audit(_GRANT_PRESENCE_READ_ID, "success")
+    return candidates, recorded
+
+
 def _wanted_aliases(providers: list[Provider]) -> frozenset[str]:
     """The server aliases an activation must produce a challenge for."""
     return frozenset(mcp_server_alias(provider["slug"]) for provider in providers)
+
+
+async def _collect_oauth_requests(handle: Any, wanted: frozenset[str]) -> list[dict[str, str]]:
+    """Collect challenges until the queue stays quiet, bounded by the expected roster."""
+    collected: dict[str, dict[str, str]] = {}
+    quiet_drains = 0
+    drains = 0
+    hard_drain_limit = max(1, len(wanted)) * _WARM_OAUTH_SETTLE_ROUNDS
+    while True:
+        before = len(collected)
+        for request in handle.pop_pending_oauth_requests():
+            name = str(request.get("serverName") or "")
+            if name and request.get("oauthUrl"):
+                collected[name] = request
+        if len(collected) > before:
+            quiet_drains = 0
+        if wanted and wanted <= collected.keys():
+            break
+        if quiet_drains >= _WARM_OAUTH_SETTLE_ROUNDS or drains >= hard_drain_limit:
+            break
+        await handle.drain_init(
+            duration=_WARM_OAUTH_SETTLE_SECONDS,
+            idle_exit=_WARM_OAUTH_SETTLE_SECONDS,
+            no_report_ceiling=0.0,
+        )
+        drains += 1
+        quiet_drains += 1
+    return list(collected.values())
 
 
 def _auth_shape(entry: dict[str, Any]) -> tuple[str, tuple[str, ...], str]:
@@ -560,31 +662,62 @@ def _warm_ownership_marks(name: str) -> dict[str, Any]:
     return {key: probe[key] for key in ("model", "includeMcpJson", "prompt", "allowedTools")}
 
 
+def _private_warm_spec_work_dir(path: Path) -> Path | None:
+    """Return the owned generation root for a project-local spec, or ``None``.
+
+    The ordinary agent reader rejects ``data_home/run`` by design. These files live there
+    deliberately, so a separate reader is allowed only after the path is proved to be a
+    direct child of a sentinel-owned generation scope.
+    """
+    agents_dir = path.parent
+    if agents_dir.name != "agents" or agents_dir.parent.name != ".kiro":
+        return None
+    work_dir = agents_dir.parent.parent
+    if not _is_plain_warm_generation_dir(work_dir):
+        return None
+    return work_dir if _read_warm_generation_owner(work_dir) is not None else None
+
+
+def _read_warm_spec_body(path: Path) -> dict[str, Any] | None:
+    """Read one spec through the correct trust boundary for its scope."""
+    if _private_warm_spec_work_dir(path) is None:
+        return _read_agent_spec(
+            path,
+            operation="connections_warm_mint",
+            source="dashboard",
+        )
+    try:
+        if platform_compat.is_link_or_junction(path):
+            return None
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > hooks.MAX_FILE_BYTES:
+            return None
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
 def _warm_spec_is_foreign(path: Path) -> bool:
     """True when ``path`` exists but no warm plan wrote it, so this module must not touch it.
 
-    Warm spec names are FIXED and predictable and they sit in the user's OWN agents
-    directory, so the name shape :func:`_is_stale_warm_spec` checks says where a spec of
-    ours would GO -- never that the file already there is one. Ownership is proved from the
-    contents instead, and it takes BOTH halves: the declared ``name`` matches the file with
-    every field the writer fixes still holding, AND the description carries the sentinel.
-    The marks alone are generic defaults, so a wholly user-authored spec that happens to
-    carry them was read as ours and clobbered; the sentinel is the half that discriminates.
+    Warm mode names are FIXED and predictable, so the name shape
+    :func:`_is_stale_warm_spec` checks says where a spec of ours would GO -- never that the
+    file already there is one. Production writes them inside a private generation, while
+    startup also applies this predicate to old global paths. Ownership is proved from the
+    contents in both scopes: the declared ``name`` matches the file with every field the
+    writer fixes still holding, AND the description carries the sentinel. The marks alone
+    are generic defaults, so the sentinel is the half that discriminates.
 
     Fails closed, because the two mistakes are not symmetric. Reading a file of ours as
     foreign costs one stale spec left as clutter; reading a user's hand-written agent as
     ours deletes it, or overwrites it with a spec they never asked for. So a file that is
     unreadable, not a JSON object, or shaped like anything but our own is foreign.
     """
-    # Through the hardened reader, like the planner read: a raw ``_load_json`` FOLLOWS a
-    # symlink planted at this warm path and parses whatever it lands on, so a link aimed at
-    # a sensitive file was read uncapped and unaudited -- and the ownership verdict this
-    # function returns is what decides whether that path gets unlinked or overwritten.
-    body = _read_agent_spec(
-        path,
-        operation="connections_warm_mint",
-        source="dashboard",
-    )
+    # Global/user files go through the hardened discovery reader. Private generation files
+    # use the equally bounded non-link reader above only after their sentinel-owned run root
+    # is proved; the general reader correctly rejects that sensitive path.
+    body = _read_warm_spec_body(path)
     if not body:
         # A refusal reads as an empty body: absent, unreadable, non-object, oversized and a
         # sensitive-target symlink all land here, and only the ABSENT one is a path we may
@@ -598,20 +731,290 @@ def _warm_spec_is_foreign(path: Path) -> bool:
     marks = _warm_ownership_marks(path.stem)
     if body.get("name") != path.stem or any(body.get(key) != value for key, value in marks.items()):
         return True
-    # No legacy exposure: no warm-spec writer has ever shipped, so no unsentinelled file of
-    # ours exists anywhere to be orphaned by requiring this. Were one to exist it would read
-    # as foreign, which means refused and left in place -- the safe direction.
+    # An unsentinelled global file remains foreign even if an early/dev build produced it.
+    # Startup logs and retains that path because its name cannot prove ownership; the design
+    # note gives the operator the manual inspection/removal rule. Private generation specs
+    # always carry the sentinel before their process starts.
     return not str(body.get("description") or "").startswith(_WARM_SPEC_SENTINEL)
 
 
-def _write_warm_mint_specs(plan: _WarmSpecPlan) -> None:
-    """Write the whole spec set, removing warm specs no longer in it.
+def _warm_work_dir() -> Path:
+    """Managed root for private warm generations, inside the protected run tree.
 
-    Every unlink and every write is gated on ownership, so a file this module did not write
-    survives both. A refusal is audited and skipped, never raised: a provider whose spec
-    path is occupied is a provider that goes unwarmed, not a failed spawn.
+    Specs never live directly here. Each process gets one direct child under
+    :func:`_warm_generations_dir`, and that child becomes its cwd so kiro-cli resolves
+    ``<cwd>/.kiro/agents`` before the user's global agent directory.
     """
-    agents_dir = _agent.kiro_agents_dir_path()
+    return data_home() / "run" / "connections-warm"
+
+
+def _warm_generations_dir() -> Path:
+    """Root whose direct children are independently owned helper generations."""
+    return _warm_work_dir() / "generations"
+
+
+def _warm_generation_agents_dir(work_dir: Path) -> Path:
+    """The project-local agent scope kiro-cli resolves for one helper process."""
+    return project_agents_dir(work_dir)
+
+
+def _warm_generation_marker_path(work_dir: Path) -> Path:
+    return work_dir / _WARM_GENERATION_MARKER
+
+
+def _warm_generation_owner(runtime: Any | None = None) -> dict[str, Any]:
+    """Ownership record for one generation, with PID-reuse-resistant identities.
+
+    Both identities are taken from ``process_start_time`` because that is the helper
+    ``_process_identity_live`` compares them against on read. The neighbouring
+    ``own_process_start_time`` answers a deliberately different, reboot-unique format --
+    start ticks joined to the boot UUID on Linux, a ``proc_pidinfo`` microtime on macOS --
+    so a gateway token taken from it could never equal what the reader recomputes, and the
+    live gateway would read as dead. Scavenging removes a generation only once BOTH
+    identities are proven dead, so that mismatch would not merely lose a signal: it would
+    forfeit the gateway's veto and delete a directory still in use the moment its
+    short-lived runtime exited.
+    """
+    gateway_pid = os.getpid()
+    runtime_pid = int(getattr(runtime, "pid", 0) or 0)
+    runtime_started = platform_compat.process_start_time(runtime_pid) if runtime_pid > 0 else None
+    return {
+        "sentinel": _WARM_GENERATION_SENTINEL,
+        "version": _WARM_GENERATION_MARKER_VERSION,
+        "gateway_pid": gateway_pid,
+        "gateway_started": platform_compat.process_start_time(gateway_pid) or "",
+        "runtime_pid": runtime_pid,
+        "runtime_started": runtime_started or "",
+    }
+
+
+def _write_warm_generation_owner(work_dir: Path, runtime: Any | None = None) -> None:
+    """Atomically publish the process identities that make boot scavenging safe."""
+    _agent._atomic_json_write(
+        _warm_generation_marker_path(work_dir), _warm_generation_owner(runtime)
+    )
+
+
+def _read_warm_generation_owner(work_dir: Path) -> dict[str, Any] | None:
+    """Read a small plain ownership marker; malformed or linked input is unowned."""
+    marker = _warm_generation_marker_path(work_dir)
+    try:
+        if platform_compat.is_link_or_junction(marker):
+            return None
+        info = marker.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _WARM_GENERATION_MARKER_MAX_BYTES:
+            return None
+        body = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    if body.get("sentinel") != _WARM_GENERATION_SENTINEL:
+        return None
+    if body.get("version") != _WARM_GENERATION_MARKER_VERSION:
+        return None
+    return body
+
+
+def _is_plain_warm_generation_dir(work_dir: Path) -> bool:
+    """Whether *work_dir* is one direct, non-link child of the managed root."""
+    if work_dir.parent != _warm_generations_dir() or not work_dir.name.startswith(
+        _WARM_GENERATION_PREFIX
+    ):
+        return False
+    try:
+        if platform_compat.is_link_or_junction(work_dir):
+            return False
+        return stat.S_ISDIR(work_dir.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _remove_warm_generation_dir(work_dir: Path) -> bool:
+    """Remove one sentinel-owned generation tree without following a link.
+
+    ``False`` means ownership or removal could not be proved. That direction leaves clutter
+    but never deletes an arbitrary run-tree entry.
+    """
+    try:
+        work_dir.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not _is_plain_warm_generation_dir(work_dir):
+        return False
+    if _read_warm_generation_owner(work_dir) is None:
+        return False
+    try:
+        shutil.rmtree(work_dir)
+    except OSError:
+        logger.debug("warm generation removal failed for %s", work_dir.name, exc_info=True)
+        return False
+    return True
+
+
+def _create_warm_generation_dir() -> Path:
+    """Create one owner-only project root and its private ``.kiro/agents`` scope.
+
+    ``make_owner_only_dir``'s tighten step is best-effort by contract, so it alone cannot
+    carry this module's owner-only guarantee: on a filesystem where the ACL write fails the
+    directory would exist but be open to other local users, and the agent specs written into
+    it are injectable. Each level is therefore re-tightened with the fail-loud
+    :func:`platform_compat.restrict_dir_to_owner` — a refused ACL raises, the cleanup below
+    removes the loose directory, and the caller gets an error instead of a false private
+    scope.
+    """
+    generations = _warm_generations_dir()
+    platform_compat.make_owner_only_dir(generations)
+    platform_compat.restrict_dir_to_owner(generations)
+    work_dir = generations / f"{_WARM_GENERATION_PREFIX}{uuid.uuid4().hex}"
+    try:
+        platform_compat.make_owner_only_dir(work_dir)
+        platform_compat.restrict_dir_to_owner(work_dir)
+        platform_compat.make_owner_only_dir(work_dir / ".kiro")
+        platform_compat.restrict_dir_to_owner(work_dir / ".kiro")
+        agents_dir = _warm_generation_agents_dir(work_dir)
+        platform_compat.make_owner_only_dir(agents_dir)
+        platform_compat.restrict_dir_to_owner(agents_dir)
+        _write_warm_generation_owner(work_dir)
+    except BaseException:
+        # The path was generated in this call and has not been handed to a process. Cleanup
+        # may therefore remove it without the marker proof normal retirement requires.
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+    return work_dir
+
+
+def _bind_warm_generation(runtime: Any, work_dir: Path) -> None:
+    """Attach a spawned process to its directory and publish its runtime identity."""
+    setattr(runtime, _WARM_RUNTIME_DIR_ATTR, str(work_dir))
+    _write_warm_generation_owner(work_dir, runtime)
+
+
+def _runtime_generation_dir(runtime: Any) -> Path | None:
+    raw = getattr(runtime, _WARM_RUNTIME_DIR_ATTR, "")
+    return Path(raw) if raw else None
+
+
+def _recorded_runtime_is_dead(work_dir: Path) -> bool:
+    """Whether the marker positively proves its runtime is gone.
+
+    Mirrors the scavenger's ``is not False`` test, so only proof of death releases a tree and
+    both "still running" and "cannot tell" keep it. An absent or unreadable marker answers
+    ``True`` here only because :func:`_remove_warm_generation_dir` independently refuses an
+    unowned directory, which keeps the ownership refusal in one place. A marker still
+    carrying ``runtime_pid: 0`` is the PROVISIONAL write from
+    :func:`_create_warm_generation_dir` whose post-spawn rewrite in
+    :func:`_bind_warm_generation` never landed -- the spawned process may be alive with no
+    recorded identity to check, so pid 0 answers ``False`` (unproved keeps the tree), exactly
+    as :func:`_process_identity_live` answers ``None`` for the same marker on the scavenge
+    path.
+    """
+    owner = _read_warm_generation_owner(work_dir)
+    if owner is None:
+        return True
+    try:
+        pid = int(owner.get("runtime_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    return _process_identity_live(pid, str(owner.get("runtime_started") or "")) is False
+
+
+def _release_runtime_generation(runtime: Any) -> bool:
+    """Release a killed process's generation tree, once that death is actually proven.
+
+    ``_kill_quietly`` answering ``True`` is not that proof. ``AcpRuntime`` reports a survivor
+    by LOGGING one and returning normally -- both of its ``kill_process_tree`` calls swallow
+    ``OSError`` by design, so a signal-delivery failure (EPERM through a launcher wrapper,
+    pgid drift) is indistinguishable from success at that layer, and it deliberately leaves
+    the PID tracked for a sweep rather than raising. Removing on the caller's word alone
+    would therefore ``rmtree`` the cwd and private agent scope of a process still reading
+    them, which is the one loss this whole ownership marker exists to prevent.
+
+    ``False`` leaves the tree attached. Startup scavenging reclaims it once both recorded
+    identities are dead, so an unkillable child costs clutter until the next gateway start
+    instead of costing the running process its specs.
+    """
+    work_dir = _runtime_generation_dir(runtime)
+    if work_dir is None:
+        return True
+    if not _recorded_runtime_is_dead(work_dir):
+        return False
+    removed = _remove_warm_generation_dir(work_dir)
+    if removed:
+        try:
+            delattr(runtime, _WARM_RUNTIME_DIR_ATTR)
+        except AttributeError:
+            pass
+    return removed
+
+
+def _process_identity_live(pid: int, started: str) -> bool | None:
+    """Tri-state PID identity: live, dead/reused, or unprovable."""
+    if pid <= 0 or not started:
+        return None
+    liveness = platform_compat.pid_liveness(pid)
+    if liveness == platform_compat.PID_DEAD:
+        return False
+    current = platform_compat.process_start_time(pid)
+    if current is None:
+        return None
+    if current != started:
+        return False
+    if liveness in (platform_compat.PID_ALIVE, platform_compat.PID_UNSIGNALABLE):
+        return True
+    return None
+
+
+def _scavenge_warm_generation_dirs() -> int:
+    """Remove crash leftovers only when both recorded process identities are dead."""
+    root = _warm_generations_dir()
+    try:
+        candidates = list(root.iterdir())
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        logger.debug("warm generation startup scan failed", exc_info=True)
+        return 0
+    removed = 0
+    for work_dir in candidates:
+        if not _is_plain_warm_generation_dir(work_dir):
+            continue
+        owner = _read_warm_generation_owner(work_dir)
+        if owner is None:
+            logger.warning(
+                "Keeping unproved warm generation directory %s; inspect it manually",
+                work_dir.name,
+            )
+            continue
+        try:
+            gateway_live = _process_identity_live(
+                int(owner.get("gateway_pid") or 0), str(owner.get("gateway_started") or "")
+            )
+            runtime_live = _process_identity_live(
+                int(owner.get("runtime_pid") or 0), str(owner.get("runtime_started") or "")
+            )
+        except (TypeError, ValueError):
+            gateway_live = runtime_live = None
+        if gateway_live is not False or runtime_live is not False:
+            continue
+        if _remove_warm_generation_dir(work_dir):
+            removed += 1
+    if removed:
+        logger.info("Removed %d stale private warm generation directorie(s)", removed)
+    return removed
+
+
+def _write_warm_mint_specs(plan: _WarmSpecPlan, agents_dir: Path) -> None:
+    """Write the complete plan into one private project-local agent scope.
+
+    Every unlink and write is still ownership-gated. The directory is generation-private,
+    but preserving the content proof closes same-user races and keeps the legacy cleanup
+    predicate identical to the writer predicate.
+    """
     agents_dir.mkdir(parents=True, exist_ok=True)
     plan_names = frozenset(plan.specs)
     try:
@@ -632,19 +1035,8 @@ def _write_warm_mint_specs(plan: _WarmSpecPlan) -> None:
         _agent._atomic_json_write(path, spec)
 
 
-def _unowned_plan_specs(plan: _WarmSpecPlan) -> list[str]:
-    """The planned spec names whose file is missing, or is not one this module wrote.
-
-    Activation happens BY NAME: the runtime is handed ``agent=<fixed name>`` and kiro-cli
-    resolves that name off this same agents directory. So the write's refusal protects the
-    FILE and nothing else -- a hand-written agent sitting at a name we declined to
-    overwrite would be spawned, and its ``mcpServers`` commands would initialize. This is
-    what protects the SPAWN.
-
-    Existence is tested as well as ownership, because :func:`_warm_spec_is_foreign` answers
-    False for an absent path: a spec that is not there is equally not ours to activate.
-    """
-    agents_dir = _agent.kiro_agents_dir_path()
+def _unowned_plan_specs(plan: _WarmSpecPlan, agents_dir: Path) -> list[str]:
+    """Planned names missing from, or foreign to, this generation's private scope."""
     unowned: list[str] = []
     for name in plan.specs:
         path = agents_dir / f"{name}.json"
@@ -653,40 +1045,33 @@ def _unowned_plan_specs(plan: _WarmSpecPlan) -> list[str]:
     return unowned
 
 
-def _remove_warm_mint_specs() -> None:
-    """Unlink every warm spec THIS module wrote. Called when the process is retired."""
+def _remove_warm_mint_specs(agents_dir: Path) -> int:
+    """Unlink every sentinel-owned warm spec from one explicit agent scope."""
+    removed = 0
     try:
-        for path in _agent.kiro_agents_dir_path().glob(f"{_WARM_AGENT_PREFIX}*.json"):
+        for path in agents_dir.glob(f"{_WARM_AGENT_PREFIX}*.json"):
             if not _is_stale_warm_spec(path.stem, frozenset()):
                 continue
             if _warm_spec_is_foreign(path):
                 _log_warm_event("warm_mint_spec_removal", path.name, outcome="refused")
                 continue
             path.unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001 — spec files; the write-time sweep catches leftovers
+            removed += 1
+    except Exception:  # noqa: BLE001 — startup cleanup is best-effort and fail-closed
         logger.debug("warm mint spec removal failed", exc_info=True)
+    return removed
 
 
-def _warm_work_dir() -> Path:
-    """The shared process's working directory, inside the agent-write-protected run tree.
+def scavenge_warm_mint_artifacts() -> int:
+    """Boot cleanup for private crash leftovers and sentinel-owned global legacy specs.
 
-    NOT under ``connections/``, and the reason is the spawn. kiro-cli resolves PROJECT-LOCAL
-    agent specs from ``<cwd>/.kiro/agents`` as well as the user's agents dir, and this module
-    activates BY NAME -- so a spec planted at ``<cwd>/.kiro/agents/<mode>.json`` shadows the
-    warm spec :func:`_write_warm_mint_specs` wrote, on a path every ownership check here
-    (:func:`_warm_spec_is_foreign`, :func:`_unowned_plan_specs`) looks straight past. The
-    injected body's ``mcpServers`` would then be what the process initializes and authorizes
-    against.
-
-    ``connections/`` carries no entry in ``security._SENSITIVE_HOME_DIRS``, so an agent file
-    tool could write that tree; ``run/`` is already fenced read+write for precisely this
-    class of reason -- it holds the sandbox launchers and run markers the gateway execs
-    outside the sandbox. Putting the cwd there makes the injection unwritable through any
-    Kiro Crew-mediated channel instead of merely unlikely.
-
-    No ``mkdir`` here: the runtime creates its work dir at spawn.
+    An unsentinelled global file is deliberately retained: its name does not prove Kiro Crew
+    owns it. The design note documents the manual inspection/removal path for that legacy
+    residue.
     """
-    return data_home() / "run" / "connections-warm"
+    removed = _scavenge_warm_generation_dirs()
+    removed += _remove_warm_mint_specs(_agent.kiro_agents_dir_path())
+    return removed
 
 
 def _runtime_alive(runtime: Any) -> bool:
@@ -700,12 +1085,33 @@ def _runtime_alive(runtime: Any) -> bool:
         return False
 
 
+def _warm_table_row(entry: MintState) -> bool:
+    """True when the SHARED table owns this row's lifecycle -- claimed, or warm-minted.
+
+    TWO disjuncts, and both are load-bearing, because ``shared`` and ``generation``
+    answer different questions and :func:`adopt_shared_mint` moves only the first.
+
+    ``shared`` is OWNERSHIP: an unclaimed premint any Connect may adopt. It is also the
+    ONLY mark a row still ``minting`` carries, which is precisely the row a cancelled
+    activation must not leave behind -- so a generation-only test would stop counting it.
+
+    ``generation`` is PROVENANCE: the PKCE verifier lives in the shared process, so
+    redeemability is judged by :func:`_warm_row_alive` no matter who owns the row.
+    Adoption clears ``shared`` and keeps this, so an ownership-only test drops the
+    adopted row out of every count here -- and the counts are what keep its process
+    parked and its session held. The reaper would then retire the process holding the
+    URL the user is part-way through redeeming, which is the worst outcome available on
+    this path.
+    """
+    return bool(entry.get("shared")) or bool(entry.get("generation"))
+
+
 def _live_row_count(generation: int) -> int:
     """How many cards are still mid-consent on ``generation``."""
     return sum(
         1
         for entry in _mints.values()
-        if entry.get("shared")
+        if _warm_table_row(entry)
         and entry.get("generation") == generation
         and entry.get("state") in _LIVE_STATES
     )
@@ -721,7 +1127,7 @@ def _activations_in_use() -> set[int]:
     return {
         int(entry["activation"])
         for entry in _mints.values()
-        if entry.get("shared") and entry.get("activation") and entry.get("state") in _LIVE_STATES
+        if _warm_table_row(entry) and entry.get("activation") and entry.get("state") in _LIVE_STATES
     }
 
 
@@ -741,6 +1147,7 @@ class _WarmSession:
     handle: Any
     expires_at: float
     settled: bool = False
+    providers: tuple[Provider, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -778,6 +1185,14 @@ class _WarmMintRuntime:
         self._activation_seq = 0
         self._lock = asyncio.Lock()
         self._reaper: Any = None
+        #: Armed only by an explicit page warm. A replacement inherits the lifecycle but not
+        #: another attempt, which bounds unattended recovery to one process per page request.
+        self._supervision_armed = False
+        self._rearms_remaining = 0
+        #: Strong reference and single-flight identity for a replacement activation. The
+        #: reaper can cancel itself while the child replaces its dead generation, so the task
+        #: cannot be owned only by the awaiting reaper.
+        self._rearm_task: asyncio.Task[list[str]] | None = None
 
     def is_alive(self) -> bool:
         return _runtime_alive(self._runtime)
@@ -815,6 +1230,58 @@ class _WarmMintRuntime:
         current process is gone and no new mint will sweep them.
         """
         return len(self._retiring)
+
+    def arm_supervision(self) -> None:
+        """Allow one automatic replacement for the current explicit page warm."""
+        self._supervision_armed = True
+        self._rearms_remaining = _WARM_REARM_ATTEMPTS
+
+    def start_rearm(self, generation: int) -> asyncio.Task[list[str]] | None:
+        """Return the one replacement task for ``generation``, or decline recovery.
+
+        The state transition is synchronous, so concurrent observers on the event loop either
+        receive the same task or see the budget already consumed. A generation mismatch means
+        another path already replaced the dead process; a held runtime lock means an explicit
+        warm is already deciding the replacement and must not be followed by a second session.
+        """
+        task = self._rearm_task
+        if task is not None and not task.done():
+            return task
+        if task is not None:
+            self._rearm_task = None
+        if (
+            not self._supervision_armed
+            or self._rearms_remaining <= 0
+            or generation != self._generation
+            or self.is_alive()
+            or self._lock.locked()
+        ):
+            return None
+        self._rearms_remaining -= 1
+        task = asyncio.get_running_loop().create_task(_rearm_dead_warm_mint(generation))
+        self._rearm_task = task
+        task.add_done_callback(self._finish_rearm)
+        return task
+
+    def _finish_rearm(self, task: asyncio.Task[list[str]]) -> None:
+        """Release the single-flight slot and surface an otherwise-unobserved failure."""
+        if self._rearm_task is task:
+            self._rearm_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.debug(
+                "warm mint automatic re-arm failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    def _disarm_supervision(self) -> asyncio.Task[list[str]] | None:
+        """Prevent resurrection and detach the task shutdown must settle."""
+        self._supervision_armed = False
+        self._rearms_remaining = 0
+        task, self._rearm_task = self._rearm_task, None
+        return task
 
     async def settle_activation(self, activation: int, in_use: set[int]) -> None:
         """Mark ``activation`` absorbed, then collect the sessions nothing needs."""
@@ -891,7 +1358,9 @@ class _WarmMintRuntime:
                 return None
             generation = self._generation
             try:
-                activation, requests = await self._activate_locked(agent, _wanted_aliases(wanted))
+                activation, requests = await self._activate_locked(
+                    agent, _wanted_aliases(wanted), tuple(wanted)
+                )
             except Exception as exc:
                 if self.is_alive():
                     # One activation failed but the process still serves: its other verifiers
@@ -958,14 +1427,17 @@ class _WarmMintRuntime:
         await self._park_or_kill_locked()
 
         runtime: Any = None
+        work_dir: Path | None = None
         handed_over = False
         try:
-            await asyncio.to_thread(_write_warm_mint_specs, plan)
+            work_dir = await asyncio.to_thread(_create_warm_generation_dir)
+            agents_dir = _warm_generation_agents_dir(work_dir)
+            await asyncio.to_thread(_write_warm_mint_specs, plan, agents_dir)
             # The write REFUSES a path it does not own rather than clobbering it, and the
             # spawn below activates by NAME -- so without this the refusal would hand
             # kiro-cli a stranger's spec to execute. Aborting is safe and honest: the cold
             # path still serves every Connect, it just spawns per provider.
-            unowned = await asyncio.to_thread(_unowned_plan_specs, plan)
+            unowned = await asyncio.to_thread(_unowned_plan_specs, plan, agents_dir)
             if unowned:
                 logger.warning(
                     "Not warming: %d planned mint spec(s) are not ours to activate", len(unowned)
@@ -978,14 +1450,17 @@ class _WarmMintRuntime:
                 )
                 return None
             runtime = _acp_runtime_factory()(
-                work_dir=await asyncio.to_thread(_warm_work_dir),
+                work_dir=work_dir,
                 agent=_WARM_BASE_AGENT,
                 sandbox_mode="auto",
             )
+            # Attach before spawn so a cancelled/failed spawn still carries the only path its
+            # cleanup may remove. The marker remains provisional until spawn returns a PID.
+            setattr(runtime, _WARM_RUNTIME_DIR_ATTR, str(work_dir))
             await asyncio.wait_for(runtime.spawn(), timeout=_WARM_SPAWN_TIMEOUT_SECONDS)
-            # No await between the spawn returning and the flag: the handover is a run of
-            # plain assignments plus a synchronous ``create_task``, so there is no window
-            # in which the process is ours but the ``finally`` would still tear it down.
+            await asyncio.to_thread(_bind_warm_generation, runtime, work_dir)
+            # No await between the ownership marker landing and the handover: the runtime,
+            # plan and reaper become visible as one event-loop-atomic state transition.
             self._runtime, self._plan, self._digest = runtime, plan, plan.digest
             self._generation += 1
             self._reaper = asyncio.get_running_loop().create_task(
@@ -1000,9 +1475,9 @@ class _WarmMintRuntime:
             # parked the old generation AND cancelled its reaper, so a CancelledError in the
             # spec write or the spawn would otherwise leave that process with nothing that
             # will ever sweep it -- the parked-generation leak by a third route -- plus a
-            # forked child and a set of specs nobody owns.
+            # forked child and a private spec tree nobody owns.
             if not handed_over:
-                await self._abandon_spawn_locked(runtime)
+                await self._abandon_spawn_locked(runtime, work_dir)
         await asyncio.to_thread(
             _log_warm_event,
             "connections_warm_mint_spawn",
@@ -1010,24 +1485,35 @@ class _WarmMintRuntime:
         )
         return plan
 
-    async def _abandon_spawn_locked(self, runtime: Any) -> None:
+    async def _abandon_spawn_locked(
+        self,
+        runtime: Any,
+        work_dir: Path | None = None,
+    ) -> None:
         """Undo a spawn attempt that never became this object's process.
 
-        Reached from a ``finally``, so it covers cancellation as well as failure.
+        Reached from a ``finally``, so it covers cancellation as well as failure. A process
+        that may still live keeps its directory attached while the parked-generation drain
+        retries the kill; a directory created before any runtime existed can be released
+        immediately.
         """
         if self._retiring:
             # Armed BEFORE any await, because ``create_task`` is synchronous: the parked
             # generation then has its sweeper even if the teardown below is interrupted.
             # Stored as the reaper so a later spawn's own reaper replaces it.
             self._reaper = asyncio.get_running_loop().create_task(_drain_parked_generations())
-        if runtime is not None and not await _kill_quietly(runtime):
+        if runtime is None:
+            if work_dir is not None:
+                await asyncio.to_thread(_remove_warm_generation_dir, work_dir)
+            return
+        if not await _kill_quietly(runtime):
             # This attempt never became ``self._runtime``, so it owns no generation and no
             # rows. Tracked under a key no row can carry, which makes every sweep read it as
             # needed by nobody and retry the kill until it takes -- rather than dropping the
             # last reference to a child that outlived the spawn we gave up on.
             self._retain_unkilled_locked(_WARM_UNKEYED_GENERATION, runtime)
-        if not self._retiring:
-            await asyncio.to_thread(_remove_warm_mint_specs)
+            return
+        await asyncio.to_thread(_release_runtime_generation, runtime)
 
     async def _abandon_session_creation_locked(self, create: Any) -> None:
         """Reap a session the backend may have created after we stopped waiting for it.
@@ -1086,7 +1572,10 @@ class _WarmMintRuntime:
                 self._sessions.pop(activation, None)
 
     async def _activate_locked(
-        self, agent: str, wanted: frozenset[str]
+        self,
+        agent: str,
+        wanted: frozenset[str],
+        providers: tuple[Provider, ...] = (),
     ) -> tuple[int, list[dict[str, str]]]:
         """Activate ``agent`` on the shared process and return its challenges."""
         runtime = self._runtime
@@ -1121,39 +1610,10 @@ class _WarmMintRuntime:
             generation=self._generation,
             handle=handle,
             expires_at=time.monotonic() + _MINT_TTL_SECONDS,
+            providers=providers,
         )
-        collected: dict[str, dict[str, str]] = {}
         try:
-            for round_index in range(_WARM_OAUTH_SETTLE_ROUNDS):
-                for request in handle.pop_pending_oauth_requests():
-                    name = str(request.get("serverName") or "")
-                    if name and request.get("oauthUrl"):
-                        collected[name] = request
-                if wanted and wanted <= collected.keys():
-                    break
-                if round_index + 1 < _WARM_OAUTH_SETTLE_ROUNDS:
-                    # CONSUME the queue rather than sleep past it. This is the whole
-                    # mechanism: ``pop_pending_oauth_requests`` reads a list that only
-                    # ``drain_init`` appends to, and ``create_session`` runs exactly one
-                    # drain before handing the handle over -- so a bare sleep here moved
-                    # nothing, and a frame arriving after that drain's idle exit was
-                    # unreachable however many rounds elapsed. The budget was never the
-                    # binding constraint; the loop had no way to absorb a late frame at all.
-                    #
-                    # ``no_report_ceiling=0.0`` is load-bearing: it arms the idle shortcut at
-                    # entry, so this call cannot hold waiting for a "first report" that this
-                    # session already produced during ``create_session``'s own drain. That is
-                    # precisely the idle-window semantics that made an unbounded drain the
-                    # wrong tool here -- bounded per round, it is the right one. Each round is
-                    # therefore a window of at most ``_WARM_OAUTH_SETTLE_SECONDS`` that
-                    # returns as soon as the queue goes quiet, so the total budget is
-                    # unchanged and a satisfied activation still short-circuits on the pop
-                    # above without opening a window at all.
-                    await handle.drain_init(
-                        duration=_WARM_OAUTH_SETTLE_SECONDS,
-                        idle_exit=_WARM_OAUTH_SETTLE_SECONDS,
-                        no_report_ceiling=0.0,
-                    )
+            requests = await _collect_oauth_requests(handle, wanted)
         except BaseException:
             # Nothing will ever be stamped with this activation, so the session it
             # registered would leak past the sweep's settled-only rule. Marked settled and
@@ -1168,11 +1628,53 @@ class _WarmMintRuntime:
             if await _destroy_session_quietly(handle):
                 self._sessions.pop(activation, None)
             raise
-        return activation, list(collected.values())
+        return activation, requests
+
+    async def redrain_for(self, slug: str) -> _WarmMintResult | None:
+        """Drain a current-compatible live session for ``slug`` without spawning another."""
+        current_entry = await asyncio.to_thread(_current_warm_redrain_entry, slug)
+        if current_entry is None:
+            return None
+        async with self._lock:
+            for activation, record in reversed(list(self._sessions.items())):
+                if not self.generation_is_live(record.generation):
+                    continue
+                activated_provider = next(
+                    (provider for provider in record.providers if provider["slug"] == slug),
+                    None,
+                )
+                if activated_provider is None:
+                    continue
+                activated_entry = _registry_server_entry(activated_provider)
+                if activated_entry is None or _auth_shape(activated_entry) != _auth_shape(
+                    current_entry
+                ):
+                    return None
+                requests = await _collect_oauth_requests(
+                    record.handle, frozenset({mcp_server_alias(slug)})
+                )
+                if not requests:
+                    return None
+                return _WarmMintResult(
+                    generation=record.generation,
+                    activation=activation,
+                    providers=[activated_provider],
+                    requests=requests,
+                )
+        return None
 
     async def shutdown(self) -> None:
-        async with self._lock:
-            await self._retire_locked()
+        """Disarm recovery, settle its task, then retire every owned process."""
+        rearm = self._disarm_supervision()
+        try:
+            if rearm is not None and rearm is not asyncio.current_task() and not rearm.done():
+                rearm.cancel()
+                # ``return_exceptions`` consumes the CHILD cancellation. Cancellation of this
+                # shutdown still raises from gather and reaches the hard teardown in finally.
+                await asyncio.gather(rearm, return_exceptions=True)
+        finally:
+            async with self._lock:
+                await self._retire_locked()
 
     async def sweep_retiring(self) -> None:
         """Kill parked generations nothing is waiting on any more."""
@@ -1238,19 +1740,18 @@ class _WarmMintRuntime:
             raise
 
     async def _kill_generation(self, generation: int, runtime: Any) -> bool:
-        """Kill one process and expire the links only it could have redeemed.
+        """Kill one process, expire its links, then release its private spec tree.
 
         ``False`` when the kill did not take, and the caller must keep the pair tracked. The
         rows are expired either way -- this generation is being retired, so its URLs must
-        stop being served -- but the spec sweep is WITHHELD: a spec removed under a process
-        that is still running strands it without the file it was spawned on, which is the
-        same rule the parked path follows.
+        stop being served -- while the generation directory stays attached until a confirmed
+        kill. A parked or unkillable process therefore never loses the modes it still owns.
         """
         killed = await _kill_quietly(runtime)
         self._drop_generation_sessions(generation)
         await _expire_shared_mints("mint_process_gone", generation=generation)
-        if killed and self._runtime is None and not self._retiring:
-            await asyncio.to_thread(_remove_warm_mint_specs)
+        if killed:
+            await asyncio.to_thread(_release_runtime_generation, runtime)
         return killed
 
     def _retain_unkilled_locked(self, generation: int, runtime: Any) -> None:
@@ -1272,7 +1773,6 @@ class _WarmMintRuntime:
         pending = list(self._retiring)
         if runtime is not None:
             pending.append((generation, runtime))
-        had_work = bool(pending)
         self._retiring = []
         self._reaper = self._runtime = None
         self._plan, self._digest = None, ""
@@ -1286,9 +1786,11 @@ class _WarmMintRuntime:
                 await _expire_shared_mints("mint_process_gone", generation=doomed_generation)
                 if not killed:
                     # A hard teardown that could not kill a child must not report it retired:
-                    # left in ``pending`` for the ``finally`` below to re-track.
+                    # left in ``pending`` for the ``finally`` below to re-track, with its
+                    # private agent scope still attached.
                     break
-                # Popped only once this generation is fully retired.
+                await asyncio.to_thread(_release_runtime_generation, doomed_runtime)
+                # Popped only once this generation and its private scope are fully retired.
                 pending.pop(0)
         finally:
             if pending:
@@ -1297,10 +1799,6 @@ class _WarmMintRuntime:
                 # lists above were emptied synchronously, so this is the only reference left.
                 self._retiring = pending
                 self._reaper = asyncio.get_running_loop().create_task(_drain_parked_generations())
-        if had_work and not self._retiring:
-            # Only once nothing is left: a spec removed under a still-running parked process
-            # strands it without the file it was spawned on.
-            await asyncio.to_thread(_remove_warm_mint_specs)
 
 
 async def _destroy_session_quietly(handle: Any) -> bool:
@@ -1352,6 +1850,11 @@ async def _kill_quietly(runtime: Any) -> bool:
 _warm_mint = _WarmMintRuntime()
 
 
+async def shutdown_warm_mint() -> None:
+    """Gateway cleanup hook: retire every live or parked warm generation."""
+    await _warm_mint.shutdown()
+
+
 def _warm_row_alive(entry: MintState) -> bool:
     """Whether a SHARED row's URL can still actually be redeemed.
 
@@ -1369,7 +1872,7 @@ def _warm_row_alive(entry: MintState) -> bool:
 def _shared_mints_pending() -> bool:
     """True while any card still needs the shared process alive."""
     return any(
-        entry.get("shared") and entry.get("state") in _LIVE_STATES for entry in _mints.values()
+        _warm_table_row(entry) and entry.get("state") in _LIVE_STATES for entry in _mints.values()
     )
 
 
@@ -1385,7 +1888,7 @@ async def _expire_shared_mints(reason: str, *, generation: int | None = None) ->
     flipped: list[str] = []
     async with _mints_lock:
         for slug, entry in _mints.items():
-            if not entry.get("shared") or entry.get("state") not in _LIVE_STATES:
+            if not _warm_table_row(entry) or entry.get("state") not in _LIVE_STATES:
                 continue
             if generation is not None and entry.get("generation") != generation:
                 continue
@@ -1399,11 +1902,16 @@ async def _expire_shared_mints(reason: str, *, generation: int | None = None) ->
 
 
 async def expire_dead_mints() -> list[str]:
-    """Withdraw every shared row whose holding process is gone. THE chokepoint."""
+    """Withdraw every warm-held row whose holding process is gone. THE chokepoint.
+
+    Adopted rows included, and that is not incidental: the cold engine's
+    ``_mint_holder_alive`` deliberately ABSTAINS on a row carrying a ``generation``
+    (it owns no ``client`` to read), so this is the only reader that can withdraw one.
+    """
     doomed: list[str] = []
     async with _mints_lock:
         for slug, entry in _mints.items():
-            if not entry.get("shared") or entry.get("state") != "waiting":
+            if not _warm_table_row(entry) or entry.get("state") != "waiting":
                 continue
             if _warm_row_alive(entry):
                 continue
@@ -1474,6 +1982,37 @@ async def _drain_parked_generations() -> None:
         await _warm_mint.sweep_sessions(in_use)
 
 
+async def _rearm_dead_warm_mint(generation: int) -> list[str]:
+    """Re-warm the still-unconnected eligible roster after one process death.
+
+    Candidate selection reuses the ordinary tri-state grant scan: only a confirmed absence
+    initiates consent, while a present or unreadable grant is skipped. ``arm_supervision`` is
+    false so this replacement cannot recursively earn another automatic replacement.
+    """
+    try:
+        candidates, audit_recorded = await asyncio.to_thread(_audited_mintable_providers)
+    except Exception:  # noqa: BLE001 -- the cold path remains available to every Connect
+        logger.debug("warm mint re-arm candidate scan failed", exc_info=True)
+        return []
+    if not candidates:
+        logger.info(
+            "Shared mint generation %d died; no confirmed-unconnected providers need re-arm",
+            generation,
+        )
+        return []
+    if not audit_recorded:
+        logger.warning(
+            "grant-presence audit for the automatic re-arm scan could not be recorded; "
+            "proceeding unaudited"
+        )
+    logger.warning(
+        "Shared mint generation %d died; re-arming %d eligible provider(s)",
+        generation,
+        len(candidates),
+    )
+    return await warm_mint_all(candidates, arm_supervision=False)
+
+
 async def _warm_mint_reaper(generation: int) -> None:
     """Retire the shared process once no card is waiting on it.
 
@@ -1496,6 +2035,19 @@ async def _warm_mint_reaper(generation: int) -> None:
             await _warm_mint.sweep_sessions(in_use)
             if not _warm_mint.is_alive():
                 await _expire_shared_mints("mint_process_gone", generation=generation)
+                rearm = _warm_mint.start_rearm(generation)
+                if rearm is not None:
+                    # Shielded because replacing the dead generation cancels THIS reaper.
+                    # The runtime owns the strong reference, and the replacement must finish
+                    # even after the obsolete observer exits.
+                    try:
+                        await asyncio.shield(rearm)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 -- the cold path remains the fallback
+                        logger.debug("warm mint automatic re-arm failed", exc_info=True)
+                    if _warm_mint.is_alive():
+                        return
                 await _drain_parked_generations()
                 return
             if _shared_mints_pending():
@@ -1518,6 +2070,99 @@ async def _warm_mint_reaper(generation: int) -> None:
 def _mint_is_cold_held(entry: MintState | None) -> bool:
     """True when a dedicated client -- not the shared process -- holds this URL."""
     return entry is not None and entry.get("state") == "waiting" and entry.get("client") is not None
+
+
+def _mint_is_adopted(entry: MintState | None) -> bool:
+    """True when a caller has taken ownership of a WARM row, so it is nobody's to reclaim.
+
+    :func:`_mint_is_cold_held` cannot answer this and never could: an adopted row owns
+    no ``client`` either -- its verifier is in the shared process -- so the cold test
+    reads it as free and the claim loop below replaces a URL the user is part-way
+    through redeeming. ``shared`` is the whole distinction: it is set while the premint
+    is unclaimed and cleared by :func:`adopt_shared_mint`.
+    """
+    return (
+        entry is not None
+        and entry.get("state") == "waiting"
+        and bool(entry.get("generation"))
+        and not entry.get("shared")
+    )
+
+
+async def _adopt_shared_row(slug: str, mcp_url: str) -> str | None:
+    """Take ownership of ``slug``'s UNCLAIMED premint. Returns its new row token, or None.
+
+    THE handoff, and the reason the premint has a consumer at all. Connect used to call
+    ``reserve_mint_row`` unconditionally, which pops WHATEVER row is at the slug -- so
+    ``start_oauth_mint`` disposed the very URL the warm table had minted for that click
+    and the cold spawn it then paid was the only thing the user ever saw. ``None`` means
+    no row was adoptable at this instant; the public flow may recover a late frame from the
+    existing live session before it falls through to the dedicated cold path.
+
+    FOUR refusals, each closing a different way to hand back a URL that cannot work: no
+    row; a row that is not an unclaimed premint (``shared`` absent -- a cold flow's or
+    an already-adopted one, whose owner's token fences it); a claim still ``minting``,
+    which holds nothing to give; and a row whose holder is gone, judged by
+    :func:`_warm_row_alive` -- the SAME generation-and-activation pair the reaper uses,
+    because a URL is redeemable only while the process holds its verifier AND the
+    session still answers its redirect.
+
+    ATOMIC BY CONSTRUCTION, like :func:`_claim_shared_mints`: everything between the
+    read and the last write is synchronous, so two clicks racing one row serialize on
+    ``_mints_lock`` and the loser observes ``shared`` already cleared. Nothing is
+    disposed here, so the engine's dispose-outside-the-table-lock rule is not merely
+    respected but unreachable.
+
+    THE TOKEN IS ROTATED, and the watcher with it. A fresh token is what fences the
+    adopting tab against the premint's own rollback and against a sibling tab, but
+    every write in :func:`~kiro_crew.connections.mint._mint_watcher` is guarded on the
+    token it was started with -- so rotating alone would leave the row watched by a
+    task that can no longer touch it: nothing would flip it to ``granted``, nothing
+    would expire it, and it would hold the shared process resident for good. Re-arming
+    is therefore part of the same synchronous run, not a follow-up.
+
+    PROVENANCE IS KEPT. ``generation``/``activation`` stay exactly as the activation
+    stamped them, because ownership moved and the verifier did not: the row is still
+    judged, parked and withdrawn by the warm table (:func:`_warm_table_row`).
+    """
+    adopted: str | None = None
+    async with _mints_lock:
+        entry = _mints.get(slug)
+        if (
+            entry is not None
+            and entry.get("shared")
+            and entry.get("state") == "waiting"
+            and entry.get("oauth_url")
+            and _warm_row_alive(entry)
+        ):
+            adopted = _new_mint_token()
+            stale = entry.pop("watcher", None)
+            if stale is not None:
+                stale.cancel()
+            entry["token"] = adopted
+            entry.pop("shared", None)
+            entry["watcher"] = asyncio.get_running_loop().create_task(
+                _mint_watcher(slug, mcp_url, adopted)
+            )
+    if adopted is not None:
+        # Off the loop: the FIRST ``sel()`` of a process constructs the log, and the warm
+        # module pins every such hop with a drift guard.
+        await asyncio.to_thread(_log_warm_event, "connections_warm_mint_adopt", f"provider:{slug}")
+    return adopted
+
+
+async def adopt_shared_mint(slug: str, mcp_url: str) -> str | None:
+    """Adopt a warm row, recovering late frames from the live shared session once."""
+    adopted = await _adopt_shared_row(slug, mcp_url)
+    if adopted is not None:
+        return adopted
+    try:
+        redrained = await _warm_mint.redrain_for(slug)
+        if redrained is not None:
+            await _recover_redrained_requests(redrained)
+    except Exception:  # noqa: BLE001 -- a dedicated cold mint remains the fallback
+        logger.debug("warm mint adoption re-drain failed", exc_info=True)
+    return await _adopt_shared_row(slug, mcp_url)
 
 
 async def _claim_shared_mints(slugs: list[str]) -> tuple[dict[str, str], list[MintState]]:
@@ -1546,9 +2191,10 @@ async def _claim_shared_mints(slugs: list[str]) -> tuple[dict[str, str], list[Mi
     async with _mints_lock:
         for slug in slugs:
             prior = _mints.get(slug)
-            if _mint_is_cold_held(prior):
-                # A dedicated client owns this provider's verifier. Leave its URL on
-                # the card rather than replace a working link.
+            if _mint_is_cold_held(prior) or _mint_is_adopted(prior):
+                # A CALLER owns this provider's URL -- a dedicated client holds its
+                # verifier, or a Connect adopted the warm row this table minted. Leave
+                # its URL on the card rather than replace a working link.
                 continue
             if prior is not None:
                 # Hand it back, don't just drop it: the replaced row may own a watcher, and
@@ -1675,7 +2321,47 @@ async def _absorb_warm_requests(result: _WarmMintResult, claims: dict[str, str])
     return minted
 
 
-async def warm_mint_all(providers: list[Provider] | None = None) -> list[str]:
+def _providers_with_requests(result: _WarmMintResult) -> list[Provider]:
+    names = {
+        str(request.get("serverName") or "")
+        for request in result.requests
+        if request.get("oauthUrl")
+    }
+    return [
+        provider
+        for provider in result.providers
+        if provider["slug"] in names or mcp_server_alias(provider["slug"]) in names
+    ]
+
+
+async def _recover_redrained_requests(result: _WarmMintResult) -> list[str]:
+    """Install attributable late frames through the ordinary warm-table fences."""
+    providers = _providers_with_requests(result)
+    if not providers:
+        return []
+    claims, displaced = await _claim_shared_mints([provider["slug"] for provider in providers])
+    if not claims:
+        return []
+    try:
+        await _dispose_displaced_rows(displaced)
+        narrowed = _WarmMintResult(
+            generation=result.generation,
+            activation=result.activation,
+            providers=providers,
+            requests=result.requests,
+        )
+        minted = await _absorb_warm_requests(narrowed, claims)
+    except BaseException:
+        await _release_shared_claims(claims)
+        raise
+    if minted:
+        logger.info("Shared mint re-drain recovered late row(s): %s", ", ".join(sorted(minted)))
+    return minted
+
+
+async def warm_mint_all(
+    providers: list[Provider] | None = None, *, arm_supervision: bool = True
+) -> list[str]:
     """Warm every mintable provider's approval URL in ONE activation.
 
     Returns the slugs now holding a URL. Never raises for a mint failure -- that leaves the
@@ -1690,13 +2376,22 @@ async def warm_mint_all(providers: list[Provider] | None = None) -> list[str]:
 
     ``POST /api/connections/premint`` passes the candidates it scanned, so an explicit
     ``providers`` is the ordinary call shape; ``None`` re-scans for a caller that has no
-    list of its own.
+    list of its own. ``arm_supervision`` is false only for the automatic replacement: the
+    replacement inherits the page-owned lifecycle without recursively earning another retry.
     """
-    candidates = (
-        await asyncio.to_thread(mintable_providers) if providers is None else list(providers)
-    )
+    if providers is None:
+        candidates, audit_recorded = await asyncio.to_thread(_audited_mintable_providers)
+        if candidates and not audit_recorded:
+            logger.warning(
+                "grant-presence audit for the implicit warm scan could not be recorded; "
+                "proceeding unaudited"
+            )
+    else:
+        candidates = list(providers)
     if not candidates:
         return []
+    if arm_supervision:
+        _warm_mint.arm_supervision()
 
     claims, displaced = await _claim_shared_mints([provider["slug"] for provider in candidates])
     if not claims:

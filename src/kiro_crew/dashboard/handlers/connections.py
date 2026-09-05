@@ -12,17 +12,21 @@ from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import web
 
-from kiro_crew import hooks
 from kiro_crew.connections import get_provider
 from kiro_crew.connections.ownership import remove_provider_entry
 from kiro_crew.connections.registry import Provider
 from kiro_crew.dashboard.handlers.mcp import _is_valid_mcp_name
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
 
 _MAX_RETURN_ADDRESS_BYTES = 8192
 _MAX_REQUEST_TARGET_BYTES = 6144
+# RFC 3986 scheme followed by "://". Deliberately requires the "//": a bare
+# "host:port/..." (which urlsplit would misread as scheme + opaque path) must
+# NOT count as having a scheme, so it gets the http:// default (#7406).
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _SERVER_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ALLOWED_CALLBACK_QUERY_KEYS = {
     "authuser",
@@ -51,12 +55,24 @@ def _validated_loopback_return_address(value: object) -> _LoopbackCallback | Non
     The user controls only an unprivileged loopback port and an ASCII HTTP
     request-target containing a single OAuth code.  The network host is selected
     later from fixed literals, so request data can never choose a remote host.
+
+    A paste with no scheme is normalized to ``http://`` first (#7406): mobile
+    browsers — iOS Safari in particular — copy address-bar URLs without the
+    scheme, so the documented paste-back flow otherwise fails on exactly the
+    text the browser gave the user. Prepending a scheme is safe here because
+    every containment constraint below (loopback host literals, port floor,
+    query allowlist) applies to the normalized value; a scheme cannot turn a
+    non-loopback host into a loopback one. The regex also catches the
+    ``urlsplit`` gotcha where ``localhost:8976/...`` parses ``localhost`` as
+    the scheme rather than the host.
     """
     if not isinstance(value, str):
         return None
     candidate = value.strip()
     if not candidate or len(candidate.encode("utf-8")) > _MAX_RETURN_ADDRESS_BYTES:
         return None
+    if not _URL_SCHEME_RE.match(candidate):
+        candidate = f"http://{candidate}"
     try:
         parsed = urlsplit(candidate)
         port = parsed.port
@@ -328,11 +344,37 @@ async def api_connections_mint(request: web.Request) -> web.Response:
 
     # Function-local by DESIGN, not for a cycle: this handlers package is imported
     # on the gateway boot path, and the mint engine drags in the ACP client, the
-    # credential predicate and the PID registry. Keeping it here is what stops a
+    # credential predicate and the PID registry -- the warm engine adds the ACP
+    # runtime and the MCP inventory on top. Keeping both here is what stops a
     # gateway start paying for a subsystem most requests never touch, and
-    # test_the_handlers_package_does_not_import_the_mint_engine enforces it in a
-    # subprocess -- hoisting this to module scope turns that test red.
+    # test_the_handlers_package_does_not_import_the_mint_engine (and its warm twin)
+    # enforce it in a subprocess -- hoisting either to module scope turns them red.
     from kiro_crew.connections.mint import _dispose_mint, reserve_mint_row, start_oauth_mint
+    from kiro_crew.connections.warm import adopt_shared_mint
+
+    # ADOPTION FIRST, because the alternative is throwing the answer away. The premint
+    # sweep may already hold this provider's approval URL, and ``reserve_mint_row``
+    # below pops whatever row is at the slug -- so reserving first disposed the very
+    # URL this click existed to serve and then paid a ~7.5s cold spawn to re-mint it.
+    # A refusal (nothing warmed, a dead holder, another tab got there first) falls
+    # through to that cold path, which stays correct and stays the only path for a
+    # provider warming never covered.
+    adopted = await adopt_shared_mint(slug, str(provider["mcp_url"]))
+    if adopted is not None:
+        # ONE event, outcome ``ok``: unlike the cold path below, this request both
+        # starts and finishes here, so a ``started`` with no completion would leave the
+        # audit trail showing a mint that never ended.
+        await asyncio.to_thread(
+            lambda: sel().log_api_access(
+                caller="dashboard",
+                operation="connections_mint",
+                outcome="ok",
+                resources=f"provider:{slug} reason=adopted_warm_mint",
+            )
+        )
+        # ``waiting`` rather than ``minting``: the URL exists already. The card polls
+        # the mint state either way, and that poll now finds it on the first read.
+        return web.json_response({"ok": True, "slug": slug, "state": "waiting", "token": adopted})
 
     # Reserved BEFORE responding: the response names a row this tab polls
     # immediately, so the row has to be visible first. Allocating only a token here
@@ -425,6 +467,83 @@ async def api_connections_status(request: web.Request) -> web.Response:
     await expire_dead_mints()
     statuses = await collect_connection_statuses()
     return web.json_response({"schema_version": _STATUS_SCHEMA_VERSION, "connections": statuses})
+
+
+#: The slug currently running a Connections Test, or ``None`` when the endpoint
+#: is idle. Each click spawns its own promptless kiro-cli ACP session
+#: (``test_connection_tools``, ~10-100s), and two running together both contend
+#: for host resources and -- because the frontend tracked only one global busy
+#: slot -- made a second click's spinner silently replace the first card's,
+#: reading as a cancelled test that had actually completed (its SEL record
+#: still shows the earlier finish). This guard makes running two at once
+#: impossible on the server regardless of what any client renders.
+#:
+#: Guarded by :data:`_TEST_SLUG_GUARD`, a :class:`LoopBoundLock`, rather than a
+#: bare check-then-set: two POSTs handled back-to-back on the loop can each run
+#: up to the read of this variable before either writes it, so an unguarded
+#: "if None: set it" has a window where both readers see ``None`` and both
+#: proceed. The guard's own acquire never blocks a caller's request in a way
+#: that would turn a refusal into a queued wait -- read-and-write below is a
+#: synchronous critical section with no ``await`` inside it, so once acquired
+#: it commits its verdict (proceed or refuse) before yielding the loop at all.
+_testing_slug: str | None = None
+_TEST_SLUG_GUARD = LoopBoundLock()
+
+
+def _conflict(error: str, code: str, *, slug: str) -> web.Response:
+    return web.json_response({"error": error, "code": code, "slug": slug}, status=409)
+
+
+async def api_connections_test(request: web.Request) -> web.Response:
+    """POST /api/connections/test — enumerate this provider through kiro-cli.
+
+    The dedicated ACP session is promptless: kiro-cli authenticates the remote
+    server, performs its MCP ``tools/list``, and reports the final agent-exposed
+    tools through native structured commands. The endpoint never receives token
+    material and never invokes a provider tool.
+
+    Single-flight (:data:`_testing_slug`): a POST arriving while another test is
+    already running -- for the same provider or a different one -- is refused
+    immediately with 409 ``test_in_flight`` naming the slug currently running,
+    rather than starting a second concurrent kiro-cli session or queuing behind
+    the first.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_test")
+    if owner_denied is not None:
+        return owner_denied
+    parsed = await _mint_request(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    _body, provider = parsed
+    slug = str(provider["slug"])
+
+    global _testing_slug
+    async with _TEST_SLUG_GUARD:
+        # No `await` between the read and the write: on one event loop this is
+        # the whole critical section, so no other coroutine can observe
+        # `_testing_slug` between them regardless of the lock -- the lock
+        # exists for the OTHER event loop a LoopBoundLock covers (a gateway
+        # restart-in-process, or two independent test loops in one process),
+        # never to make this caller wait for one already running.
+        if _testing_slug is not None:
+            return _conflict(
+                f"a connection test for {_testing_slug} is already running",
+                "test_in_flight",
+                slug=_testing_slug,
+            )
+        _testing_slug = slug
+
+    try:
+        # Function-local by design: the handlers package is imported at
+        # gateway boot, while this path imports the ACP client and should be
+        # paid only when the owner explicitly clicks Test.
+        from kiro_crew.connections.tool_test import test_connection_tools
+
+        return web.json_response(await test_connection_tools(provider))
+    finally:
+        _testing_slug = None
 
 
 async def api_connections_cancel(request: web.Request) -> web.Response:
@@ -632,13 +751,13 @@ async def api_connections_premint(request: web.Request) -> web.Response:
     # scope then adds the ACP runtime and the MCP inventory on top -- the heaviest
     # half of Connections. test_the_handlers_package_does_not_import_the_warm_engine
     # enforces it in a subprocess; hoisting this to module scope turns that red.
-    from kiro_crew.connections.warm import mintable_providers, warm_mint_all
+    from kiro_crew.connections.warm import _audited_mintable_providers, warm_mint_all
 
     # Off the loop: the scan reads the user's MCP config and stats kiro-cli's OAuth
     # artifact directory, either of which can sit on a network mount where a stat is
     # unbounded. warm.py routes the same call through a thread for this reason and
     # pins it with a drift guard.
-    candidates = await asyncio.to_thread(mintable_providers)
+    candidates, audit_recorded = await asyncio.to_thread(_audited_mintable_providers)
     slugs = [str(provider["slug"]) for provider in candidates]
     if not slugs:
         # Nothing to warm: an activation with an empty claim set would spawn a
@@ -660,9 +779,7 @@ async def api_connections_premint(request: web.Request) -> web.Response:
     # opened, so no credential material crosses this boundary, and refusing to warm on
     # an SEL outage would make every Connect pay a cold spawn instead. An unaudited
     # boolean is the lesser failure, and it leaves a warning behind.
-    if not await asyncio.to_thread(
-        hooks.emit_internal_read_audit, _GRANT_PRESENCE_READ_ID, "success"
-    ):
+    if not audit_recorded:
         logger.warning(
             "grant-presence audit for the premint scan could not be recorded; "
             "proceeding unaudited"
