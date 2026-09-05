@@ -669,7 +669,13 @@ caller cannot re-open the hole by passing the path:
   launcher binds over itself and then **remounts** `MS_RDONLY`. Both mounts are
   load-bearing — `MS_RDONLY` is ignored on the initial `MS_BIND` — and both go through
   `_mount_or_die`, so a seal that does not land refuses the spawn rather than silently
-  granting write. `test_sandbox_mount_checked.py` pins all six mount sites.
+  granting write. The sealing remount also **re-asserts the target's locked mount
+  flags** (`nosuid`/`nodev`/`noexec`, read off the fresh bind via `statvfs`): inside an
+  unprivileged user namespace the kernel rejects a remount that would drop a locked
+  bit, so on hosts whose `/tmp` or `/home` is mounted `nosuid,nodev` the plain
+  `MS_RDONLY` remount got EPERM and every spawn refused (#8386). Re-asserting bits
+  already in force only keeps restrictions. `test_sandbox_mount_checked.py` pins all
+  six mount sites; `test_sandbox_seal_locked_flags.py` pins the flag re-assertion.
 - **macOS** keeps the `file-write*` and `file-link` denies and drops only `file-read*`.
 
 On a host running **unconfined** — no sandbox backend, or `agent.sandbox='off'` with the
@@ -2098,7 +2104,10 @@ descriptor. Every decision, list and mint alike, is SEL-audited through
 entry; the method rows themselves come from the `mobile_connect` CPP seam —
 see `platform-context.md`), and
 `capabilities.telemetry` (the anonymous beacon: send gate + both write
-chokepoints — **policy layer only**, see below). Only the live `approval_mode`
+chokepoints — **policy layer only**, see below), and
+`capabilities.social_share` (the dashboard's "Share as image" entry — read
+through `GET /api/dashboard/config`, every layer honoured, every decision
+audited; see below). Only the live `approval_mode`
 clamp remains reserved.
 
 The `commands` scope now **doubles as the enterprise force-pin** for built-in
@@ -2469,6 +2478,80 @@ switch off" (flippable) from "off because an administrator pinned it" (a config
 write returns 403), since offering a working-looking toggle for the second is the
 half-control this row exists to avoid.
 
+### "Share as image" — `capabilities.social_share`
+
+The chat's *More actions → Share as image* turns an assistant reply into a branded
+PNG card with a prefilled caption and offers to post it to X or LinkedIn
+(`website/src/pages/chat/share/`). The card is rendered and exported **in the
+browser** — copy and download never leave the machine, and there is no upload — but
+the intent buttons hand the caption text to a third-party site inside a URL. That
+makes the entry an egress path for agent output, which a managed fleet may forbid
+wholesale. Governed by the `capabilities.social_share` `SCOPE_CATALOG` capability
+row (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
+change, mirroring the rows above).
+
+**Why the chokepoint is a read.** There is no server-side share action to refuse:
+nothing is rendered, stored or posted by the gateway. The control is the dashboard
+entry itself, and the only way the dashboard can learn the ceiling's answer is the
+endpoint it already fetches — `GET /api/dashboard/config` reports a read-only
+`social_share_enabled` (`dashboard/social_share.py`), and the frontend draws the
+menu item only when it is `true`. The entry stays hidden until the server has
+answered — the endpoint is the authority, the frontend never guesses (the same
+posture as the mobile-connect rail row). When Share was the menu's only item (a
+loaded window keeps fork/plan as row buttons), the trigger is withdrawn with it
+rather than opening an empty menu. A swap that lands while the share dialog is
+already open does **not** unmount it: the dialog stays with the user's edited
+caption in place, its four share actions are disabled, a notice names the cause and
+tells the user to copy their text now (it is not saved on close), and a plain-text
+Copy affordance — the caption plus the card's editable text, local clipboard, no
+image, no site — stays available so closing
+never means silent loss; when the clipboard refuses, the button says so and
+selects the caption for a keyboard copy rather than looking like success. The
+notice does not name who set the policy (a fleet ceiling and an operator's own
+profile pin both land here). In the Security panel's ceiling viewer the scope's row
+is labelled after the menu entry it withdraws ("Share as image", translated), so a
+user who lost the entry can connect the row to the feature. The field is dropped
+from the `PUT` body (both settings surfaces round-trip the whole `GET`), so it can
+never be written: governance, not config, owns the answer.
+
+**Shape: the mobile-connect listing, not the startup probes.** The evaluation runs
+through `vet_and_audit` on the pinned `dashboard:ui` surface key — never a
+caller-controlled header, which would let a request dodge a profile bound to the
+dashboard surface — and **every denied decision is honoured**, whichever layer
+produced it. This is a per-request dashboard question, so unlike `telemetry` and
+`tailnet_origin` (process-wide, session-less, evaluated once at boot) there is no
+policy-layer-only carve-out: a Level-2 profile narrowing the dashboard can withdraw
+the entry.
+
+**Fails CLOSED** (`fail_closed=True`), joining `capabilities.publish` /
+`theme_install` / `telemetry` / `tailnet_origin`: a wrong-DENY hides a convenience
+menu item, a wrong-PERMIT offers a "post this to a third-party site" button on a
+fleet that forbade it. An unevaluable ceiling is recorded as `denied` with a
+`fail-closed` reason.
+
+**Every decision is audited.** Each evaluation the dashboard acts on leaves a
+`governance_decision` SEL row (tool `dashboard_config_social_share`), grant and
+denial alike, through the shared seam — the read *is* the enforcement here, so it
+is not an inspection to leave unrecorded. The endpoint is not polled: the client
+fetches it on mount, focus and after its stale window, and otherwise only when the
+WS `slots` frame reports a generation change (below).
+
+**Follows a mid-session ceiling swap.** `policy_distribution.apply_ceiling` can
+replace the ceiling without a restart. The WS `slots` frame carries the process-local
+`governanceGeneration` alongside `gitlabHostsGeneration`; every dashboard-user
+socket's existing 5-second status pusher (`ws.py`, `_push_status`) compares the
+counter on each tick and asks for a coalesced slots push when it moves — no task of
+its own, and deliberately separate from the owner-only credential-refresh driver, so
+a fleet that tightened policy while only a non-owner window was open still reaches
+that window; the initial frame and the tick's baseline come from one read, so a swap
+during connection setup registers as a change. The client invalidates its cached
+`dashboardConfig` on a change (and on each connection's first frame, since the
+counter restarts with the process) — so a withdrawn entry disappears within one
+status tick rather than waiting out the cache's stale window.
+
+The Security panel picks the row up automatically (`api_governance_policy` iterates
+`SCOPE_CATALOG`; its label is the humanised leaf, "Social share").
+
 ### Which ACP harness a deployment may select — `agent_backend`
 
 `agent.acp_backend` chooses the harness a session runs on (kiro-cli, KAS, and
@@ -2614,6 +2697,104 @@ binding app activation and the messaging host gates use — see
 
 The Security panel picks the row up automatically — `api_governance_policy`
 iterates `SCOPE_CATALOG`.
+
+### Which tool-approval modes a deployment may select — `approval_modes`
+
+The dashboard approval-mode picker offers four modes: `normal` (interactive —
+ask for every tool), `trust_reads` (auto-approve reads), `trust` (auto-approve
+the active slot), and `yolo` (auto-approve every tool everywhere). The
+`approval_modes` `SCOPE_CATALOG` row (a `ScopedRuleset` on the `identifier`
+matcher — data-only shape, no evaluator change, mirroring `agent_backend`
+above) lets a managed fleet forbid an auto-approve mode and force interactive
+approval.
+
+**Today the scope governs exactly one mode: `yolo`.**
+
+```json
+{"approval_modes": {"mode": "deny", "deny": ["yolo"]}}
+```
+
+This is distinct from the ordinal `approval_mode` scale
+(`yolo < auto < interactive`) documented under the archetypes: that clamps a
+single ceiling, whereas `approval_modes` denies a named mode.
+
+**Three modes are non-deniable, for two different reasons.** Both are declared as
+catalog DATA — `ScopeSpec(..., always_permitted=("normal", "trust", "trust_reads"))`
+— and `_parse_control` refuses any ruleset that forbids one, whether directly
+(`deny: ["trust"]`) or by an allow-list that omits it, with
+`PlatformCompositionError`. Data rather than a scope-name branch, so a second scope
+with a non-deniable member is a catalog entry and not another `if` in the loader:
+
+- **`normal` is the interactive floor.** Denying it would leave no selectable mode
+  and brick tool approval, and the trust-root `security_policy.json` is the one file
+  the dashboard may not write to repair it (see
+  [Self-protection](#self-protection-the-keystone)).
+- **`trust` and `trust_reads` are not yet governed.** Their grants are honoured by
+  consumption predicates this scope does not reach — the in-memory trusted set, and
+  the session `approval_policy` a spawned subagent inherits — spread across the
+  messaging, Slack, Telegram and subagent-admission paths. Accepting a deny for them
+  would advertise a control that does not hold, so the policy is refused **loudly at
+  parse time** instead. Governing those read paths is tracked separately.
+
+The refusal happens at parse time in both cases, because a policy that misdescribes
+the posture is worse than one that fails to load.
+
+**Enforced at every `yolo` surface**, because a mode is only actually off if every
+path that can arm it — and every path that HONOURS an existing grant — refuses:
+
+- `dashboard/chat_handlers.py::api_chat_mode` — the explicit mode switch. Refuses
+  with `403` + `mode_disabled_by_policy` **before any mutation**.
+- `safety_override` arming — `_commit_activation` and `activate_scoped`,
+  fail-closed, so YOLO stays blocked however it is armed (dashboard, Slack `!yolo`,
+  the `/yolo` slash handler, config).
+- `safety_override.is_active` / `is_scope_active` / `renew_scoped` — the consult
+  points that honour a LIVE grant. Gating only at arming left an already-armed grant
+  running to its own TTL, so an admin who denied `yolo` mid-session kept
+  auto-approving every tool for up to 24h.
+
+**A denial REVOKES the grant; it does not merely mask it.** This matters because the
+same predicate answers two different questions. `is_active` is both "may this tool
+auto-approve?" and, for every caller that asks "is there a grant to clear?", the
+liveness test — Slack's `!yolo off` is `if is_yolo_mode(): disable_yolo()`. An earlier
+revision left `_active` set and only reported `False`, so inside a denial window that
+branch reported "already off" and cleared nothing, and a later policy relaxation
+resurrected auto-approve the operator had explicitly revoked. Tearing the grant down
+makes both readings agree. The cost is that a policy which denies and then relaxes
+requires a fresh arm, which is the honest outcome anyway.
+
+**Every refusal is SEL-audited.** A governance denial that leaves no trace is
+indistinguishable from the request never having been made, which is exactly the
+record an operator needs after an attempted escalation. The audit is best-effort at
+each site: an SEL write failure never turns a refusal into a grant.
+
+**Nothing resolves governance on the event loop.** Resolving the scope walks the
+profiles dir (`iterdir` + per-file `stat`), and two call shapes forbid a per-call
+read: `status_snapshot` is emitted on the 5s WebSocket push, and `is_active` is the
+predicate every transport hands to `TurnDriver`, so it runs per *tool call*. Hence
+two forms, chosen by frequency — `yolo_policy_permits()` and
+`cached_disabled_approval_modes()` read memory and schedule an off-loop refresh (at
+most one in flight, 5s TTL, stale in the SAFE direction since a tightening lands
+within one TTL), while arming reads authoritatively because it is rare and already
+does filesystem I/O for its fail-closed audit. `/api/status` primes the status cache
+from inside the `asyncio.to_thread` it already used, so the HTTP, SSE and WebSocket
+frames cannot disagree.
+
+The denied set rides the shared `state.status_snapshot()` as
+`disabled_approval_modes`. The picker **hides** each denied mode rather than showing
+it disabled — a mode that cannot be chosen is simply absent, and `normal` keeps the
+list from ever being empty. The one exception is a denied mode that is STILL THE
+ACTIVE one: the trigger renders the active mode regardless, so hiding its row too
+would put a label on the button with no matching row in the menu. That row stays,
+disabled and labelled with the reason, until the user picks something else. The
+Security panel lists the scope and its deny-list automatically —
+`api_governance_policy` iterates `SCOPE_CATALOG` — so an operator can always see
+which modes a policy removed.
+
+**Not yet reached.** Auto-approval also enters through cron
+`approval_mode: "auto"`, the messaging API's approval-mode field, subagent spawn, and
+config `agent.approval_mode`. Those carry their own vocabulary and are tracked
+separately from this scope — see the reserved `approval_mode` ordinal's
+still-reserved note.
 
 ### Computer use is NOT governed (deliberately)
 

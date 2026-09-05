@@ -357,6 +357,37 @@ class TestListServers:
         monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
         assert not any(s.name == "srv" for s in list_servers())
 
+    def test_dashboard_disabled_server_keeps_a_disabled_row(self, tmp_path, monkeypatch) -> None:
+        """``/api/mcp/toggle`` off writes ``disabled: true`` into the Kiro global
+        AND onto the agent entry (the agent-side marker is what stops a running
+        kiro-cli session's server). The row must survive that, or the user has
+        nothing to switch back on — and it carries the agent entry's full spec,
+        because the global copy can be the bare stub the toggle creates."""
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        (agent_dir / "defaults.json").write_text(
+            json.dumps(
+                {"mcpServers": {"srv": {"command": "real-cmd", "args": ["-x"], "disabled": True}}}
+            )
+        )
+        store = tmp_path / "store.json"
+        store.write_text(json.dumps({"mcpServers": {}}))
+        kiro_mcp = tmp_path / "kiro.json"
+        kiro_mcp.write_text(json.dumps({"mcpServers": {"srv": {"disabled": True}}}))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.mcp_discovery._MCP_SOURCES",
+            ((store, SCOPE_KIROCREW), (kiro_mcp, SCOPE_KIRO_GLOBAL)),
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (store, kiro_mcp))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        rows = [s for s in list_servers() if s.name == "srv"]
+        assert len(rows) == 1
+        assert rows[0].disabled is True
+        assert rows[0].source == "agent"
+        assert rows[0].command == "real-cmd"
+        assert rows[0].args == ["-x"]
+
     def test_disabled_mcp_json_still_carries_disabled_tools(self, tmp_path, monkeypatch) -> None:
         """disabledTools from a disabled mcp.json entry are applied to an existing agent server."""
         agent_dir = tmp_path / "agents"
@@ -2501,6 +2532,114 @@ class TestProbeTempContainment:
         assert captured["TMP"] == str(tmp_path / "chosen")
         root = home / "run" / "mcp-tmp"
         assert not root.exists() or not any(root.iterdir())
+
+    @pytest.mark.asyncio
+    async def test_probe_tmp_allocated_before_wrap_and_carved_out(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """#8653: the probe TMPDIR is allocated BEFORE the sandbox wrap, which
+        receives it as a write carve-out, and the spawn env points at it.
+
+        The managed probe root lives at ``<data home>/run/mcp-tmp``, inside the
+        runtime parent the sandbox seals read-only. A TMPDIR allocated after
+        the wrap is a directory the sandboxed child cannot write -- a
+        Bun-packaged server then fails the probe with "Cannot find the native
+        Koffi module" because it cannot extract its native module. Lock BOTH
+        halves of the fix: the ordering (alloc, then wrap) and the carve-out
+        kwarg naming the allocated dir.
+        """
+        import sys
+        from pathlib import Path
+
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        calls: list[str] = []
+        real_alloc = bt.allocate_probe_tmp
+
+        def alloc_spy():
+            calls.append("alloc")
+            return real_alloc()
+
+        monkeypatch.setattr(bt, "allocate_probe_tmp", alloc_spy)
+
+        captured_wrap: dict = {}
+
+        def _wrap(argv, *a, env=None, **k):
+            calls.append("wrap")
+            captured_wrap.update(k)
+            return list(argv), dict(env if env is not None else os.environ), None
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _wrap)
+
+        server = McpServerInfo(
+            name="order-lock", command=sys.executable, args=["-c", "pass"]
+        )
+        with patch(
+            "kiro_crew.mcp_discovery.create_subprocess_limited",
+            new_callable=AsyncMock,
+            side_effect=OSError("stop after env capture"),
+        ) as spawn_mock:
+            await probe_server(server)
+
+        assert calls == ["alloc", "wrap"]
+        carve = captured_wrap.get("extra_writable_dirs")
+        assert carve is not None and len(carve) == 1
+        scratch = Path(carve[0])
+        # The carve-out is the child-facing SCRATCH SUBDIR of the allocation,
+        # never the allocation root: the root holds the ``.owner`` reclamation
+        # record, which must stay OUTSIDE the child's writable window (a
+        # garbled ``.owner`` makes the dir unreclaimable by the daemon sweep).
+        assert scratch.name == bt.PROBE_SCRATCH_SUBDIR
+        allocated = scratch.parent
+        assert allocated.parent == home / "run" / "mcp-tmp"
+        owner = allocated / bt.OWNER_FILENAME
+        assert not str(owner).startswith(str(scratch) + os.sep)
+        # The managed triple lands on the env the child actually receives,
+        # pointing at the SAME dir the wrap carved out.
+        captured_env = spawn_mock.call_args.kwargs["env"]
+        assert captured_env["TMPDIR"] == str(scratch)
+
+    @pytest.mark.asyncio
+    async def test_probe_alloc_failure_wraps_without_carveout(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Containment is fail-open hygiene: when allocation fails, the probe
+        # must still run -- wrapped, with inherited temp and no carve-out.
+        import sys
+
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+        monkeypatch.setattr(
+            bt,
+            "allocate_probe_tmp",
+            MagicMock(side_effect=OSError("disk full")),
+        )
+
+        captured_wrap: dict = {}
+
+        def _wrap(argv, *a, env=None, **k):
+            captured_wrap.update(k)
+            return list(argv), dict(env if env is not None else os.environ), None
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _wrap)
+
+        server = McpServerInfo(
+            name="alloc-fail", command=sys.executable, args=["-c", "pass"]
+        )
+        result = await probe_server(server)
+
+        # The wrap ran (kwargs captured) and received no carve-out.
+        assert "extra_writable_dirs" not in captured_wrap
+        # And the probe was not diverted into an error about containment --
+        # whatever the handshake outcome, allocation failure is not the error.
+        assert "disk full" not in (result.error or "")
 
     @pytest.mark.asyncio
     async def test_probe_drops_reserved_kirocrew_namespace_from_spec_env(

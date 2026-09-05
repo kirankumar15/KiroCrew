@@ -15,6 +15,7 @@ import asyncio
 import dataclasses
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,6 +23,7 @@ from chat_test_helpers import _make_state
 
 from kiro_crew.config import loader
 from kiro_crew.dashboard import chat_delivery as cd
+from kiro_crew.dashboard import create_rate_limit
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard import stop_retry
 from kiro_crew.dashboard.chat_utils import slot_history_key
@@ -51,6 +53,21 @@ def _fresh_stop_windows():
     stop_retry.reset_for_tests()
     yield
     stop_retry.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_create_budget():
+    """The per-caller create-rate window is process-wide module state.
+
+    Nearly every create test here calls as the same caller (``chat-1``), so the
+    20-per-window budget is consumed by the file itself: left behind, the 21st
+    create in a worker process is refused with ``create_rate_limited`` and the
+    test that happens to be 21st fails for a reason it never asserted. Which
+    test that is depends on xdist distribution, which is what made it flaky.
+    """
+    create_rate_limit.reset_for_tests()
+    yield
+    create_rate_limit.reset_for_tests()
 
 
 def _slot(state, name: str, **kwargs):
@@ -597,14 +614,43 @@ def test_scheduled_target_is_refused(tmp_path):
     assert "unattended" in exc.value.message
 
 
-def test_scheduled_caller_cannot_control_anyone(tmp_path):
+def test_scheduled_caller_cannot_control_a_session_it_did_not_create(tmp_path):
+    """A cron caller is admitted but fenced to its own children (issue #8332).
+
+    The refusal it used to get was ``unattended_caller``, keyed on the slot-key
+    prefix. That was replaced by the ``created_by`` fence, which refuses the case
+    the prefix check existed for -- a scheduled job reaching the user's own
+    conversation -- while letting it drive the sessions it dispatched. The
+    positive half, and a cron's other gates, are in
+    ``test_cron_session_control.py``.
+    """
     state = _make_state(tmp_path)
     caller = _slot(state, "cron-abc123")
+    # Ownership is read from the JOB, and an unfindable one fails closed, so the
+    # fence is only reached once the registry can produce a non-app owner.
+    state.crons.list_jobs.return_value = [SimpleNamespace(id="abc123", created_by="U0123ABCD")]
     _slot(state, "chat-2")
     with pytest.raises(sc.SessionControlError) as exc:
         sc.authorize_target(
             state, caller_session_key=_key(caller), target="chat-2", operation="read"
         )
+    assert exc.value.code == "not_creator"
+
+
+def test_workflow_caller_cannot_control_anyone(tmp_path):
+    """The unattended refusal still stands for the caller class with no fence.
+
+    A ``workflow-<run_id>`` slot is minted only once its originating tab is gone,
+    so there is no owning session to bound it to.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "workflow-run7")
+    _slot(state, "chat-2")
+    with pytest.raises(sc.SessionControlError) as exc:
+        sc.authorize_target(
+            state, caller_session_key=_key(caller), target="chat-2", operation="read"
+        )
+    assert exc.value.code == "unattended_caller"
     assert "cannot control other sessions" in exc.value.message
 
 
@@ -925,21 +971,25 @@ class TestTheRoutesRequireTheInternalSecret:
 # ── The config switch ────────────────────────────────────────────────────────
 
 
-def test_the_trust_switch_needs_a_positive_grant():
-    """``agent.session_control`` must not enable itself from absence OR from junk.
+def test_the_switch_is_on_by_default_and_an_explicit_false_still_disables():
+    """``agent.session_control`` defaults ON; the agent config is the real grant.
 
-    Two independent ways this switch could grant cross-session reach without
-    anyone asking for it, and both are pinned here:
+    Who may reach a peer session is decided by the AGENT CONFIG, not by this
+    switch: the tools come from the `kirocrew-dashboard` MCP server, so an agent
+    that does not mount it never has them -- the same rule as every other MCP
+    server. A second default-off gate on top of that only made the capability
+    unreachable for an agent whose spec had already been given it deliberately.
 
-    * **Absent.** The three tools ride on the existing assignable
-      `kirocrew-dashboard` server, so an operator who assigned that server for
-      folder work would gain peer stop-and-read purely by upgrading. Both the
-      ``.get`` default and the dataclass field default must therefore be
-      ``False`` -- a grant has to be written down.
+    What the switch is still for is a single withdrawal: an operator who wants it
+    gone from every agent at once, without editing each spec. So the one direction
+    that must keep working is an EXPLICIT ``false``:
+
+    * **Absent.** Both the ``.get`` default and the dataclass field default are
+      ``True``, so a mounted server works with nothing else written down.
     * **Malformed.** ``bool("false")`` is ``True``, so a plain coercion loads a
       quoted opt-out as ENABLED and a user who wrote it in an editor that quotes
       values would keep cross-session control on while believing it off.
-      ``_safe_bool`` accepts only a real bool and falls back to ``False``.
+      ``_safe_bool`` accepts only a real bool.
 
     Asserted on the source rather than through ``KiroCrewConfig.load()``:
     ``load()`` merges the real data home's ``config.local.json`` and serves a
@@ -955,18 +1005,22 @@ def test_the_trust_switch_needs_a_positive_grant():
     assert wiring.startswith(
         "_safe_bool("
     ), f"session_control must be parsed through _safe_bool, got: {wiring}"
-    assert wiring.endswith(
-        "False)"
-    ), f"the fallback must be False so a malformed value fails closed, got: {wiring}"
-    assert '"session_control", False' in wiring, (
-        "an absent setting must read as DISABLED -- otherwise an existing "
-        f"kirocrew-dashboard assignment gains peer stop/read on upgrade, got: {wiring}"
-    )
+    assert (
+        '"session_control", True' in wiring
+    ), f"an absent setting must read as ENABLED -- the mount is the grant, got: {wiring}"
     # The field default is the second absent path: it is what a config object
-    # built without going through the loader resolves to.
-    assert loader.AgentConfig().session_control is False, (
-        "the dataclass default must also be False, or a config built outside the "
-        "loader grants cross-session reach with nothing written down"
+    # built without going through the loader resolves to, and it must agree with
+    # the loader or the answer depends on which path produced the config.
+    assert loader.AgentConfig().session_control is True, (
+        "the dataclass default must also be True, or a config built outside the "
+        "loader disables a capability the agent's own spec was given"
+    )
+    # An explicit opt-out is the direction that still has to hold, including the
+    # quoted form `_safe_bool` exists for.
+    assert loader._safe_bool(False, True) is False
+    assert loader._safe_bool("false", True) is True, (
+        "a quoted value is not a bool, so it falls back rather than being coerced "
+        "-- the operator who means it writes a real false"
     )
 
 
@@ -1951,6 +2005,39 @@ def test_send_to_a_busy_target_queues_instead_of_racing(tmp_path):
     assert any("queued message" in q.get("content", "") for q in target._queue)
 
 
+def test_send_to_a_remote_bound_target_is_refused_not_run_locally(tmp_path, monkeypatch):
+    """A crew-bound target executes on the peer; session_send must not run its
+    turn on THIS machine.
+
+    ``send_to_target`` hands ``_run_chat`` to ``enqueue_or_run_prompt``, which has
+    no remote/executor branch — so a bound target would run the crew's work here
+    and diverge the local and peer transcripts (GPT #7693). It is refused with a
+    409 before any dispatch, and nothing is queued.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    target.executor = "remote"  # bound to a peer crew for execution
+
+    ran: dict[str, str] = {}
+
+    async def _fake_run_chat(_state, slot, prompt):
+        ran["slot"] = slot.key
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner._run_chat", _fake_run_chat)
+
+    with pytest.raises(sc.SessionControlError) as err:
+        asyncio.run(
+            sc.send_to_target(
+                state, caller_session_key=_key(caller), target="chat-2", message="do it there"
+            )
+        )
+    assert err.value.code == "remote_target_unsupported"
+    # Refused before dispatch: no local turn ran and nothing was queued.
+    assert ran == {}
+    assert target._queue == []
+
+
 def test_send_is_refused_for_a_session_out_of_bounds(tmp_path):
     """The same deny-by-default guard the other verbs share gates send too."""
     state = _make_state(tmp_path)
@@ -2121,6 +2208,178 @@ def test_created_session_gets_its_workspace_project_dir(tmp_path):
     child = state.get_slot(created["target"])
     assert child is not None
     assert child.project == loader.default_project_dir(child.workspace)
+
+
+# ── session_create: the creator's trust grant ───────────────────────────────
+
+
+def test_created_session_inherits_the_callers_trust(tmp_path):
+    """A trusted creator's worker starts trusted, or dispatch stalls on a prompt.
+
+    The whole point of dispatching a session is that the work proceeds without the
+    operator sitting on it, and `spawn_run` subagents already start auto-approved
+    off the parent's policy (`parent_trusted`). A child born interactive blocks on
+    the first tool call with nobody watching -- the same failure, one layer up.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child is not None
+    assert child._trust is True, "the creator's posture must follow the work"
+
+
+def test_command_grants_never_transfer_even_under_full_trust(tmp_path):
+    """`_trusted_patterns` are per-command grants, not a posture, so they stay put.
+
+    A pattern is judged against the session the operator was LOOKING at, while a
+    dispatched worker runs model-authored work they have not seen -- so the same
+    glob can admit a command the grant was never asked about. Inheriting them also
+    buys nothing where it would be safe: with `_trust` set the child already
+    auto-approves through `_slot_is_trusted`, so the list is dead weight here and
+    changes the outcome only in the case that must keep asking (see the sibling
+    test below).
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+    caller._trusted_patterns = {"npm test", "git status"}
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trusted_patterns == set(), "command grants must not be delegated"
+    # And nothing was aliased on the way past: the caller keeps its own grants.
+    assert caller._trusted_patterns == {"npm test", "git status"}
+
+
+def test_a_pattern_only_creator_produces_a_child_that_still_asks(tmp_path):
+    """The case the exclusion exists for: grants without session trust.
+
+    An operator who approved single commands and deliberately did NOT click trust
+    has said "ask me". `chat_runner` matches `_trusted_patterns` independently of
+    `_trust` (so an inherited pattern would auto-approve on its own), which is why
+    a child of such a caller must be born with nothing.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = False
+    caller._trusted_patterns = {"npm test"}
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust is False
+    assert child._trusted_patterns == set(), "a withheld posture must not leak as a grant"
+
+
+def test_created_session_inherits_trust_reads(tmp_path):
+    """`trust_reads` is a grant too, and it is the narrower one.
+
+    Inheriting only the full grant would leave the read-only mode -- the setting a
+    cautious operator picks -- as the one that still stalls its own workers.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = False
+    caller._trust_reads = True
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust_reads is True
+    assert child._trust is False, "the narrow grant must not widen on the way down"
+
+
+def test_an_untrusted_creator_makes_an_untrusted_child(tmp_path):
+    """Negative control: nothing is granted that the creator did not hold.
+
+    Without this the inheritance could be a constant `True` and every test above
+    would still pass.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust is False
+    assert child._trust_reads is False
+    assert child._trusted_patterns == set()
+
+
+def test_the_scoped_safety_override_grant_is_never_inherited(tmp_path):
+    """`_trust_scope` is a revocable credential, not a setting to copy.
+
+    Its entire value is being re-checked on every approval against a TTL-bounded,
+    SEL-audited `SafetyOverride` scope. Forking the key hands a second session a
+    grant whose revocation the create path cannot observe -- and the child would
+    keep auto-approving after the scope that justified it is gone.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust_scope = "app:worker:abc123"
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust_scope == "", "a scoped grant must not fork onto the child"
+    assert child._trust is False, "nor may it be laundered into the durable flag"
+
+
+def test_trust_revoked_mid_create_is_not_inherited(tmp_path, monkeypatch):
+    """The grant that transfers is the one held at ALLOCATION, not at entry.
+
+    `create_session` suspends several times before the slot exists (project dir,
+    config load, folder confirmation), and the operator can pick `normal` in any
+    of those windows. Reading the entry-time slot would hand the child a grant
+    that no longer exists. Simulated by revoking inside the project-dir
+    resolution, the same interleaving the folder-delete test uses.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+
+    def _revoke_then_resolve(_workspace):
+        caller._trust = False
+        caller._trust_reads = False
+        return str(tmp_path)
+
+    monkeypatch.setattr(sc, "default_project_dir", _revoke_then_resolve)
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust is False, "a revoked grant must not be resurrected by a create"
+    assert child._trust_reads is False
+
+
+def test_the_create_audit_records_what_the_child_was_born_with(tmp_path):
+    """An auto-approval in the child must be traceable to the creator's grant.
+
+    Without it, the SEL shows a session whose tools approve themselves and no
+    record of where that authority came from. Recorded on both outcomes, so
+    "false" is positive evidence the grant did not transfer.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+
+    seen: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        seen.update(kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sc, "_audit", _capture)
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    detail = seen["detail"]
+    assert detail["inherited_trust"] == "true"
+    assert detail["inherited_trust_reads"] == "false"
 
 
 # ── session_create: filing at birth (#6118) ─────────────────────────────────
@@ -2434,6 +2693,19 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
         "app",
         "forked_from",
         "linked_session_key",
+        # The remote-execution binding, written all-three-or-none by both the
+        # full save and the merge. A plain local newborn carries none of it; the
+        # bound case is covered by
+        # test_remote_crew_execution.py::test_the_empty_window_merge_persists_a_complete_binding.
+        "executor",
+        "instance_id",
+        "remote_slot",
+        # In-flight relay marker: written ONLY while a relay is running and
+        # omitted once the turn ends (absence = "not in flight"), so a plain
+        # newborn never carries it. Its clear-on-completion behaviour is covered by
+        # test_remote_crew_execution.py::
+        # test_the_marker_is_cleared_on_disk_when_a_relay_completes.
+        "relay_in_flight",
     }
     for key in sorted(SLOT_OWNED_META_KEYS - excluded):
         assert key in meta, f"slot-owned field {key!r} missing after an empty-window forced save"
@@ -2792,11 +3064,20 @@ def test_a_mirror_link_landing_during_the_await_still_refuses(tmp_path, monkeypa
 def test_the_slot_cap_is_re_checked_after_the_await(tmp_path, monkeypatch):
     """The ceiling is read from live state, so it can fill inside the window too.
 
+    The ceiling is lowered for this test because what is under test is WHEN it is
+    read, not what it is: minting the production 500 slots is superlinear and cost
+    ~17s of pure setup for no extra property. The caller's own slot stays under the
+    lowered cap -- asserted below -- so the refusal can only come from the fill that
+    lands inside the await.
+
     Mutation guard: checking the cap only before the await lets two concurrent
     creations land over the ceiling.
     """
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
+    monkeypatch.setattr(sc, "MAX_LIVE_SLOTS", 3)
+    # Without this the test could pass on a cap checked only BEFORE the await.
+    assert state.live_slot_count() < sc.MAX_LIVE_SLOTS
 
     def _resolve_then_fill(_workspace):
         for i in range(sc.MAX_LIVE_SLOTS):

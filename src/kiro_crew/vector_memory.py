@@ -66,7 +66,7 @@ from kiro_crew.project_scope import (
     project_scope_satisfied,
     scope_is_admissible,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact_and_truncate
 from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES, normalize_lesson_category
 
 # Consolidation caps live in vector_memory_constants (a light module with no
@@ -1823,8 +1823,7 @@ class VectorMemoryStore:
             # is surfaced verbatim on the dashboard (/api/memory/events -> get_events).
             # Scrub exfiltration URLs + credentials before persisting the audit
             # snippet so poisoned text can't smuggle secrets onto that surface.
-            safe_snippet, _ = redact_exfiltration_urls(text[:200])
-            safe_snippet, _ = redact_credentials(safe_snippet)
+            safe_snippet = redact_and_truncate(text, 200)
             self._log_event(
                 SemanticRejectCode.INJECTION.value,
                 "episodic",
@@ -2217,7 +2216,11 @@ class VectorMemoryStore:
         tag_filter: list[str] | None = None,
         relevance_filter: bool = False,
     ) -> list[dict]:
-        """Cosine similarity search using embeddings stored in SQLite (stdlib only)."""
+        """Cosine similarity search using embeddings stored in SQLite.
+
+        Scoring is vectorized with numpy when available (one mat-vec over all
+        surviving rows); falls back to the stdlib-only per-row loop otherwise.
+        """
         # Normalize query
         norm = math.sqrt(sum(x * x for x in query_embedding))
         q = [x / norm for x in query_embedding] if norm > 0 else query_embedding
@@ -2242,33 +2245,44 @@ class VectorMemoryStore:
 
         now = datetime.now(tz=timezone.utc)
         candidates: list[dict] = []
-        for r in rows:
-            blob = r["embedding"]
-            n_floats = len(blob) // 4
-            if n_floats != q_len:
-                continue
-            if tag_filter and not self._matches_tags(dict(r), tag_filter):
-                continue
-            vec = struct.unpack(f"{n_floats}f", blob)
-            # dot product (both pre-normalized → cosine similarity)
-            cosine_sim = sum(a * b for a, b in zip(q, vec))
-            created = datetime.fromisoformat(r["created_at"])
-            days_old = max(0, (now - created).days)
-            decay_rate = self._decay_rate_for(r["tags"])
-            score = cosine_sim * (0.7 + 0.3 * r["importance"]) * math.exp(-decay_rate * days_old)
-            candidates.append(
-                {
-                    "id": r["id"],
-                    "conversation_id": r["conversation_id"],
-                    "text": r["text"],
-                    "tags": r["tags"],
-                    "importance": r["importance"],
-                    "created_at": r["created_at"],
-                    "last_accessed_at": r["last_accessed_at"],
-                    "score": round(score, 4),
-                    "cosine_sim": round(cosine_sim, 4),
-                }
-            )
+        if _HAS_NUMPY:
+            # First pass: apply the skip rules and collect surviving rows and
+            # their embedding blobs, preserving order.
+            survivors: list = []
+            blobs: list[bytes] = []
+            for r in rows:
+                blob = r["embedding"]
+                n_floats = len(blob) // 4
+                if n_floats != q_len:
+                    continue
+                if tag_filter and not self._matches_tags(dict(r), tag_filter):
+                    continue
+                survivors.append(r)
+                blobs.append(blob)
+            if survivors:
+                # One mat-vec over every surviving row (both sides are
+                # pre-normalized → the dot product IS the cosine similarity).
+                # float32 matches the stored dtype and the FAISS path.
+                mat = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(
+                    len(blobs), q_len
+                )
+                sims: list[float] = [float(s) for s in mat @ np.asarray(q, dtype=np.float32)]
+            else:
+                sims = []
+            for r, cosine_sim in zip(survivors, sims):
+                candidates.append(self._episodic_candidate(r, cosine_sim, now))
+        else:
+            for r in rows:
+                blob = r["embedding"]
+                n_floats = len(blob) // 4
+                if n_floats != q_len:
+                    continue
+                if tag_filter and not self._matches_tags(dict(r), tag_filter):
+                    continue
+                vec = struct.unpack(f"{n_floats}f", blob)
+                # dot product (both pre-normalized → cosine similarity)
+                cosine_sim = sum(a * b for a, b in zip(q, vec))
+                candidates.append(self._episodic_candidate(r, cosine_sim, now))
 
         if relevance_filter:
             candidates = self._filter_by_relevance(candidates)
@@ -2283,6 +2297,29 @@ class VectorMemoryStore:
         # regardless of caller. _touch_last_accessed does the locking and debouncing.
         self._touch_last_accessed([c["id"] for c in result])
         return result
+
+    def _episodic_candidate(self, r: sqlite3.Row, cosine_sim: float, now: datetime) -> dict:
+        """Build one episodic search candidate from a row and its cosine score.
+
+        Shared by both scoring branches of :meth:`_sqlite_vector_search` so the
+        candidate shape cannot silently diverge between numpy-installed and
+        stdlib-only installs.
+        """
+        created = datetime.fromisoformat(r["created_at"])
+        days_old = max(0, (now - created).days)
+        decay_rate = self._decay_rate_for(r["tags"])
+        score = cosine_sim * (0.7 + 0.3 * r["importance"]) * math.exp(-decay_rate * days_old)
+        return {
+            "id": r["id"],
+            "conversation_id": r["conversation_id"],
+            "text": r["text"],
+            "tags": r["tags"],
+            "importance": r["importance"],
+            "created_at": r["created_at"],
+            "last_accessed_at": r["last_accessed_at"],
+            "score": round(score, 4),
+            "cosine_sim": round(cosine_sim, 4),
+        }
 
     def get_episodic_list(
         self, limit: int = 50, offset: int = 0, tag_filter: list[str] | None = None
@@ -3077,6 +3114,21 @@ class VectorMemoryStore:
         else:
             rows = self._fetch_all_locked(sql)
         return [dict(r) for r in rows]
+
+    def count_lessons(self) -> int:
+        """Return the number of live lessons without materializing them.
+
+        ``get_lessons()`` returns full row dicts (including embedding blobs);
+        callers that only need the COUNT (the status paths poll it every few
+        seconds per client) must not pull every lesson row into memory just to
+        ``len()`` it. Same predicate and ``_db_lock`` serialization as
+        ``get_lessons``, so it is safe from executor threads and the loop
+        alike and always agrees with ``len(get_lessons())``.
+        """
+        rows = self._fetch_all_locked(
+            "SELECT COUNT(*) AS n FROM semantic_memory WHERE is_deleted = 0 AND key LIKE 'lesson.%'"
+        )
+        return int(rows[0]["n"]) if rows else 0
 
     def delete_lesson(self, rule_substring: str) -> bool:
         """Delete lessons whose value contains rule_substring."""

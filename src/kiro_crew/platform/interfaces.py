@@ -32,6 +32,9 @@ if TYPE_CHECKING:
     from aiohttp import web
 
     from kiro_crew.config.loader import KiroCrewConfig, TelemetryConfig
+    from kiro_crew.security import DeniedCommandRule
+    from kiro_crew.skill_providers.base import SkillProvider
+    from kiro_crew.tips_pool import TipsPool
 
 
 class InterceptDecision(enum.Enum):
@@ -595,6 +598,170 @@ class PromptSourceProvider(Protocol):
         resolved package prompt/SOP roots so its installed SOPs appear in the
         ``/api/prompts`` catalog and ``@agent-sop:`` mentions. Read fail-closed
         through ``safe_context_call`` at the call site (fallback ``[]``).
+        """
+        ...
+
+
+class SkillDiscoveryProvider(Protocol):
+    """Edition-contributed skill discovery providers for the multi-provider search.
+
+    A distinct edition concern with its own interface (not folded into
+    ``McpToolingProvider``) so each edition hook lands on its own interface.
+    """
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        """Extra skill discovery providers the edition contributes.
+
+        WIRED: the dashboard discover registry
+        (``handlers/discover._build_registry``) registers each returned provider
+        AFTER the built-in one, gated per provider by the same
+        ``external_access.admits_registry("skill", name, api_base)`` decision the
+        built-in provider passes through — so an edition provider is subject to
+        the composed discovery policy uniformly, and a managed allowlist needs no
+        edition-specific carve-out. ADD-only and de-duped by name: a provider
+        whose ``name`` collides with an already-registered one is skipped with a
+        warning (the built-in wins), so an edition cannot silently replace the
+        catalog identity a policy admitted.
+
+        Each returned object implements
+        ``kiro_crew.skill_providers.base.SkillProvider`` (async ``search`` /
+        ``fetch_skill_content`` plus ``is_available()``, so an unconfigured
+        provider is skipped by the registry rather than erroring) and SHOULD
+        expose an ``api_base`` naming its catalog endpoint — that is the identity
+        an allowlist is written against; a provider without one is gated on an
+        empty base. Read fail-closed through ``safe_context_call`` at the call
+        site (fallback ``[]``). The public Default returns ``[]`` (discovery
+        offers the built-in catalog only). v1 addition (no ``CONTRACT_VERSION``
+        bump).
+        """
+        ...
+
+
+class TipsProvider(Protocol):
+    """The edition's feature-tip pool — the one REPLACE-capable edition seam.
+
+    Every other edition hook in this contract is ADD-only: an edition UNIONS its
+    contribution into the public set (``McpToolingProvider.extra_mcp_servers``,
+    ``SkillDiscoveryProvider.skill_providers``, ``DeniedRuleProvider``…).  Tips
+    cannot work that way.  A tip asserts that a feature exists and is worth
+    using, so a public tip shown on an edition build advertises a capability that
+    build may not have or may deliberately not expose — and the failure is
+    silent, because a tip is an unprompted suggestion nobody asked to verify.
+
+    Subtraction is not an alternative: a deny-list has to enumerate the public
+    pool to subtract from it, so every tip added to the public pool afterwards
+    would surface on the edition build until someone remembered to deny it — the
+    default would be leak, not withhold.  Hence full replacement: when an edition
+    supplies a pool, the public curated file and the public docs-scan catalog are
+    not consulted at all.
+    """
+
+    def tips_pool(self) -> "Optional[TipsPool]":
+        """The edition's COMPLETE tip pool, or ``None`` to keep the public one.
+
+        WIRED: ``tips.get_tips_cache`` calls this once per process when it builds
+        the tips cache.  ``None`` (the public Default) leaves today's behavior
+        byte-for-byte — bundled catalog, docs-scan fallback, bundled curated
+        file.  A :class:`TipsPool` REPLACES both the curated pool and the feature
+        catalog, so neither the public curated file nor ``docs/*.md`` is read and
+        no public feature is offered to the tip generator.  An empty pool is legal
+        and means this build shows no tips.
+
+        Scope of that guarantee: the prompt is built from the pool's catalog
+        alone, so a public feature is never put in front of the model, and a
+        generated tip whose ``doc`` is outside that catalog is dropped at parse
+        time (``tips._parse_tips``).  What remains is narrow: a tip could cite a
+        valid pool doc while its prose names something absent, because generated
+        text is checked for shape and provenance, not for subject.  Constrain the
+        pool; treat a generated tip's wording as unverified.
+
+        Pool entries are re-validated on the way into the cache through the same
+        checks the public pool's entries pass (``tips._sanitize_pool``); a
+        malformed entry is dropped and logged rather than served.
+
+        The pool's ``pool_id`` is persisted and compared on load: when it differs
+        from the stamp in ``tips_state.json``, tips generated against the previous
+        pool are discarded rather than re-served, which is what closes the leak on
+        a host that gains (or loses) the companion after tips were already
+        generated.  User dismissals and snoozes are deliberately NOT discarded —
+        they are keyed by tip id and doc, so an entry from another pool simply
+        never matches, and dropping them would silently un-dismiss tips the user
+        already refused.
+
+        Read fail-closed through ``safe_context_call`` at the call site, and the
+        degrade is profile-dependent: on ``standalone`` a failure falls back to the
+        public pool, because there is no other pool to prefer; on a non-standalone
+        build it WITHHOLDS tips (an empty pool stamped ``edition-unavailable``),
+        because falling back to public there would serve exactly the tips this
+        seam exists to keep off that build. A ``PlatformCompositionError`` is
+        re-raised on both. v1 addition (no ``CONTRACT_VERSION`` bump).
+        """
+        ...
+
+
+class DeniedRuleProvider(Protocol):
+    """Edition-contributed DENIED-COMMAND RULES that the user can switch off.
+
+    A distinct edition concern with its own interface (not folded into
+    ``SecurityOverlay``) because the two answer opposite questions.
+    ``SecurityOverlay.extra_deny_patterns`` is the un-weakenable floor: its
+    patterns travel the GLOB tier via ``extra_patterns`` and no user opt-out can
+    reach them. This seam is the other half — rules an edition wants ON by
+    default but wants the operator to be ABLE to turn off, which the overlay
+    structurally cannot express.
+    """
+
+    def denied_rules(self) -> List["DeniedCommandRule"]:
+        """Extra denied-command rules the edition contributes, DISABLEABLE.
+
+        WIRED: ``hooks.resolve_effective_denied_regexes`` unions these into the
+        rule list it hands ``security.compute_effective_denied``, so each rule is
+        subject to the SAME opt-out resolution as a built-in — an operator can
+        disable one by id, or clear the lot with ``disable_all``, through the
+        existing ``denied_commands.json`` keystone and the existing
+        ``/api/security/denied-commands`` endpoints. ``handlers/security`` lists
+        them in the Settings panel (tagged ``source="edition"``) and accepts a
+        toggle for them, so a rule contributed here is discoverable rather than
+        an invisible block.
+
+        TIER: ``pattern`` is a Python REGEX matched via ``re.search`` with
+        ``re.IGNORECASE`` — the same tier and the same ReDoS-bounded matcher as a
+        built-in rule. It is NOT an fnmatch glob. An edition moving a pattern
+        here from ``extra_deny_patterns`` MUST rewrite it: ``*ada credentials*``
+        is a glob, and as a regex its ``*`` are quantifiers on ``a`` and ``s``.
+
+        SCOPE — the surfaces these rules reach, and the one they do not.  They
+        are enforced wherever the *effective* denied set is resolved from the
+        keystone opt-out state: the agent tool gate (``hooks.on_tool_call``) and
+        the cron/MCP gate (``mcp_cron`` via
+        ``effective_denied_regexes_from_config``).  They deliberately do NOT
+        reach ``computer_use.policy.check_text_input``, which calls
+        ``is_denied`` with ``denied_regexes=None`` to fail closed to the BUILT-IN
+        catalogue alone — that surface ignores opt-out state on purpose (typing
+        into somebody else's window is not the same decision as running a command
+        under the tool gate), and honouring an edition contribution there without
+        its opt-out would make the seam mean two different things on two
+        surfaces.  An edition needing a rule enforced on the computer-use
+        surface must express it as an un-weakenable
+        ``SecurityOverlay.extra_deny_patterns`` glob instead.
+
+        IDENTITY: ``id`` is the opt-out key and the SEL ``rule_id``, so it MUST be
+        namespaced by the edition (``<edition>-<slug>``). ``disabled_ids`` is one
+        flat set: a rule whose id collides with a built-in id is SKIPPED with a
+        warning (the built-in wins), because a collision would make one rule's
+        toggle silently move the other.
+
+        NOT PINNABLE (v1): governance ``commands``-scope pins resolve a pattern to
+        a rule id against the STATIC catalog, so a pin naming a rule from this
+        seam matches nothing. An edition needing an un-opt-out-able pattern keeps
+        using ``extra_deny_patterns`` — that is still the floor, unchanged.
+
+        Read fail-closed through ``safe_context_call`` at the call site (fallback
+        ``[]``): a raising provider degrades to the built-in catalog rather than
+        wedging the deny gate. Losing an additive, user-disableable rule is the
+        safe direction; the overlay floor is unaffected either way. The public
+        Default returns ``[]`` (the built-in catalog only). v1 addition (no
+        ``CONTRACT_VERSION`` bump).
         """
         ...
 

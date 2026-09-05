@@ -13,8 +13,10 @@ lightweight background work (heartbeat, lesson extraction).  It
 stays alive between uses, serialized by the per-session semaphore.
 
 At >= ``cfg.session.autocompact_pct`` context usage, fires a background
-compaction task. Both backends compact **in place** so the session — and
-any queued or agentic work on it — continues without a user nudge:
+compaction task. A backend that can serve ``/compact`` compacts **in
+place** so the session — and any queued or agentic work on it —
+continues without a user nudge; one that cannot is declined before any
+dispatch:
 
 * **kiro-cli:** run ``/compact`` in place under the session semaphore
   (native command execute + ``_kiro.dev/compaction/status`` wait). The
@@ -29,6 +31,13 @@ any queued or agentic work on it — continues without a user nudge:
   semaphore. The SDK preserves the same session ID across the
   compact_boundary; the session keeps its summary and continues without
   a recycle.
+* **KAS:** nothing is dispatched. KAS treats the ``/compact`` prompt as
+  ordinary text and never answers it with a compaction status, so the
+  gate declines (``compact_unsupported``) before the compaction task is
+  scheduled: an ungated dispatch stranded the wait for the full budget
+  while holding the semaphore and then recycled the session (#7812). KAS
+  summarizes on its own initiative, the same way ``cc_managed`` leaves
+  Claude-Code sessions to compact themselves.
 
 A failed compact records a per-key cooldown so a broken /compact does
 not fire on every subsequent turn. The compact callback fires on both
@@ -102,8 +111,11 @@ from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     CONTEXT_WARN_MARGIN_PCT,
     POOL_SIZE_MAX,
     build_provider_factory,
@@ -132,6 +144,9 @@ from kiro_crew.session_allocation import (
     AllocationConstants,
     AllocationDeps,
     SessionAllocationService,
+)
+from kiro_crew.session_allocation import SessionBusyError as SessionBusyError  # noqa: F401
+from kiro_crew.session_allocation import (
     SessionClosingError,
     SessionRegistryState,
 )
@@ -1013,6 +1028,7 @@ class SessionManager:
             load_watchdog_settings=lambda crew: _load_allocation_watchdog_settings(crew),
             advertised_model_ids=lambda models: advertised_model_ids(models),
             model_is_unusable=lambda model, advertised: model_is_unusable(model, advertised),
+            resolve_pin_spelling=lambda model, advertised: resolve_pin_spelling(model, advertised),
             to_provider_id=lambda model, provider: model_registry.to_provider_id(model, provider),
             to_acp_id=lambda model: model_registry.to_acp_id(model),
             inc_session_created=lambda: Stats().inc_session_created(),
@@ -1710,9 +1726,19 @@ class SessionManager:
             parent_session_key, agent=agent, cwd=cwd
         )
 
-    async def _reacquire_and_validate(self, key: str, sess: "_Session") -> bool:
+    async def _reacquire_and_validate(
+        self,
+        key: str,
+        sess: "_Session",
+        *,
+        wait_if_busy: bool = True,
+    ) -> bool:
         """Acquire outside the registry lock and revalidate identity."""
-        return await self._allocation_boundary()._reacquire_and_validate(key, sess)
+        return await self._allocation_boundary()._reacquire_and_validate(
+            key,
+            sess,
+            wait_if_busy=wait_if_busy,
+        )
 
     async def _evict_stale_session(self, key: str, sess: "_Session") -> None:
         """Evict and close the exact stale session."""
@@ -1945,6 +1971,7 @@ class SessionManager:
         extra_env: dict[str, str] | None = None,
         speculative: bool = False,
         speculative_resume: bool = False,
+        wait_if_busy: bool = True,
         _won_race_retries: int = 0,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
@@ -1959,6 +1986,7 @@ class SessionManager:
             extra_env=extra_env,
             speculative=speculative,
             speculative_resume=speculative_resume,
+            wait_if_busy=wait_if_busy,
             _won_race_retries=_won_race_retries,
             **extra_factory_kwargs,
         )
@@ -1982,6 +2010,37 @@ class SessionManager:
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
         """Delegate context accounting and compaction triggering."""
         return self._compaction.check_context_usage(key, provider)
+
+    def set_autocompact_pct(self, key: str, pct: float | None) -> None:
+        """Set or clear (``None``) *key*'s per-session compaction threshold.
+
+        Values clamp into the documented ``AUTOCOMPACT_PCT_MIN``–``MAX`` range,
+        the same guarantee the config loader gives the global knob: an
+        out-of-range override (e.g. from a hand-edited persistence file) must
+        degrade to the nearest firing value, never silently disable the
+        backstop. The override is keyed independently of live-session
+        membership, so it survives resets and recycles; callers that persist it
+        (the dashboard slot) re-seed it after a gateway restart.
+        """
+        if pct is not None:
+            if pct != pct:  # NaN: comparisons below would both be False
+                return
+            try:
+                pct = min(max(float(pct), AUTOCOMPACT_PCT_MIN), AUTOCOMPACT_PCT_MAX)
+            except OverflowError:
+                # An int too large for a float; ignore like NaN.
+                return
+        self._compaction.set_autocompact_pct(key, pct)
+
+    def drop_autocompact_overrides_matching(
+        self, exact_keys: set[str], folded_keys: set[str], fold: Callable[[str], str]
+    ) -> int:
+        """Drop threshold overrides for permanently deleted, slotless sessions.
+
+        The slotless complement of ``destroy()``'s override clear — see the
+        coordinator method for the matching contract.
+        """
+        return self._compaction.drop_autocompact_overrides_matching(exact_keys, folded_keys, fold)
 
     async def compact_if_needed(self, key: str) -> str:
         """Delegate awaited between-turn compaction."""
@@ -2531,6 +2590,10 @@ class SessionManager:
     async def drain_warm_pool(self) -> list:
         """Remove and return all queued warm providers."""
         return await self._pool.drain_warm_pool()
+
+    def warm_providers(self) -> list[LLMProvider]:
+        """Snapshot the queued warm providers without consuming them."""
+        return self._pool.warm_providers()
 
     # ── Idle cleanup ──
 

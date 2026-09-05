@@ -16,6 +16,7 @@ Covers spec task 2 of the Crew Members page:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -144,6 +145,12 @@ def _make_members_app(state) -> web.Application:
     async def _auth(request: web.Request, handler):
         if "app" not in request:
             request["app"] = ""
+        # POST /api/members/{slug}/thread is owner-gated. ``local-app`` is the
+        # standalone-local owner subject the gate accepts when no owner_id is
+        # configured; set only when a test has not already chosen a caller, so
+        # the non-owner and app-token cases can still pick their own.
+        if "user" not in request:
+            request["user"] = "local-app"
         return await handler(request)
 
     app = web.Application(middlewares=[_auth])
@@ -179,6 +186,9 @@ class TestMemberRoutes:
         # (the page never trusts it), no top-level default_agent.
         assert "bound" not in rows[CREW]
         assert "default_agent" not in data
+        # The avatar override IS allowlisted (presentation-only, validated at
+        # load) — without it every Members surface shows the name-derived face.
+        assert rows[CREW]["avatar"] == {}
         # Unbound members have never talked: last activity reads as 0.
         assert rows[CREW]["last_active_ts"] == 0.0
 
@@ -232,7 +242,7 @@ class TestMemberRoutes:
         assert "AKIA" not in preview
 
     @pytest.mark.asyncio
-    async def test_roster_orders_by_message_ts_not_file_mtime(self, tmp_path):
+    async def test_roster_orders_by_message_ts_not_file_mtime(self, tmp_path, monkeypatch):
         """last_active_ts is the newest MESSAGE's own timestamp.
 
         Non-message writes (metadata, rehydration) bump the transcript file's
@@ -241,8 +251,30 @@ class TestMemberRoutes:
         newest time must NOT promote it above the thread whose message is
         actually newer.
         """
+        import datetime as _dt
         import os
         import time
+
+        # append stamps each row via monotonic_transcript_ts, whose correction
+        # only consults prior rows of the SAME file — two freshly created files
+        # each get a raw clock read. On a coarse clock (Windows' ~15ms tick)
+        # these back-to-back appends collide, and the strict `<` below fails on
+        # equal timestamps. Drive a strictly-increasing clock so the
+        # chronological order this test asserts is actually encoded in the
+        # timestamps, on every OS. The stand-in must be tz-aware: append calls
+        # .astimezone() on the result.
+        _base = _dt.datetime(2026, 7, 25, 0, 0, 0, tzinfo=_dt.timezone.utc)
+        _tick = {"n": 0}
+
+        # Subclass keeps datetime classmethods (fromisoformat) available while
+        # patched, so _parse_transcript_ts is not silently degraded.
+        class _IncDateTime(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                _tick["n"] += 1
+                return _base + _dt.timedelta(seconds=_tick["n"])
+
+        monkeypatch.setattr("kiro_crew.history.datetime", _IncDateTime)
 
         state = _make_state(tmp_path)
         write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
@@ -254,6 +286,9 @@ class TestMemberRoutes:
         state.conversation_log.append(old_key, "user", "older message")
         state.conversation_log.append(new_key, "user", "newer message")
         # Touch the OLDER thread's file so its mtime is the newest of the two.
+        # Deliberately the REAL clock (2026-09-xx+), far ahead of the fake
+        # message timestamps (fixed 2026-07-25): the mtime-vs-ts contrast is
+        # the point of this test — do not "align" the two clocks.
         old_path = state.conversation_log._path(old_key)
         now = time.time() + 60
         os.utime(old_path, (now, now))
@@ -1469,3 +1504,114 @@ class TestMemberActivityRoute:
                 data = await resp.json()
         assert data["capped"] is True
         assert len(data["entries"]) == handler_mod._ACTIVITY_LIMIT
+
+
+class TestDenialAuditOffload:
+    """Deny-path SEL audits are direct enqueues since the startup warm (#8608).
+
+    The per-site ``asyncio.to_thread`` wrappers existed because a fresh
+    gateway's first ``_sel()`` touch performed synchronous filesystem
+    initialization (HMAC key load/create, chain-head read). That first touch
+    now happens once at gateway startup (``sel.warm_sel_singleton``, awaited
+    by both server start paths — pinned in test_sel_startup_warm.py), so a
+    handler-side ``log_api_access`` is a non-blocking enqueue and the thread
+    hop is gone. Each test records the thread the audit ran on and fails if
+    it is NOT the event-loop thread — re-adding a pointless per-site offload
+    turns the recorded ident back into a worker's and fails these.
+    """
+
+    @staticmethod
+    def _recording_sel(record: dict):
+        class _RecordingSel:
+            def log_api_access(self, **kwargs):
+                record["thread_ident"] = threading.get_ident()
+                record["kwargs"] = kwargs
+
+        return _RecordingSel()
+
+    @pytest.mark.asyncio
+    async def test_app_denial_audit_runs_inline(self, tmp_path, monkeypatch):
+        state = _make_state(tmp_path)
+        record: dict = {}
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: self._recording_sel(record))
+
+        @web.middleware
+        async def _as_app(request: web.Request, handler):
+            request["app"] = "some-app"
+            return await handler(request)
+
+        app = _make_members_app(state)
+        app.middlewares.insert(0, _as_app)
+        loop_ident = threading.get_ident()
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(app)) as client:
+                assert (await client.get("/api/members")).status == 404
+        assert record["kwargs"]["outcome"] == "denied"
+        assert record["kwargs"]["source"] == "app_isolation"
+        assert record["kwargs"]["operation"] == "members.list"
+        # The audit is a direct enqueue on the loop thread — no thread hop.
+        assert record["thread_ident"] == loop_ident
+
+    @pytest.mark.asyncio
+    async def test_member_pin_denial_audit_runs_inline(self, tmp_path, monkeypatch):
+        """The pin-mismatch denial (binding names a non-owner) audits inline."""
+        state = _make_state(tmp_path)
+        record: dict = {}
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: self._recording_sel(record))
+        # ``Code_Reviewer`` slugifies to CREW's slug (so the binding reads back
+        # as present) but is NOT a config-registered owner → pin mismatch.
+        write_dm_binding(CREW, member="Code_Reviewer", slot_key=member_slot_key(CREW))
+        loop_ident = threading.get_ident()
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.post(f"/api/members/{CREW}/thread")
+                assert resp.status == 409
+                assert (await resp.json())["code"] == "member_pin_mismatch"
+        assert record["kwargs"]["source"] == "member_pin"
+        assert record["kwargs"]["outcome"] == "denied"
+        assert record["thread_ident"] == loop_ident
+        assert not state._slots
+
+    def test_no_members_sel_audit_is_offloaded(self):
+        """AST guard (inverted from #8523 by #8608): no ``log_api_access``
+        call in members.py hides inside an ``asyncio.to_thread`` lambda.
+
+        The startup warm makes a post-init ``log_api_access`` a non-blocking
+        enqueue, so a per-site thread hop is pure overhead — an extra
+        suspension point and a worker dispatch per denial. A future site that
+        genuinely needs a synchronous write (``critical=True``) must offload
+        AND adjust this guard with that reasoning.
+        """
+        import ast
+        import inspect
+
+        from kiro_crew.dashboard.handlers import members as members_mod_py
+
+        tree = ast.parse(inspect.getsource(members_mod_py))
+        offloaded: set[int] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_thread"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "asyncio"
+            ):
+                for arg in node.args:
+                    if isinstance(arg, ast.Lambda):
+                        for inner in ast.walk(arg):
+                            offloaded.add(id(inner))
+        audits = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "log_api_access"
+        ]
+        assert audits, "expected log_api_access audit sites in members.py"
+        wrapped = [node.lineno for node in audits if id(node) in offloaded]
+        assert not wrapped, (
+            f"to_thread-wrapped _sel().log_api_access at lines {wrapped}; SEL is "
+            "warmed at startup (sel.warm_sel_singleton), so a non-critical audit "
+            "is a direct enqueue (#8608)"
+        )
